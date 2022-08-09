@@ -21,6 +21,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -39,6 +40,8 @@ namespace facebook {
 namespace cachelib {
 namespace cachebench {
 
+constexpr uint32_t kNvmCacheWarmUpCheckRate = 1000;
+
 // Implementation of stressor that uses a workload generator to stress an
 // instance of the cache.  All item's value in CacheStressor follows CacheValue
 // schema, which contains a few integers for sanity checks use. So it is invalid
@@ -48,7 +51,7 @@ class CacheStressor : public Stressor {
  public:
   using CacheT = Cache<Allocator>;
   using Key = typename CacheT::Key;
-  using ItemHandle = typename CacheT::ItemHandle;
+  using WriteHandle = typename CacheT::WriteHandle;
 
   // @param cacheConfig   the config to instantiate the cache instance
   // @param config        stress test config
@@ -93,7 +96,8 @@ class CacheStressor : public Stressor {
       cacheConfig.ticker = ticker_;
     }
 
-    cache_ = std::make_unique<CacheT>(cacheConfig, movingSync);
+    cache_ = std::make_unique<CacheT>(cacheConfig, movingSync, "",
+                                      config_.touchValue);
     if (config_.opPoolDistribution.size() > cache_->numPools()) {
       throw std::invalid_argument(folly::sformat(
           "more pools specified in the test than in the cache. "
@@ -220,7 +224,7 @@ class CacheStressor : public Stressor {
   }
 
   // populate the input item handle according to the stress setup.
-  void populateItem(ItemHandle& handle) {
+  void populateItem(WriteHandle& handle) {
     if (!config_.populateItem) {
       return;
     }
@@ -316,7 +320,7 @@ class CacheStressor : public Stressor {
           // add a distribution over sequences of requests/access patterns
           // e.g. get-no-set and set-no-get
           cache_->recordAccess(*key);
-          auto it = cache_->find(*key, AccessMode::kRead);
+          auto it = cache_->find(*key);
           if (it == nullptr) {
             ++stats.getMiss;
             result = OpResultType::kGetMiss;
@@ -348,7 +352,7 @@ class CacheStressor : public Stressor {
         case OpType::kAddChained: {
           ++stats.get;
           auto lock = chainedItemAcquireUniqueLock(*key);
-          auto it = cache_->find(*key, AccessMode::kRead);
+          auto it = cache_->findToWrite(*key);
           if (!it) {
             ++stats.getMiss;
 
@@ -388,7 +392,7 @@ class CacheStressor : public Stressor {
           if (ticker_) {
             ticker_->updateTimeStamp(req.timestamp);
           }
-          auto it = cache_->find(*key, AccessMode::kWrite);
+          auto it = cache_->findToWrite(*key);
           if (it == nullptr) {
             ++stats.getMiss;
             ++stats.updateMiss;
@@ -469,6 +473,11 @@ class CacheStressor : public Stressor {
       if (config_.checkConsistency && cache_->isInvalidKey(req.key)) {
         continue;
       }
+      // TODO: allow callback on nvm eviction instead of checking it repeatedly.
+      if (config_.checkNvmCacheWarmUp &&
+          folly::Random::oneIn(kNvmCacheWarmUpCheckRate)) {
+        checkNvmCacheWarmedUp(req.timestamp);
+      }
       return req;
     }
   }
@@ -478,6 +487,21 @@ class CacheStressor : public Stressor {
       return;
     }
     rateLimiter_->consumeWithBorrowAndWait(1);
+  }
+
+  void checkNvmCacheWarmedUp(uint64_t requestTimestamp) {
+    if (hasNvmCacheWarmedUp_) {
+      // already notified, nothing to do
+      return;
+    }
+    if (cache_->isNvmCacheDisabled()) {
+      return;
+    }
+    if (cache_->hasNvmCacheWarmedUp()) {
+      wg_->setNvmCacheWarmedUp(requestTimestamp);
+      XLOG(INFO) << "NVM cache has been warmed up";
+      hasNvmCacheWarmedUp_ = true;
+    }
   }
 
   const StressorConfig config_; // config for the stress run
@@ -517,6 +541,9 @@ class CacheStressor : public Stressor {
 
   // Token bucket used to limit the operations per second.
   std::unique_ptr<folly::BasicTokenBucket<>> rateLimiter_;
+
+  // Whether flash cache has been warmed up
+  bool hasNvmCacheWarmedUp_{false};
 };
 } // namespace cachebench
 } // namespace cachelib

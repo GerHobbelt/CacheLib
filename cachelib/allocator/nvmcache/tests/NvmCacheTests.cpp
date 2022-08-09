@@ -370,22 +370,32 @@ TEST_F(NvmCacheTest, ConcurrentFills) {
   auto doConcurrentFetch = [&](int id) {
     auto key = std::string("blah") + folly::to<std::string>(id);
     std::vector<std::thread> thr;
+    std::atomic<bool> missed = false;
     for (unsigned int j = 0; j < 50; j++) {
       thr.push_back(std::thread([&]() {
-        auto hdl = nvm.find(key, AccessMode::kRead);
+        auto hdl = nvm.find(key);
         hdl.wait();
-        ASSERT_NE(hdl, nullptr);
-        ASSERT_EQ(id, *(int*)hdl->getMemory());
+        if (!hdl) {
+          missed = true;
+        } else {
+          ASSERT_EQ(id, *hdl->getMemoryAs<int>());
+        }
       }));
     }
     for (unsigned int j = 0; j < 50; j++) {
       thr[j].join();
     }
+    return missed.load(std::memory_order_relaxed);
   };
-
-  for (unsigned int i = 0; i < 10; i++) {
-    doConcurrentFetch(i);
+  size_t misses{0};
+  for (unsigned int i = 0; i < nKeys; i++) {
+    misses += doConcurrentFetch(i);
   }
+  // The number of misses equals to the number of puts aborted in the process.
+  // Aborts can happen if an item's NvmCache::remove issued by
+  // CacheAllocator::insertOrReplace is still in flight when the item is evicted
+  // from RAM.
+  ASSERT_EQ(nvm.getGlobalCacheStats().numNvmAbortedPutOnTombstone, misses);
 }
 
 TEST_F(NvmCacheTest, NvmClean) {
@@ -397,12 +407,30 @@ TEST_F(NvmCacheTest, NvmClean) {
   const int nKeys = 1024;
   const uint32_t allocSize = 15 * 1024;
 
+  // We determine how many keys fit into a Navy block-cache region.
+  const uint32_t numKeysPerRegion =
+      config_.blockCache().getRegionSize() / allocSize;
+
   for (unsigned int i = 0; i < nKeys; i++) {
     auto key = std::string("blah") + folly::to<std::string>(i);
     auto it = nvm.allocate(pid, key, allocSize);
     ASSERT_NE(nullptr, it);
     cache_->insertOrReplace(it);
+
+    if (i % numKeysPerRegion == 0) {
+      // Flush nvm-cache. The reason we flush is to make sure remove jobs
+      // enqueued when we call "insertOrReplace()" is finished to avoid
+      // a scenario where we evict key "Foo" from cache while a previously
+      // enqueued remove job for "Foo" is still pending, which would lead
+      // to "Foo" not being inserted into the cache. And the reason we only
+      // flush every "numKeysPerRegion" is to make sure we don't end up
+      // trigger evictions from flash-cache by flushing too frequently.
+      // If we flush after each insertion, then one region only fits a single
+      // item.
+      cache_->flushNvmCache();
+    }
   }
+  cache_->flushNvmCache();
 
   auto nEvictions = this->evictionCount() - evictBefore;
   auto nPuts = this->getStats().numNvmPuts - putsBefore;
@@ -414,7 +442,7 @@ TEST_F(NvmCacheTest, NvmClean) {
   // read everything again. This should churn and cause the current ones to be
   // evicted to nvmcache.
   size_t numClean = 0;
-  for (unsigned int i = nKeys - 1; i > 0; i--) {
+  for (unsigned int i = nKeys; i > 0; i--) {
     auto key = std::string("blah") + folly::to<std::string>(i - 1);
     bool missInRam = !this->checkKeyExists(key, true /* ramOnly */);
     auto hdl = this->fetch(key, false /* ramOnly */);
@@ -425,7 +453,6 @@ TEST_F(NvmCacheTest, NvmClean) {
       ASSERT_TRUE(hdl->isNvmClean());
     }
   }
-
   ASSERT_LT(0, numClean);
 
   // we must have done evictions from ram to navy
@@ -442,7 +469,7 @@ TEST_F(NvmCacheTest, NvmClean) {
     auto key = std::string("blah") + folly::to<std::string>(i);
     auto hdl = this->fetch(key, false /* ramOnly */);
     hdl.wait();
-    XDCHECK(hdl);
+    ASSERT_TRUE(hdl);
     ASSERT_TRUE(hdl->isNvmClean());
   }
   ASSERT_EQ(0, this->getStats().numNvmEvictions);
@@ -979,7 +1006,7 @@ TEST_F(NvmCacheTest, ChainedItems) {
         << item.toString();
   };
 
-  auto verifyChainedAllcos = [&](const ItemHandle& hdl) {
+  auto verifyChainedAllcos = [&](const WriteHandle& hdl) {
     auto allocs = cache.viewAsChainedAllocs(hdl);
     verifyItem(allocs.getParentItem(), vals[0]);
 
@@ -1056,7 +1083,7 @@ TEST_F(NvmCacheTest, ChainedItemsModifyAccessible) {
           << item.toString();
     };
 
-    auto verifyChainedAllcos = [&](const ItemHandle& hdl, uint32_t nChained) {
+    auto verifyChainedAllcos = [&](const ReadHandle& hdl, uint32_t nChained) {
       auto allocs = cache.viewAsChainedAllocs(hdl);
       verifyItem(allocs.getParentItem(), vals[0]);
 
@@ -1527,6 +1554,7 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bc_reclaim_value_checksum_errors"));
   EXPECT_TRUE(cs("navy_bc_cleanup_entry_header_checksum_errors"));
   EXPECT_TRUE(cs("navy_bc_cleanup_value_checksum_errors"));
+  EXPECT_TRUE(cs("navy_bc_remove_attempt_collisions"));
   for (int size = 64;;
        size = std::min(4 * 1024 * 1024, static_cast<int>(size * 1.25))) {
     EXPECT_TRUE(cs(folly::sformat("navy_bc_approx_bytes_in_size_{}", size)));
@@ -1983,7 +2011,7 @@ TEST_F(NvmCacheTest, testEvictCB) {
     ASSERT_NE(nullptr, handle.get());
     std::memcpy(handle->getMemory(), val.data(), val.size());
     auto buf = toIOBuf(makeNvmItem(handle));
-    evictCB(navy::makeView(key.data()),
+    evictCB(HashedKey{key.data()},
             navy::BufferView(buf.length(), buf.data()),
             navy::DestructorEvent::Recycled);
     ASSERT_TRUE(destructorCalled);
@@ -2004,7 +2032,7 @@ TEST_F(NvmCacheTest, testEvictCB) {
     std::memcpy(handle->getMemory(), val.data(), val.size());
     cache.insertOrReplace(handle);
     auto buf = toIOBuf(makeNvmItem(handle));
-    evictCB(navy::makeView(key.data()),
+    evictCB(HashedKey{key.data()},
             navy::BufferView(buf.length(), buf.data()),
             navy::DestructorEvent::Recycled);
     ASSERT_TRUE(destructorCalled);
@@ -2023,7 +2051,7 @@ TEST_F(NvmCacheTest, testEvictCB) {
     cache.insertOrReplace(handle);
     handle->markNvmClean();
     auto buf = toIOBuf(makeNvmItem(handle));
-    evictCB(navy::makeView(key.data()),
+    evictCB(HashedKey{key.data()},
             navy::BufferView(buf.length(), buf.data()),
             navy::DestructorEvent::Recycled);
     // Recycled event, in RAM and clean
@@ -2039,7 +2067,7 @@ TEST_F(NvmCacheTest, testEvictCB) {
     ASSERT_NE(nullptr, handle.get());
     std::memcpy(handle->getMemory(), val.data(), val.size());
     auto buf = toIOBuf(makeNvmItem(handle));
-    evictCB(navy::makeView(key.data()),
+    evictCB(HashedKey{key.data()},
             navy::BufferView(buf.length(), buf.data()),
             navy::DestructorEvent::Removed);
     // Removed event, not in RAM
@@ -2058,7 +2086,7 @@ TEST_F(NvmCacheTest, testEvictCB) {
     std::memcpy(handle->getMemory(), val.data(), val.size());
     cache.insertOrReplace(handle);
     auto buf = toIOBuf(makeNvmItem(handle));
-    evictCB(navy::makeView(key.data()),
+    evictCB(HashedKey{key.data()},
             navy::BufferView(buf.length(), buf.data()),
             navy::DestructorEvent::Removed);
     // Removed event, in RAM but unclean
@@ -2077,7 +2105,7 @@ TEST_F(NvmCacheTest, testEvictCB) {
     cache.insertOrReplace(handle);
     handle->markNvmClean();
     auto buf = toIOBuf(makeNvmItem(handle));
-    evictCB(navy::makeView(key.data()),
+    evictCB(HashedKey{key.data()},
             navy::BufferView(buf.length(), buf.data()),
             navy::DestructorEvent::Removed);
     // Removed event, in RAM and clean
@@ -2099,7 +2127,7 @@ void verifyItem(const Item& item, const Item& iobufItem) {
 }
 
 void NvmCacheTest::verifyItemInIOBuf(const std::string& key,
-                                     const ItemHandle& handle,
+                                     const ReadHandle& handle,
                                      folly::IOBuf* iobuf) {
   Item& item = *reinterpret_cast<Item*>(iobuf->writableData());
   ASSERT_EQ(Item::getRequiredSize(key, handle->getSize()), iobuf->length());
@@ -2437,6 +2465,61 @@ TEST_F(NvmCacheTest, testFindToWriteNvmInvalidation) {
   ASSERT_FALSE(handle->isNvmClean());
 }
 
+TEST_F(NvmCacheTest, IsNewCacheInstanceStat) {
+  // A new instane of cache should have this stat set to true
+  // A cache that is recovered successfully should set it to false
+
+  auto stats = getStats();
+  EXPECT_TRUE(stats.isNewRamCache);
+  EXPECT_TRUE(stats.isNewNvmCache);
+  // The sleep calls in this test is to make sure the time
+  // has moved forward by a second or two so the cache uptime
+  // checks we rely on for determining new/warm cache is valid.
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  // Use SHM. This is also a new cache instance
+  this->convertToShmCache();
+  stats = getStats();
+  EXPECT_TRUE(stats.isNewRamCache);
+  EXPECT_TRUE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  warmRoll();
+  stats = getStats();
+  EXPECT_FALSE(stats.isNewRamCache);
+  EXPECT_FALSE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  coldRoll();
+  stats = getStats();
+  EXPECT_TRUE(stats.isNewRamCache);
+  EXPECT_FALSE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  warmRoll();
+  stats = getStats();
+  EXPECT_FALSE(stats.isNewRamCache);
+  EXPECT_FALSE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  iceRoll();
+  stats = getStats();
+  EXPECT_FALSE(stats.isNewRamCache);
+  EXPECT_TRUE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  warmRoll();
+  stats = getStats();
+  EXPECT_FALSE(stats.isNewRamCache);
+  EXPECT_FALSE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+
+  iceColdRoll();
+  stats = getStats();
+  EXPECT_TRUE(stats.isNewRamCache);
+  EXPECT_TRUE(stats.isNewNvmCache);
+  std::this_thread::sleep_for(std::chrono::seconds{2});
+}
 } // namespace tests
 } // namespace cachelib
 } // namespace facebook

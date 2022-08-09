@@ -34,6 +34,7 @@ StressorConfig::StressorConfig(const folly::dynamic& configJson) {
   JSONSetVal(configJson, samplingIntervalMs);
 
   JSONSetVal(configJson, checkConsistency);
+  JSONSetVal(configJson, touchValue);
 
   JSONSetVal(configJson, numOps);
   JSONSetVal(configJson, numThreads);
@@ -59,6 +60,8 @@ StressorConfig::StressorConfig(const folly::dynamic& configJson) {
 
   JSONSetVal(configJson, repeatTraceReplay);
   JSONSetVal(configJson, timestampFactor);
+
+  JSONSetVal(configJson, checkNvmCacheWarmUp);
 
   if (configJson.count("poolDistributions")) {
     for (auto& it : configJson["poolDistributions"]) {

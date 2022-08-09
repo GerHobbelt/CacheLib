@@ -140,6 +140,7 @@ void setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
 
   blockCache->setNumInMemBuffers(blockCacheConfig.getNumInMemBuffers());
   blockCache->setItemDestructorEnabled(itemDestructorEnabled);
+  blockCache->setPreciseRemove(blockCacheConfig.isPreciseRemove());
 
   proto.setBlockCache(std::move(blockCache));
 }
@@ -232,7 +233,7 @@ std::unique_ptr<cachelib::navy::Device> createDevice(
   auto maxDeviceWriteSize = config.getDeviceMaxWriteSize();
 
   if (config.usesRaidFiles()) {
-    auto stripeSize = config.getRaidStripeSize();
+    auto stripeSize = config.blockCache().getRegionSize();
     return cachelib::navy::createRAIDDevice(
         config.getRaidPaths(),
         alignDown(config.getFileSize(), stripeSize),

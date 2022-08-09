@@ -22,9 +22,11 @@
 #include <vector>
 
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
+#include "cachelib/common/Hash.h"
 #include "cachelib/navy/block_cache/BlockCache.h"
 #include "cachelib/navy/block_cache/HitsReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/tests/TestHelpers.h"
+#include "cachelib/navy/common/Buffer.h"
 #include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/driver/Driver.h"
 #include "cachelib/navy/testing/BufferGen.h"
@@ -103,10 +105,12 @@ Buffer strzBuffer(const char* strz) { return Buffer{makeView(strz)}; }
 class CacheEntry {
  public:
   CacheEntry(Buffer k, Buffer v) : key_{std::move(k)}, value_{std::move(v)} {}
+  CacheEntry(HashedKey k, Buffer v)
+      : key_{makeView(k.key())}, value_{std::move(v)} {}
   CacheEntry(CacheEntry&&) = default;
   CacheEntry& operator=(CacheEntry&&) = default;
 
-  BufferView key() const { return key_.view(); }
+  HashedKey key() const { return makeHK(key_); }
 
   BufferView value() const { return value_.view(); }
 
@@ -115,7 +119,7 @@ class CacheEntry {
 };
 
 InsertCallback saveEntryCb(CacheEntry&& e) {
-  return [entry = std::move(e)](Status /* status */, BufferView /* key */) {};
+  return [entry = std::move(e)](Status /* status */, HashedKey /* key */) {};
 }
 
 void finishAllJobs(MockJobScheduler& ex) {
@@ -123,6 +127,55 @@ void finishAllJobs(MockJobScheduler& ex) {
     ex.runFirst();
   }
 }
+
+// This class creates a Driver that has an entry on its device with a similar
+// situation as hash collision.
+class CollisionCreator {
+ public:
+  // After the initialization:
+  // It has the hash value of key in block cache index.
+  // On the block cache device, it has an entry with key+addtion as key, and val
+  // as value.
+  CollisionCreator(
+      const char* key,
+      const char* val,
+      const char* addition,
+      std::function<void(BlockCache::Config&)> configModifier = {}) {
+    auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
+    device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
+    auto ex = makeJobScheduler();
+    auto config = makeConfig(*ex, std::move(policy), *device);
+    if (configModifier) {
+      configModifier(config);
+    }
+    auto engine = makeEngine(std::move(config));
+    driver = makeDriver(std::move(engine), std::move(ex));
+    CacheEntry e{strzBuffer(key), strzBuffer(val)};
+    EXPECT_EQ(Status::Ok, driver->insert(e.key(), e.value()));
+
+    Buffer value;
+    EXPECT_EQ(Status::Ok, driver->lookup(makeHK(key), value));
+    EXPECT_EQ(makeView(val), value.view());
+    driver->flush();
+
+    uint8_t buf[512]{}; // 512 is the minimal alloc alignment size
+    EXPECT_TRUE(device->read(0, sizeof(buf), buf));
+    size_t kKeySize{strlen(key)}; // "key"
+    size_t keyOffset = sizeof(buf) - kSizeOfEntryDesc - kKeySize;
+    BufferView keyOnDevice{kKeySize, buf + keyOffset};
+    EXPECT_EQ(keyOnDevice, makeView(key));
+
+    std::memcpy(buf + keyOffset, addition, strlen(addition));
+    EXPECT_TRUE(device->write(0, Buffer{BufferView{sizeof(buf), buf}}));
+  }
+
+  std::unique_ptr<Driver> driver;
+
+ private:
+  std::vector<uint32_t> hits{4};
+  std::unique_ptr<Device> device;
+};
+
 } // namespace
 
 TEST(BlockCache, InsertLookup) {
@@ -249,36 +302,36 @@ TEST(BlockCache, AsyncCallbacks) {
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
   MockInsertCB cbInsert;
-  EXPECT_CALL(cbInsert, call(Status::Ok, makeView("key")));
+  EXPECT_CALL(cbInsert, call(Status::Ok, makeHK("key")));
   EXPECT_EQ(Status::Ok,
-            driver->insertAsync(makeView("key"), makeView("value"),
+            driver->insertAsync(makeHK("key"), makeView("value"),
                                 toCallback(cbInsert)));
   driver->flush();
 
   MockLookupCB cbLookup;
-  EXPECT_CALL(cbLookup, call(Status::Ok, makeView("key"), makeView("value")));
-  EXPECT_CALL(cbLookup, call(Status::NotFound, makeView("cat"), BufferView{}));
+  EXPECT_CALL(cbLookup, call(Status::Ok, makeHK("key"), makeView("value")));
+  EXPECT_CALL(cbLookup, call(Status::NotFound, makeHK("cat"), BufferView{}));
   EXPECT_EQ(Status::Ok,
             driver->lookupAsync(
-                makeView("key"),
-                [&cbLookup](Status status, BufferView key, Buffer value) {
+                makeHK("key"),
+                [&cbLookup](Status status, HashedKey key, Buffer value) {
                   cbLookup.call(status, key, value.view());
                 }));
   EXPECT_EQ(Status::Ok,
             driver->lookupAsync(
-                makeView("cat"),
-                [&cbLookup](Status status, BufferView key, Buffer value) {
+                makeHK("cat"),
+                [&cbLookup](Status status, HashedKey key, Buffer value) {
                   cbLookup.call(status, key, value.view());
                 }));
   driver->flush();
 
   MockRemoveCB cbRemove;
-  EXPECT_CALL(cbRemove, call(Status::Ok, makeView("key")));
-  EXPECT_CALL(cbRemove, call(Status::NotFound, makeView("cat")));
+  EXPECT_CALL(cbRemove, call(Status::Ok, makeHK("key")));
+  EXPECT_CALL(cbRemove, call(Status::NotFound, makeHK("cat")));
   EXPECT_EQ(Status::Ok,
-            driver->removeAsync(makeView("key"), toCallback(cbRemove)));
+            driver->removeAsync(makeHK("key"), toCallback(cbRemove)));
   EXPECT_EQ(Status::Ok,
-            driver->removeAsync(makeView("cat"), toCallback(cbRemove)));
+            driver->removeAsync(makeHK("cat"), toCallback(cbRemove)));
   driver->flush();
 }
 
@@ -310,47 +363,79 @@ TEST(BlockCache, Remove) {
   EXPECT_EQ(log[0].value(), value.view());
   EXPECT_EQ(Status::Ok, driver->lookup(log[1].key(), value));
   EXPECT_EQ(log[1].value(), value.view());
-  EXPECT_EQ(Status::Ok, driver->remove(makeView("dog")));
-  EXPECT_EQ(Status::NotFound, driver->remove(makeView("fox")));
+  EXPECT_EQ(Status::Ok, driver->remove(makeHK("dog")));
+  EXPECT_EQ(Status::NotFound, driver->remove(makeHK("fox")));
   EXPECT_EQ(Status::Ok, driver->lookup(log[0].key(), value));
   EXPECT_EQ(log[0].value(), value.view());
   EXPECT_EQ(Status::NotFound, driver->lookup(log[1].key(), value));
-  EXPECT_EQ(Status::NotFound, driver->remove(makeView("dog")));
-  EXPECT_EQ(Status::NotFound, driver->remove(makeView("fox")));
-  EXPECT_EQ(Status::Ok, driver->remove(makeView("cat")));
+  EXPECT_EQ(Status::NotFound, driver->remove(makeHK("dog")));
+  EXPECT_EQ(Status::NotFound, driver->remove(makeHK("fox")));
+  EXPECT_EQ(Status::Ok, driver->remove(makeHK("cat")));
   EXPECT_EQ(Status::NotFound, driver->lookup(log[0].key(), value));
   EXPECT_EQ(Status::NotFound, driver->lookup(log[1].key(), value));
 }
 
+// Test precise remove flag works
+TEST(BlockCache, PreciseRemove) {
+  {
+    // default, not preciseRemove.
+    auto collision = CollisionCreator("key", "value", "abc");
+    Buffer value;
+    // Behavior: old "key" can remove the entry "key"+"abc": "value".
+    EXPECT_EQ(Status::Ok, collision.driver->remove(makeHK("key")));
+    collision.driver->getCounters([](folly::StringPiece name, double count) {
+      // The counter is not populated because preciseRemove_ and item
+      // destructors are not triggered.
+      if (name == "navy_bc_remove_attempt_collisions") {
+        EXPECT_EQ(0, count);
+      }
+    });
+  }
+
+  {
+    // With preciseRemove.
+    auto collision =
+        CollisionCreator("key", "value", "abc",
+                         [](BlockCache::Config& c) { c.preciseRemove = true; });
+    Buffer value;
+    // Behavior: old "key" can not remove the entry "key"+"abc": "value"
+    EXPECT_EQ(Status::NotFound, collision.driver->remove(makeHK("key")));
+    collision.driver->getCounters([](folly::StringPiece name, double count) {
+      // The counter is populated
+      if (name == "navy_bc_remove_attempt_collisions") {
+        EXPECT_EQ(1, count);
+      }
+    });
+  }
+
+  {
+    // Without preciseRemove, with item destructor. Remove is not precise, but
+    // the ODS counter should be incremented.
+    MockDestructor cb;
+
+    auto collision =
+        CollisionCreator("key", "value", "abc", [&cb](BlockCache::Config& c) {
+          c.itemDestructorEnabled = true;
+          c.destructorCb = toCallback(cb);
+        });
+    Buffer value;
+
+    // Behavior: old "key" can not remove the entry "key"+"abc": "value"
+    EXPECT_EQ(Status::Ok, collision.driver->remove(makeHK("key")));
+    collision.driver->getCounters([](folly::StringPiece name, double count) {
+      // The counter is populated.
+      if (name == "navy_bc_remove_attempt_collisions") {
+        EXPECT_EQ(1, count);
+      }
+    });
+  }
+}
+
 TEST(BlockCache, CollisionOverwrite) {
-  // We can't make up a collision easily. Instead, let's write a key and then
-  // modify it on device (memory device in this case).
-  std::vector<uint32_t> hits(4);
-  auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
-  auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
-  auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
-  auto engine = makeEngine(std::move(config));
-  auto driver = makeDriver(std::move(engine), std::move(ex));
-  CacheEntry e{strzBuffer("key"), strzBuffer("value")};
-  EXPECT_EQ(Status::Ok, driver->insert(e.key(), e.value()));
-
+  auto collision = CollisionCreator("key", "value", "abc");
   Buffer value;
-  EXPECT_EQ(Status::Ok, driver->lookup(makeView("key"), value));
-  EXPECT_EQ(makeView("value"), value.view());
-  driver->flush();
-
-  uint8_t buf[512]{}; // 512 is the minimal alloc alignment size
-  ASSERT_TRUE(device->read(0, sizeof(buf), buf));
-  constexpr uint32_t kKeySize{3}; // "key"
-  size_t keyOffset = sizeof(buf) - kSizeOfEntryDesc - kKeySize;
-  BufferView keyOnDevice{kKeySize, buf + keyOffset};
-  ASSERT_EQ(keyOnDevice, makeView("key"));
-
-  std::memcpy(buf + keyOffset, "abc", 3);
-  ASSERT_TRUE(device->write(0, Buffer{BufferView{sizeof(buf), buf}}));
   // Original key is not found, because it didn't pass key equality check
-  EXPECT_EQ(Status::NotFound, driver->lookup(makeView("key"), value));
+  EXPECT_EQ(Status::NotFound, collision.driver->lookup(makeHK("key"), value));
 }
 
 TEST(BlockCache, SimpleReclaim) {
@@ -857,7 +942,7 @@ TEST(BlockCache, ReadRegionDuringEviction) {
     for (size_t i = 0; i < 4; i++) {
       CacheEntry e{bg.gen(8), bg.gen(3800)};
       driver->insertAsync(e.key(), e.value(),
-                          [](Status status, BufferView /*key */) {
+                          [](Status status, HashedKey /*key */) {
                             EXPECT_EQ(Status::Ok, status);
                           });
       log.push_back(std::move(e));
@@ -883,10 +968,9 @@ TEST(BlockCache, ReadRegionDuringEviction) {
   // to evict the first region eventually for the reclaim.
   CacheEntry e{bg.gen(8), bg.gen(1000)};
   EXPECT_EQ(0, exPtr->getQueueSize());
-  driver->insertAsync(e.key(), e.value(),
-                      [](Status status, BufferView /*key */) {
-                        EXPECT_EQ(Status::Ok, status);
-                      });
+  driver->insertAsync(
+      e.key(), e.value(),
+      [](Status status, HashedKey /*key */) { EXPECT_EQ(Status::Ok, status); });
   // Insert finds region is full and  puts region for tracking, resets allocator
   // and retries.
   EXPECT_TRUE(exPtr->runFirstIf("insert"));
@@ -959,18 +1043,18 @@ TEST(BlockCache, DeviceFailure) {
   auto value2 = bg.gen(800);
   auto value3 = bg.gen(800);
 
-  EXPECT_EQ(Status::Ok, driver->insert(makeView("key1"), value1.view()));
+  EXPECT_EQ(Status::Ok, driver->insert(makeHK("key1"), value1.view()));
   driver->flush();
-  EXPECT_EQ(Status::Ok, driver->insert(makeView("key2"), value2.view()));
+  EXPECT_EQ(Status::Ok, driver->insert(makeHK("key2"), value2.view()));
   driver->flush();
-  EXPECT_EQ(Status::Ok, driver->insert(makeView("key3"), value3.view()));
+  EXPECT_EQ(Status::Ok, driver->insert(makeHK("key3"), value3.view()));
   driver->flush();
 
   Buffer value;
-  EXPECT_EQ(Status::Ok, driver->lookup(makeView("key1"), value));
+  EXPECT_EQ(Status::Ok, driver->lookup(makeHK("key1"), value));
   EXPECT_EQ(value1.view(), value.view());
-  EXPECT_EQ(Status::DeviceError, driver->lookup(makeView("key2"), value));
-  EXPECT_EQ(Status::Ok, driver->lookup(makeView("key3"), value));
+  EXPECT_EQ(Status::DeviceError, driver->lookup(makeHK("key2"), value));
+  EXPECT_EQ(Status::Ok, driver->lookup(makeHK("key3"), value));
   EXPECT_EQ(value3.view(), value.view());
 }
 
@@ -1063,8 +1147,8 @@ TEST(BlockCache, DestructorCallback) {
     log.emplace_back(bg.gen(8), bg.gen(3'000));
     log.emplace_back(bg.gen(8), bg.gen(6'000));
     // 3rd region, 16k, overwrites
-    log.emplace_back(Buffer{log[0].key()}, bg.gen(8'000));
-    log.emplace_back(Buffer{log[3].key()}, bg.gen(8'000));
+    log.emplace_back(log[0].key(), bg.gen(8'000));
+    log.emplace_back(log[3].key(), bg.gen(8'000));
     // 4th region, 15k
     log.emplace_back(bg.gen(8), bg.gen(9'000));
     log.emplace_back(bg.gen(8), bg.gen(6'000));
@@ -1231,11 +1315,14 @@ TEST(BlockCache, RegionLastOffsetOnReset) {
 
 TEST(BlockCache, Recovery) {
   std::vector<uint32_t> hits(4);
+  uint32_t ioAlignSize = 4096;
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto& mp = *policy;
   size_t metadataSize = 3 * 1024 * 1024;
   auto deviceSize = metadataSize + kDeviceSize;
-  auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
+  // Create MemoryDevice with ioAlignSize{4096} allows Header to fit in.
+  auto device =
+      createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
   auto ex = makeJobScheduler();
   auto config = makeConfig(*ex, std::move(policy), *device);
   config.numInMemBuffers = 2;
@@ -1373,7 +1460,7 @@ TEST(BlockCache, RecoveryWithDifferentCacheSize) {
           Deserializer deserializer{iobuf->data(),
                                     iobuf->data() + iobuf->length()};
           auto c = deserializer.deserialize<serialization::BlockCacheConfig>();
-          c.cacheSize_ref() = *c.cacheSize_ref() + 4096;
+          c.cacheSize() = *c.cacheSize() + 4096;
           serializeProto(c, rw2);
         }));
     engine->persist(rw2);
@@ -1386,8 +1473,8 @@ TEST(BlockCache, RecoveryWithDifferentCacheSize) {
           Deserializer deserializer{iobuf->data(),
                                     iobuf->data() + iobuf->length()};
           auto c = deserializer.deserialize<serialization::BlockCacheConfig>();
-          c.version_ref() = 11;
-          c.cacheSize_ref() = *c.cacheSize_ref() + 4096;
+          c.version() = 11;
+          c.cacheSize() = *c.cacheSize() + 4096;
           serializeProto(c, rw3);
         }));
     engine->persist(rw3);
@@ -1461,6 +1548,8 @@ TEST(BlockCache, RecoveryWithDifferentCacheSize) {
 //
 TEST(BlockCache, SmallerSlotSizes) {
   std::vector<uint32_t> hits(4);
+  uint32_t ioAlignSize = 4096;
+
   {
     auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
     auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
@@ -1475,7 +1564,9 @@ TEST(BlockCache, SmallerSlotSizes) {
     }
   }
   const uint64_t myDeviceSize = 16 * 1024 * 1024;
-  auto device = createMemoryDevice(myDeviceSize, nullptr /* encryption */);
+  // Create MemoryDevice with ioAlignSize{4096} allows Header to fit in.
+  auto device =
+      createMemoryDevice(myDeviceSize, nullptr /* encryption */, ioAlignSize);
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   size_t metadataSize = 3 * 1024 * 1024;
   auto ex = makeJobScheduler();
@@ -1522,10 +1613,13 @@ TEST(BlockCache, SmallerSlotSizes) {
 
 TEST(BlockCache, HoleStatsRecovery) {
   std::vector<uint32_t> hits(4);
+  uint32_t ioAlignSize = 4096;
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   size_t metadataSize = 3 * 1024 * 1024;
   auto deviceSize = metadataSize + kDeviceSize;
-  auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
+  // Create MemoryDevice with ioAlignSize{4096} allows Header to fit in.
+  auto device =
+      createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
   auto ex = makeJobScheduler();
   auto config = makeConfig(*ex, std::move(policy), *device);
   auto engine = makeEngine(std::move(config), metadataSize);
@@ -1817,10 +1911,13 @@ TEST(BlockCache, HitsReinsertionPolicy) {
 
 TEST(BlockCache, HitsReinsertionPolicyRecovery) {
   std::vector<uint32_t> hits(4);
+  uint32_t ioAlignSize = 4096;
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   size_t metadataSize = 3 * 1024 * 1024;
   auto deviceSize = metadataSize + kDeviceSize;
-  auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
+  // Create MemoryDevice with ioAlignSize{4096} allows Header to fit in.
+  auto device =
+      createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
   auto ex = makeJobScheduler();
   auto config = makeConfig(*ex, std::move(policy), *device);
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
@@ -2042,8 +2139,8 @@ TEST(BlockCache, testItemDestructor) {
     log.emplace_back(Buffer{makeView("key_003")}, bg.gen(3'000));
     log.emplace_back(Buffer{makeView("key_004")}, bg.gen(6'000));
     // 3rd region, 16k, overwrites
-    log.emplace_back(Buffer{log[0].key()}, bg.gen(8'000));
-    log.emplace_back(Buffer{log[3].key()}, bg.gen(8'000));
+    log.emplace_back(log[0].key(), bg.gen(8'000));
+    log.emplace_back(log[3].key(), bg.gen(8'000));
     // 4th region, 15k
     log.emplace_back(Buffer{makeView("key_007")}, bg.gen(9'000));
     log.emplace_back(Buffer{makeView("key_008")}, bg.gen(6'000));
@@ -2053,8 +2150,8 @@ TEST(BlockCache, testItemDestructor) {
   MockDestructor cb;
   ON_CALL(cb, call(_, _, _))
       .WillByDefault(
-          Invoke([](BufferView key, BufferView val, DestructorEvent event) {
-            XLOGF(ERR, "cb key: {}, val: {}, event: {}", toString(key),
+          Invoke([](HashedKey key, BufferView val, DestructorEvent event) {
+            XLOGF(ERR, "cb key: {}, val: {}, event: {}", key.key(),
                   toString(val).substr(0, 20), toString(event));
           }));
 
@@ -2088,26 +2185,26 @@ TEST(BlockCache, testItemDestructor) {
 
   mockRegionsEvicted(mp, {0, 1, 2, 3, 1});
   for (size_t i = 0; i < 7; i++) {
-    XLOG(ERR, "insert ") << toString(log[i].key());
+    XLOG(ERR, "insert ") << log[i].key().key();
     EXPECT_EQ(Status::Ok, driver->insert(log[i].key(), log[i].value()));
   }
 
   // remove with cb triggers destructor Immediately
-  XLOG(ERR, "remove ") << toString(log[2].key());
+  XLOG(ERR, "remove ") << log[2].key().key();
   EXPECT_EQ(Status::Ok, driver->remove(log[2].key()));
 
   // remove with cb triggers destructor Immediately
-  XLOG(ERR, "remove ") << toString(log[0].key());
+  XLOG(ERR, "remove ") << log[0].key().key();
   EXPECT_EQ(Status::Ok, driver->remove(log[0].key()));
 
   // remove again
   EXPECT_EQ(Status::NotFound, driver->remove(log[2].key()));
   EXPECT_EQ(Status::NotFound, driver->remove(log[0].key()));
 
-  XLOG(ERR, "insert ") << toString(log[7].key());
+  XLOG(ERR, "insert ") << log[7].key().key();
   EXPECT_EQ(Status::Ok, driver->insert(log[7].key(), log[7].value()));
   // insert will trigger evictions
-  XLOG(ERR, "insert ") << toString(log[8].key());
+  XLOG(ERR, "insert ") << log[8].key().key();
   EXPECT_EQ(Status::Ok, driver->insert(log[8].key(), log[8].value()));
 
   Buffer value;
