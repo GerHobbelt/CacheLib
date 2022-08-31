@@ -16,12 +16,6 @@
 
 #pragma once
 
-#include <cachelib/allocator/CacheStats.h>
-#include <cachelib/common/Time.h>
-
-#include <chrono>
-
-#include "cachelib/common/Hash.h"
 namespace facebook {
 namespace cachelib {
 
@@ -1231,6 +1225,7 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
           config_.evictionSearchTries > searchTries) &&
          itr) {
     ++searchTries;
+    (*stats_.evictionAttempts)[pid][cid].inc();
 
     Item* candidate = itr.get();
     // for chained items, the ownership of the parent can change. We try to
@@ -2269,6 +2264,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
       cacheStats.insert(
           {cid,
            {allocSizes[cid], (*stats_.allocAttempts)[poolId][cid].get(),
+            (*stats_.evictionAttempts)[poolId][cid].get(),
             (*stats_.allocFailures)[poolId][cid].get(),
             (*stats_.fragmentationSize)[poolId][cid].get(), classHits,
             (*stats_.chainedItemEvictions)[poolId][cid].get(),
