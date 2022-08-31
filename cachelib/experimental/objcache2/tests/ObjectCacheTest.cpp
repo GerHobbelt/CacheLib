@@ -13,6 +13,18 @@ struct Foo {
   int b{};
   int c{};
 };
+
+struct Foo2 {
+  int d{};
+  int e{};
+  int f{};
+};
+
+struct Foo3 {
+  explicit Foo3(int& n) : numDtors_{n} {}
+  ~Foo3() { numDtors_++; }
+  int& numDtors_;
+};
 } // namespace
 
 template <typename AllocatorT>
@@ -24,13 +36,12 @@ class ObjectCacheTest : public ::testing::Test {
 
     for (uint8_t keySize = 8; keySize < 255; keySize++) {
       maxKeySizes.push_back(keySize);
-      allocSizes.push_back(
-          ObjectCache<AllocatorT>::template getL1AllocSize<Foo>(keySize));
+      allocSizes.push_back(ObjectCache<AllocatorT>::getL1AllocSize(keySize));
     }
 
     for (size_t i = 0; i < maxKeySizes.size(); i++) {
       EXPECT_TRUE(allocSizes[i] >= ObjectCache<AllocatorT>::kL1AllocSizeMin);
-      EXPECT_TRUE(maxKeySizes[i] + sizeof(ObjectCacheItem<Foo>) +
+      EXPECT_TRUE(maxKeySizes[i] + sizeof(ObjectCacheItem) +
                       sizeof(typename AllocatorT::Item) <=
                   allocSizes[i]);
       EXPECT_TRUE(allocSizes[i] % 8 == 0);
@@ -63,6 +74,63 @@ class ObjectCacheTest : public ::testing::Test {
     EXPECT_EQ(3, found2->c);
   }
 
+  void testMultiType() {
+    ObjectCacheConfig config;
+    config.l1EntriesLimit = 10'000;
+    config.setItemDestructor([&](ObjectCacheDestructorData ctx) {
+      if (ctx.key == "Foo") {
+        ctx.deleteObject<Foo>();
+      } else if (ctx.key == "Foo2") {
+        ctx.deleteObject<Foo2>();
+      }
+    });
+
+    auto objcache = ObjectCache<AllocatorT>::create(config);
+
+    auto foo = std::make_unique<Foo>();
+    foo->a = 1;
+    foo->b = 2;
+    foo->c = 3;
+    auto res1 = objcache->insertOrReplace("Foo", std::move(foo));
+    EXPECT_EQ(ObjectCache<AllocatorT>::AllocStatus::kSuccess, res1.first);
+
+    auto found1 = objcache->template find<Foo>("Foo");
+    ASSERT_NE(nullptr, found1);
+    EXPECT_EQ(1, found1->a);
+    EXPECT_EQ(2, found1->b);
+    EXPECT_EQ(3, found1->c);
+
+    auto foo2 = std::make_unique<Foo2>();
+    foo2->d = 4;
+    foo2->e = 5;
+    foo2->f = 6;
+    auto res2 = objcache->insertOrReplace("Foo2", std::move(foo2));
+    EXPECT_EQ(ObjectCache<AllocatorT>::AllocStatus::kSuccess, res2.first);
+
+    auto found2 = objcache->template find<Foo2>("Foo2");
+    ASSERT_NE(nullptr, found2);
+    EXPECT_EQ(4, found2->d);
+    EXPECT_EQ(5, found2->e);
+    EXPECT_EQ(6, found2->f);
+  }
+
+  void testUserItemDestructor() {
+    int numDtors = 0;
+    ObjectCacheConfig config;
+    config.l1EntriesLimit = 10'000;
+    config.setItemDestructor(
+        [&](ObjectCacheDestructorData ctx) { ctx.deleteObject<Foo3>(); });
+    auto objcache = ObjectCache<AllocatorT>::create(config);
+    for (int i = 0; i < 10; i++) {
+      objcache->insertOrReplace(folly::sformat("key_{}", i),
+                                std::make_unique<Foo3>(numDtors));
+    }
+    for (int i = 0; i < 10; i++) {
+      objcache->remove(folly::sformat("key_{}", i));
+    }
+    ASSERT_EQ(10, numDtors);
+  }
+
   void testExpiration() {
     ObjectCacheConfig config;
     config.l1EntriesLimit = 10'000;
@@ -73,8 +141,14 @@ class ObjectCacheTest : public ::testing::Test {
     foo->b = 2;
     foo->c = 3;
 
+    int ttlSecs = 2;
+    // test bad API call
+    ASSERT_THROW(objcache->insertOrReplace(
+                     "Foo", std::move(std::make_unique<Foo>()), ttlSecs),
+                 std::invalid_argument);
+
     objcache->insertOrReplace("Foo", std::move(foo), 0 /*object size*/,
-                              2 /* seconds */);
+                              ttlSecs);
 
     auto found1 = objcache->template find<Foo>("Foo");
     ASSERT_NE(nullptr, found1);
@@ -130,6 +204,11 @@ class ObjectCacheTest : public ::testing::Test {
     ObjectCacheConfig config;
     config.l1EntriesLimit = 10'000;
     auto objcache = ObjectCache<AllocatorT>::template create<Foo>(config);
+
+    // test bad API call
+    ASSERT_THROW(objcache->insert("Foo", std::move(std::make_unique<Foo>()),
+                                  2 /* TTL seconds */),
+                 std::invalid_argument);
 
     auto foo1 = std::make_unique<Foo>();
     foo1->a = 1;
@@ -454,6 +533,10 @@ using AllocatorTypes = ::testing::Types<LruAllocator,
 TYPED_TEST_CASE(ObjectCacheTest, AllocatorTypes);
 TYPED_TEST(ObjectCacheTest, GetAllocSize) { this->testGetAllocSize(); }
 TYPED_TEST(ObjectCacheTest, Simple) { this->testSimple(); }
+TYPED_TEST(ObjectCacheTest, MultiType) { this->testMultiType(); }
+TYPED_TEST(ObjectCacheTest, UserItemDestructor) {
+  this->testUserItemDestructor();
+}
 TYPED_TEST(ObjectCacheTest, Expiration) { this->testExpiration(); }
 TYPED_TEST(ObjectCacheTest, Replace) { this->testReplace(); }
 TYPED_TEST(ObjectCacheTest, UniqueInsert) { this->testUniqueInsert(); }

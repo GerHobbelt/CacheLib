@@ -126,13 +126,6 @@ struct CacheConfig : public JSONConfig {
   // appropriate ratios.
   std::vector<unsigned int> navySegmentedFifoSegmentRatio{};
 
-  // size classes for large objects in Navy that exceed the
-  // @navySmallItemMaxSize. Must be multiples of @navyBlockSize unless
-  // in-mem buffer is enabled. If empty, navy will use stack allocation mode.
-  std::vector<uint32_t> navySizeClasses{512,      2 * 512,  3 * 512,
-                                        4 * 512,  6 * 512,  8 * 512,
-                                        12 * 512, 16 * 512, 32 * 512};
-
   // Number of shards expressed as power of two for request ordering in
   // Navy. If 0, the default configuration of Navy(20) is used.
   uint64_t navyReqOrderShardsPower{21};

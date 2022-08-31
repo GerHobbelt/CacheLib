@@ -21,17 +21,20 @@ namespace cachelib {
 namespace objcache2 {
 template <typename AllocatorT>
 void ObjectCacheSizeController<AllocatorT>::work() {
-  auto totalObjSize = objCache_.getTotalObjectSize();
   auto currentNumEntries = objCache_.getNumEntries();
+  if (currentNumEntries == 0) {
+    return;
+  }
+  auto totalObjSize = objCache_.getTotalObjectSize();
   // Do the calculation only when total object size or total object number
   // achieves the threshold. This is to avoid unreliable calculation of average
   // object size when the cache is new and only has a few objects.
-  if (totalObjSize >
-          kSizeControllerThresholdPct * objCache_.cacheSizeLimit_ / 100 ||
-      currentNumEntries >
-          kSizeControllerThresholdPct * objCache_.l1EntriesLimit_ / 100) {
+  if (totalObjSize > kSizeControllerThresholdPct *
+                         objCache_.config_.cacheSizeLimit / 100 ||
+      currentNumEntries > kSizeControllerThresholdPct *
+                              objCache_.config_.l1EntriesLimit / 100) {
     auto averageObjSize = totalObjSize / currentNumEntries;
-    auto newEntriesLimit = objCache_.cacheSizeLimit_ / averageObjSize;
+    auto newEntriesLimit = objCache_.config_.cacheSizeLimit / averageObjSize;
     if (newEntriesLimit < currentEntriesLimit_ &&
         currentNumEntries >= newEntriesLimit) {
       // shrink cache when getting a lower new limit and current entries num
@@ -60,7 +63,7 @@ void ObjectCacheSizeController<AllocatorT>::shrinkCacheByEntriesNum(
   auto size = objCache_.placeholders_.size();
   for (size_t i = size; i < size + entries; i++) {
     auto key = objCache_.getPlaceHolderKey(i);
-    auto success = objCache_.template allocatePlaceholder<int>(key);
+    auto success = objCache_.allocatePlaceholder(key);
     if (!success) {
       XLOGF(ERR, "Couldn't allocate {}", key);
     } else {
@@ -101,7 +104,7 @@ ObjectCacheSizeController<AllocatorT>::ObjectCacheSizeController(
     ObjectCache& objCache, const util::Throttler::Config& throttlerConfig)
     : throttlerConfig_(throttlerConfig),
       objCache_(objCache),
-      currentEntriesLimit_(objCache_.l1EntriesLimit_) {}
+      currentEntriesLimit_(objCache_.config_.l1EntriesLimit) {}
 
 } // namespace objcache2
 } // namespace cachelib
