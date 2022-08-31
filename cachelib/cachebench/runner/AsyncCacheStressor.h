@@ -21,7 +21,6 @@
 
 #include <atomic>
 #include <cstddef>
-#include <cstdint>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -40,14 +39,14 @@ namespace facebook {
 namespace cachelib {
 namespace cachebench {
 
-constexpr uint32_t kNvmCacheWarmUpCheckRate = 1000;
+constexpr uint32_t kNvmAsyncCacheWarmUpCheckRate = 1000;
 
 // Implementation of stressor that uses a workload generator to stress an
-// instance of the cache.  All item's value in CacheStressor follows CacheValue
-// schema, which contains a few integers for sanity checks use. So it is invalid
-// to use item.getMemory and item.getSize APIs.
+// instance of the cache.  All item's value in AsyncCacheStressor follows
+// CacheValue schema, which contains a few integers for sanity checks use. So it
+// is invalid to use item.getMemory and item.getSize APIs.
 template <typename Allocator>
-class CacheStressor : public Stressor {
+class AsyncCacheStressor : public Stressor {
  public:
   using CacheT = Cache<Allocator>;
   using Key = typename CacheT::Key;
@@ -56,9 +55,9 @@ class CacheStressor : public Stressor {
   // @param cacheConfig   the config to instantiate the cache instance
   // @param config        stress test config
   // @param generator     workload  generator
-  CacheStressor(CacheConfig cacheConfig,
-                StressorConfig config,
-                std::unique_ptr<GeneratorBase>&& generator)
+  AsyncCacheStressor(CacheConfig cacheConfig,
+                     StressorConfig config,
+                     std::unique_ptr<GeneratorBase>&& generator)
       : config_(std::move(config)),
         throughputStats_(config_.numThreads),
         wg_(std::move(generator)),
@@ -75,7 +74,7 @@ class CacheStressor : public Stressor {
       struct CacheStressSyncObj : public CacheT::SyncObj {
         std::unique_lock<folly::SharedMutex> lock;
 
-        CacheStressSyncObj(CacheStressor& s, std::string itemKey)
+        CacheStressSyncObj(AsyncCacheStressor& s, std::string itemKey)
             : lock{s.chainedItemAcquireUniqueLock(itemKey)} {}
       };
       movingSync = [this](typename CacheT::Item::Key key) {
@@ -96,8 +95,8 @@ class CacheStressor : public Stressor {
       cacheConfig.ticker = ticker_;
     }
 
-    cache_ = std::make_unique<CacheT>(cacheConfig, movingSync,
-                                      cacheConfig.cacheDir, config_.touchValue);
+    cache_ = std::make_unique<CacheT>(cacheConfig, movingSync, "",
+                                      config_.touchValue);
     if (config_.opPoolDistribution.size() > cache_->numPools()) {
       throw std::invalid_argument(folly::sformat(
           "more pools specified in the test than in the cache. "
@@ -120,7 +119,7 @@ class CacheStressor : public Stressor {
     }
   }
 
-  ~CacheStressor() override { finish(); }
+  ~AsyncCacheStressor() override { finish(); }
 
   // Start the stress test by spawning the worker threads and waiting for them
   // to finish the stress operations.
@@ -475,7 +474,7 @@ class CacheStressor : public Stressor {
       }
       // TODO: allow callback on nvm eviction instead of checking it repeatedly.
       if (config_.checkNvmCacheWarmUp &&
-          folly::Random::oneIn(kNvmCacheWarmUpCheckRate)) {
+          folly::Random::oneIn(kNvmAsyncCacheWarmUpCheckRate)) {
         checkNvmCacheWarmedUp(req.timestamp);
       }
       return req;
