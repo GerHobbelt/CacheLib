@@ -14,25 +14,9 @@
  * limitations under the License.
  */
 
-#include <folly/DynamicConverter.h>
-#include <folly/Format.h>
-#include <folly/json.h>
-#include <folly/logging/xlog.h>
-#include <gflags/gflags.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-
-#include <iostream>
-
-#include "cachelib/allocator/Util.h"
-#include "cachelib/allocator/nvmcache/NavyConfig.h"
-#include "cachelib/cachebench/cache/ItemRecords.h"
-#include "cachelib/cachebench/util/NandWrites.h"
-
 namespace facebook {
 namespace cachelib {
 namespace cachebench {
-
 template <typename Allocator>
 uint64_t Cache<Allocator>::fetchNandWrites() const {
   size_t total = 0;
@@ -226,6 +210,10 @@ Cache<Allocator>::Cache(const CacheConfig& config,
         XLOG(ERR) << "CAST ERROR " << e.what();
         throw;
       }
+    } else if (config_.nvmAdmissionRetentionTimeThreshold > 0) {
+      nvmAdmissionPolicy_ = std::make_shared<RetentionAP<Allocator>>(
+          config_.nvmAdmissionRetentionTimeThreshold);
+      allocatorConfig_.setNvmCacheAdmissionPolicy(nvmAdmissionPolicy_);
     }
 
     allocatorConfig_.setNvmAdmissionMinTTL(config_.memoryOnlyTTL);
@@ -468,6 +456,63 @@ typename Cache<Allocator>::ReadHandle Cache<Allocator>::find(Key key) {
     invalidKeys_[key.str()].store(true, std::memory_order_relaxed);
   }
   return it;
+}
+
+template <typename Allocator>
+folly::SemiFuture<typename Cache<Allocator>::ReadHandle>
+Cache<Allocator>::asyncFind(Key key) {
+  auto findFn = [&]() {
+    util::LatencyTracker tracker;
+    if (FLAGS_report_api_latency) {
+      tracker = util::LatencyTracker(cacheFindLatency_);
+    }
+    // find from cache, don't wait for the result to be ready.
+    auto it = cache_->find(key);
+
+    if (it.isReady()) {
+      if (touchValueEnabled()) {
+        touchValue(it);
+      }
+
+      return std::move(it).toSemiFuture();
+    }
+
+    // if the handle is not ready, return a SemiFuture with deferValue for
+    // touchValue
+    return std::move(it).toSemiFuture().deferValue(
+        [this, t = std::move(tracker)](auto handle) {
+          if (touchValueEnabled()) {
+            touchValue(handle);
+          }
+          return handle;
+        });
+  };
+
+  if (!consistencyCheckEnabled()) {
+    return findFn();
+  }
+
+  auto opId = valueTracker_->beginGet(key);
+  auto sf = findFn();
+
+  if (sf.isReady()) {
+    if (checkGet(opId, sf.value())) {
+      invalidKeys_[key.str()].store(true, std::memory_order_relaxed);
+    }
+
+    return sf;
+  }
+
+  // if the handle is not ready, return a SemiFuture with deferValue for
+  // checking consistency
+  return std::move(sf).deferValue(
+      [this, opId = std::move(opId), key = std::move(key)](auto handle) {
+        if (checkGet(opId, handle)) {
+          invalidKeys_[key.str()].store(true, std::memory_order_relaxed);
+        }
+
+        return handle;
+      });
 }
 
 template <typename Allocator>
