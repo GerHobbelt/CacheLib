@@ -1688,9 +1688,42 @@ CacheAllocator<CacheTrait>::getMMContainer(PoolId pid,
 }
 
 template <typename CacheTrait>
+MMContainerStat CacheAllocator<CacheTrait>::getMMContainerStat(
+    PoolId pid, ClassId cid) const noexcept {
+  if (static_cast<size_t>(pid) >= mmContainers_.size()) {
+    return MMContainerStat{};
+  }
+  if (static_cast<size_t>(cid) >= mmContainers_[pid].size()) {
+    return MMContainerStat{};
+  }
+  return mmContainers_[pid][cid] ? mmContainers_[pid][cid]->getStats()
+                                 : MMContainerStat{};
+}
+
+template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::ReadHandle
 CacheAllocator<CacheTrait>::peek(typename Item::Key key) {
   return findInternal(key);
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::couldExistFast(typename Item::Key key) {
+  // At this point, a key either definitely exists or does NOT exist in cache
+  auto handle = findFastInternal(key, AccessMode::kRead);
+  if (handle) {
+    if (handle->isExpired()) {
+      return false;
+    }
+    return true;
+  }
+
+  if (!nvmCache_) {
+    return false;
+  }
+
+  // When we have to go to NvmCache, we can only probalistically determine
+  // if a key could possibly exist in cache, or definitely NOT exist.
+  return nvmCache_->couldExistFast(HashedKey{key});
 }
 
 template <typename CacheTrait>
@@ -2259,7 +2292,6 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
   // TODO export evictions, numItems etc from compact cache directly.
   if (!isCompactCache) {
     for (const ClassId cid : classIds) {
-      const auto& container = getMMContainer(poolId, cid);
       uint64_t classHits = (*stats_.cacheHits)[poolId][cid].get();
       cacheStats.insert(
           {cid,
@@ -2269,7 +2301,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
             (*stats_.fragmentationSize)[poolId][cid].get(), classHits,
             (*stats_.chainedItemEvictions)[poolId][cid].get(),
             (*stats_.regularItemEvictions)[poolId][cid].get(),
-            container.getStats()}});
+            getMMContainerStat(poolId, cid)}});
       totalHits += classHits;
     }
   }

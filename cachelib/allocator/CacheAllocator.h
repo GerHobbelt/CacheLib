@@ -550,6 +550,17 @@ class CacheAllocator : public CacheBase {
   //              not exist.
   FOLLY_ALWAYS_INLINE ReadHandle peek(Key key);
 
+  // Returns true if a key is potentially in cache. There is a non-zero chance
+  // the key does not exist in cache (e.g. hash collision in NvmCache). This
+  // check is meant to be synchronous and fast as we only check DRAM cache and
+  // in-memory index for NvmCache. Similar to peek, this does not indicate to
+  // cachelib you have looked up an item (i.e. no stats bump, no eviction queue
+  // promotion, etc.)
+  //
+  // @param key   the key for lookup
+  // @return      true if the key could exist, false otherwise
+  bool couldExistFast(Key key);
+
   // Mark an item that was fetched through peek as useful. This is useful when
   // users want to look into the cache and only mark items as useful when they
   // inspect the contents of it.
@@ -1340,11 +1351,10 @@ class CacheAllocator : public CacheBase {
 
   MMContainer& getMMContainer(PoolId pid, ClassId cid) const noexcept;
 
-  // acquire the MMContainer for the give pool and class id and creates one
-  // if it does not exist.
-  //
-  // @return pointer to a valid MMContainer that is initialized.
-  MMContainer& getEvictableMMContainer(PoolId pid, ClassId cid) const noexcept;
+  // Get stats of the specified pid and cid.
+  // If such mmcontainer is not valid (pool id or cid out of bound)
+  // or the mmcontainer is not initialized, return an empty stat.
+  MMContainerStat getMMContainerStat(PoolId pid, ClassId cid) const noexcept;
 
   // create a new cache allocation. The allocation can be initialized
   // appropriately and made accessible through insert or insertOrReplace.
