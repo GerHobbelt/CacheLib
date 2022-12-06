@@ -717,10 +717,14 @@ std::unique_ptr<folly::IOBuf> NvmCache<C>::createItemAsIOBuf(
 
   stats().numNvmAllocForItemDestructor.inc();
   std::unique_ptr<folly::IOBuf> head;
+
   try {
-    // use the original alloc size to allocate, but make sure that the usable
-    // size matches the pBlob's size
-    auto size = Item::getRequiredSize(key, pBlob.origAllocSize);
+    // Use the pBlob's actual size instead of origAllocSize
+    // because the slack space might be used if nvmcache is configured
+    // with useTruncatedAllocSize == false
+    XDCHECK_LE(pBlob.origAllocSize, pBlob.data.size());
+    auto size = Item::getRequiredSize(key, pBlob.data.size());
+
     head = folly::IOBuf::create(size);
     head->append(size);
   } catch (const std::bad_alloc&) {
@@ -733,7 +737,7 @@ std::unique_ptr<folly::IOBuf> NvmCache<C>::createItemAsIOBuf(
 
   XDCHECK_LE(pBlob.origAllocSize, item->getSize());
   XDCHECK_LE(pBlob.origAllocSize, pBlob.data.size());
-  ::memcpy(item->getMemory(), pBlob.data.data(), pBlob.origAllocSize);
+  ::memcpy(item->getMemory(), pBlob.data.data(), pBlob.data.size());
   item->markNvmClean();
   item->markNvmEvicted();
 
@@ -844,7 +848,7 @@ typename NvmCache<C>::SampleItem NvmCache<C>::getSampleItem() {
   navy::Buffer value;
   auto [status, keyStr] = navyCache_->getRandomAlloc(value);
   if (status != navy::Status::Ok) {
-    return SampleItem{};
+    return SampleItem{true /* fromNvm */};
   }
 
   folly::StringPiece key(keyStr);
@@ -860,7 +864,7 @@ typename NvmCache<C>::SampleItem NvmCache<C>::getSampleItem() {
 
   auto iobufs = createItemAsIOBuf(key, nvmItem, true /* parentOnly */);
   if (!iobufs) {
-    return SampleItem{};
+    return SampleItem{true /* fromNvm */};
   }
 
   return SampleItem(std::move(*iobufs.release()), poolId, clsId, allocSize,

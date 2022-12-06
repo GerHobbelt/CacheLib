@@ -223,10 +223,10 @@ class CacheAllocator : public CacheBase {
   // internal resource (e.g., ref counts, buffer) will be managed by the iobuf
   class SampleItem {
    public:
-    SampleItem() = default;
+    explicit SampleItem(bool fromNvm) : fromNvm_{fromNvm} {}
 
     SampleItem(folly::IOBuf&& iobuf, const AllocInfo& allocInfo, bool fromNvm)
-        : iobuf_(std::move(iobuf)), allocInfo_(allocInfo), fromNvm_(fromNvm) {}
+        : iobuf_{std::move(iobuf)}, allocInfo_{allocInfo}, fromNvm_{fromNvm} {}
 
     SampleItem(folly::IOBuf&& iobuf,
                PoolId poolId,
@@ -1826,7 +1826,7 @@ class CacheAllocator : public CacheBase {
     // detection.
     folly::annotate_ignore_thread_sanitizer_guard g(__FILE__, __LINE__);
     auto slabsSkipped = allocator_->forEachAllocation(std::forward<Fn>(f));
-    stats().numSkippedSlabReleases.add(slabsSkipped);
+    stats().numReaperSkippedSlabs.add(slabsSkipped);
   }
 
   // returns true if nvmcache is enabled and we should write this item to
