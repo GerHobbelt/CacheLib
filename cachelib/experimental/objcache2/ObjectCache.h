@@ -23,15 +23,20 @@
 #include <memory>
 #include <mutex>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "cachelib/allocator/CacheAllocator.h"
 #include "cachelib/common/EventInterface.h"
+#include "cachelib/common/Serialization.h"
 #include "cachelib/common/Time.h"
 #include "cachelib/experimental/objcache2/ObjectCacheBase.h"
+#include "cachelib/experimental/objcache2/ObjectCacheConfig.h"
 #include "cachelib/experimental/objcache2/ObjectCacheSizeController.h"
+#include "cachelib/experimental/objcache2/persistence/Persistence.h"
+#include "cachelib/experimental/objcache2/persistence/gen-cpp2/persistent_data_types.h"
 
 namespace facebook {
 namespace cachelib {
@@ -64,89 +69,6 @@ struct ObjectCacheDestructorData {
   const KAllocation::Key& key;
 };
 
-template <typename ObjectCache>
-struct ObjectCacheConfig {
-  // With size controller disabled, above this many entries, L1 will start
-  // evicting.
-  // With size controller enabled, this is only a hint used for initialization.
-  size_t l1EntriesLimit{};
-
-  // This controls how many buckets are present in L1's hashtable
-  uint32_t l1HashTablePower{10};
-
-  // This controls how many locks are present in L1's hashtable
-  uint32_t l1LockPower{10};
-
-  // Number of shards to improve insert/remove concurrency
-  size_t l1NumShards{1};
-
-  // The cache name
-  std::string cacheName;
-
-  // The maximum key size in bytes. Default to 255 bytes which is the maximum
-  // key size cachelib supports.
-  uint8_t maxKeySizeBytes{255};
-
-  // If this is enabled, user has to pass the object size upon insertion
-  bool objectSizeTrackingEnabled{false};
-
-  // Period to fire size controller in milliseconds. 0 means size controller is
-  // disabled.
-  int sizeControllerIntervalMs{0};
-
-  // With size controller enabled, if total object size is above this limit,
-  // L1 will start evicting
-  size_t cacheSizeLimit{};
-
-  // Throttler config of size controller
-  util::Throttler::Config sizeControllerThrottlerConfig{};
-
-  // Enable event tracker. This will log all relevant cache events.
-  using Key = KAllocation::Key;
-  using EventTrackerSharedPtr = std::shared_ptr<EventInterface<Key>>;
-  EventTrackerSharedPtr eventTracker{nullptr};
-
-  ObjectCacheConfig& setEventTracker(EventTrackerSharedPtr&& ptr) {
-    eventTracker = std::move(ptr);
-    return *this;
-  }
-
-  // You MUST set this callback to release the removed/evicted/expired objects
-  // memory; otherwise, memory leak will happen.
-  // 1) store a single type Foo
-  // config.setItemDestructor([&](ObjectCacheDestructorData data) {
-  //         data.deleteObject<Foo>();
-  //     }
-  // });
-  //
-  // 2) store multiple types
-  // one way to do that is to encode the type in the key.
-  // Example:
-  // enum class user_defined_ObjectType {Foo1, Foo2, Foo3 };
-  //
-  // config.setItemDestructor([&](ObjectCacheDestructorData data) {
-  //     switch (user_defined_getType(data.key)) {
-  //       case user_defined_ObjectType::Foo1:
-  //         data.deleteObject<Foo1>();
-  //         break;
-  //       case user_defined_ObjectType::Foo2:
-  //         data.deleteObject<Foo2>();
-  //         break;
-  //       case user_defined_ObjectType::Foo3:
-  //         data.deleteObject<Foo3>();
-  //         break;
-  //       ...
-  //     }
-  // });
-  using ItemDestructor = std::function<void(ObjectCacheDestructorData)>;
-  ItemDestructor itemDestructor{};
-
-  ObjectCacheConfig& setItemDestructor(ItemDestructor destructor) {
-    itemDestructor = std::move(destructor);
-    return *this;
-  }
-};
-
 template <typename AllocatorT>
 class ObjectCache : public ObjectCacheBase<AllocatorT> {
  private:
@@ -154,11 +76,21 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   struct InternalConstructor {};
 
  public:
+  using ItemDestructor = std::function<void(ObjectCacheDestructorData)>;
+  using Key = KAllocation::Key;
   using Config = ObjectCacheConfig<ObjectCache<AllocatorT>>;
+  using Item = ObjectCacheItem;
+  using Serializer = ObjectSerializer<ObjectCache<AllocatorT>>;
+  using Deserializer = ObjectDeserializer<ObjectCache<AllocatorT>>;
+  using SerializeCb = std::function<std::unique_ptr<folly::IOBuf>(Serializer)>;
+  using DeserializeCb = std::function<bool(Deserializer)>;
+  using Persistor = Persistor<ObjectCache<AllocatorT>>;
+  using Restorer = Restorer<ObjectCache<AllocatorT>>;
+
   enum class AllocStatus { kSuccess, kAllocError, kKeyAlreadyExists };
 
   explicit ObjectCache(InternalConstructor, const Config& config)
-      : config_{config} {}
+      : config_(config.validate()) {}
 
   // Create an ObjectCache to store objects of one or more types
   //    - ItemDestructor must be set from ObjectCacheConfig
@@ -238,6 +170,18 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // Remove an object from cache by its key. No-op if object doesn't exist.
   // @param key   the key to the object.
   void remove(folly::StringPiece key);
+
+  // Persist all non-expired objects in the cache if cache persistence is
+  // enabled.
+  // No-op if cache persistence is not enabled.
+  // @return false if no persistence happened
+  bool persist();
+
+  // Recover non-expired objects to the cache if cache persistence is
+  // enabled.
+  // No-op if cache persistence is not enabled.
+  // @return false if no recovery happened
+  bool recover();
 
   // Get all the stats related to object-cache
   // @param visitor   callback that will be invoked with
@@ -337,6 +281,8 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
   template <typename AllocatorT2>
   friend class ObjectCacheSizeController;
+
+  friend Persistor;
 };
 } // namespace objcache2
 } // namespace cachelib

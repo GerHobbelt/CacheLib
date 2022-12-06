@@ -13,9 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
 
-#include <stdexcept>
 namespace facebook {
 namespace cachelib {
 namespace objcache2 {
@@ -24,13 +22,10 @@ template <typename AllocatorT>
 void ObjectCache<AllocatorT>::init() {
   // compute the approximate cache size using the l1EntriesLimit and
   // l1AllocSize
-  XCHECK(config_.l1EntriesLimit);
   auto l1AllocSize = getL1AllocSize(config_.maxKeySizeBytes);
-  const size_t l1SizeRequired = config_.l1EntriesLimit * l1AllocSize;
-  const size_t l1SizeRequiredSlabGranularity =
-      (l1SizeRequired / Slab::kSize + (l1SizeRequired % Slab::kSize != 0)) *
-      Slab::kSize;
-  auto cacheSize = l1SizeRequiredSlabGranularity + Slab::kSize;
+  const size_t l1SizeRequired =
+      util::getAlignedSize(config_.l1EntriesLimit * l1AllocSize, Slab::kSize);
+  auto cacheSize = l1SizeRequired + Slab::kSize;
 
   typename AllocatorT::Config l1Config;
   l1Config.setCacheName(config_.cacheName)
@@ -38,8 +33,6 @@ void ObjectCache<AllocatorT>::init() {
       .setAccessConfig({config_.l1HashTablePower, config_.l1LockPower})
       .setDefaultAllocSizes({l1AllocSize});
 
-  // TODO T121696070: Add validate() API in ObjectCacheConfig
-  XCHECK(config_.itemDestructor);
   l1Config.setItemDestructor([this](typename AllocatorT::DestructorData ctx) {
     if (ctx.context == DestructorContext::kEvictedFromRAM) {
       evictions_.inc();
@@ -287,9 +280,7 @@ uint32_t ObjectCache<AllocatorT>::getL1AllocSize(uint8_t maxKeySizeBytes) {
 
 template <typename AllocatorT>
 ObjectCache<AllocatorT>::~ObjectCache() {
-  if (config_.objectSizeTrackingEnabled) {
-    stopSizeController();
-  }
+  stopSizeController();
 
   for (auto itr = this->l1Cache_->begin(); itr != this->l1Cache_->end();
        ++itr) {
@@ -367,6 +358,35 @@ bool ObjectCache<AllocatorT>::stopSizeController(std::chrono::seconds timeout) {
   }
   sizeController_.reset();
   return ret;
+}
+
+template <typename AllocatorT>
+bool ObjectCache<AllocatorT>::persist() {
+  if (config_.persistBaseFilePath.empty() || !config_.serializeCb) {
+    return false;
+  }
+
+  // Stop all the other workers before persist
+  if (!stopSizeController()) {
+    return false;
+  }
+
+  if (!this->l1Cache_->stopWorkers()) {
+    return false;
+  }
+
+  Persistor persistor(config_.persistThreadCount, config_.persistBaseFilePath,
+                      config_.serializeCb, *this);
+  return persistor.run();
+}
+
+template <typename AllocatorT>
+bool ObjectCache<AllocatorT>::recover() {
+  if (config_.persistBaseFilePath.empty() || !config_.deserializeCb) {
+    return false;
+  }
+  Restorer restorer(config_.persistBaseFilePath, config_.deserializeCb, *this);
+  return restorer.run();
 }
 
 } // namespace objcache2

@@ -2,6 +2,8 @@
 
 #include "cachelib/allocator/CacheAllocator.h"
 #include "cachelib/experimental/objcache2/ObjectCache.h"
+#include "cachelib/experimental/objcache2/persistence/gen-cpp2/persistent_data_types.h"
+#include "cachelib/experimental/objcache2/tests/gen-cpp2/test_object_types.h"
 
 namespace facebook {
 namespace cachelib {
@@ -66,9 +68,83 @@ class ObjectCacheTest : public ::testing::Test {
     }
   }
 
+  void testConfigValidation() {
+    {
+      ObjectCacheConfig config;
+      config.setCacheName("test").setCacheCapacity(10'000);
+      EXPECT_THROW(config.validate(), std::invalid_argument);
+
+      EXPECT_THROW(ObjectCache::create(config), std::invalid_argument);
+
+      config.setItemDestructor(
+          [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+      EXPECT_NO_THROW(ObjectCache::create(config));
+
+      config.setCacheName("");
+      EXPECT_THROW(ObjectCache::create(config), std::invalid_argument);
+    }
+
+    {
+      // test size-aware cache config
+      ObjectCacheConfig config;
+      config.setCacheName("test").setItemDestructor(
+          [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+
+      // missing sizeControllerIntervalMs
+      EXPECT_THROW(config.setCacheCapacity(10'000, 100'000),
+                   std::invalid_argument);
+
+      // missing cacheSizeLimit
+      EXPECT_THROW(config.setCacheCapacity(10'000, 0, 10),
+                   std::invalid_argument);
+
+      config.setCacheCapacity(10'000, 100'000, 10);
+      EXPECT_NO_THROW(config.validate());
+    }
+
+    {
+      ObjectCacheConfig config;
+      // invalid thread count
+      EXPECT_THROW(config.enablePersistence(
+                       0, "persistent_file",
+                       [&](typename ObjectCache::Serializer serializer) {
+                         return serializer.template serialize<ThriftFoo>();
+                       },
+                       [&](typename ObjectCache::Deserializer deserializer) {
+                         return deserializer.template deserialize<ThriftFoo>();
+                       }),
+                   std::invalid_argument);
+      // invalid file path
+      EXPECT_THROW(config.enablePersistence(
+                       1, "",
+                       [&](typename ObjectCache::Serializer serializer) {
+                         return serializer.template serialize<ThriftFoo>();
+                       },
+                       [&](typename ObjectCache::Deserializer deserializer) {
+                         return deserializer.template deserialize<ThriftFoo>();
+                       }),
+                   std::invalid_argument);
+      // missing serialize callback
+      EXPECT_THROW(config.enablePersistence(
+                       1, "persistent_file", nullptr,
+                       [&](typename ObjectCache::Deserializer deserializer) {
+                         return deserializer.template deserialize<ThriftFoo>();
+                       }),
+                   std::invalid_argument);
+      // missing deserialize callback
+      EXPECT_THROW(config.enablePersistence(
+                       1, "persistent_file",
+                       [&](typename ObjectCache::Serializer serializer) {
+                         return serializer.template serialize<ThriftFoo>();
+                       },
+                       nullptr),
+                   std::invalid_argument);
+    }
+  }
+
   void testSimple() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
+    config.setCacheName("test").setCacheCapacity(10'000);
     config.setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
@@ -96,14 +172,14 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testMultiType() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor([&](ObjectCacheDestructorData data) {
-      if (data.key == "Foo") {
-        data.deleteObject<Foo>();
-      } else if (data.key == "Foo2") {
-        data.deleteObject<Foo2>();
-      }
-    });
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
+        [&](ObjectCacheDestructorData data) {
+          if (data.key == "Foo") {
+            data.deleteObject<Foo>();
+          } else if (data.key == "Foo2") {
+            data.deleteObject<Foo2>();
+          }
+        });
 
     auto objcache = ObjectCache::create(config);
 
@@ -136,8 +212,7 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testMultiTypePolymorphism() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<FooBase>(); });
 
     auto objcache = ObjectCache::create(config);
@@ -172,8 +247,7 @@ class ObjectCacheTest : public ::testing::Test {
   void testUserItemDestructor() {
     int numDtors = 0;
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo3>(); });
     auto objcache = ObjectCache::create(config);
     for (int i = 0; i < 10; i++) {
@@ -188,8 +262,7 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testExpiration() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -220,8 +293,7 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testReplace() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -261,8 +333,7 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testUniqueInsert() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -302,10 +373,12 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testObjectSizeTrackingBasics() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
-        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
-    config.objectSizeTrackingEnabled = true;
+    config.setCacheName("test")
+        .setCacheCapacity(10'000 /* l1EntriesLimit*/,
+                          10'000'000 /* cacheSizeLimit */,
+                          100 /* sizeControllerIntervalMs */)
+        .setItemDestructor(
+            [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
     EXPECT_EQ(objcache->getTotalObjectSize(), 0);
     auto foo1 = std::make_unique<Foo>();
@@ -360,10 +433,12 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testObjectSizeTrackingUniqueInsert() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
-        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
-    config.objectSizeTrackingEnabled = true;
+    config.setCacheName("test")
+        .setCacheCapacity(10'000 /* l1EntriesLimit*/,
+                          10'000'000 /* cacheSizeLimit */,
+                          100 /* sizeControllerIntervalMs */)
+        .setItemDestructor(
+            [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
     // will throw without the object size
@@ -403,12 +478,273 @@ class ObjectCacheTest : public ::testing::Test {
     EXPECT_EQ(3, found2->c);
   }
 
+  void testPersistence() {
+    auto persistBaseFilePath = std::tmpnam(nullptr);
+    ThriftFoo foo1;
+    foo1.a().value() = 1;
+    foo1.b().value() = 2;
+    foo1.c().value() = 3;
+
+    ThriftFoo foo2;
+    foo2.a().value() = 4;
+    foo2.b().value() = 5;
+    foo2.c().value() = 6;
+
+    auto objectSize1 = 1000;
+    auto objectSize2 = 500;
+    auto ttlSecs = 10;
+
+    size_t threadsCount = 10;
+
+    ObjectCacheConfig config;
+
+    config.setCacheName("test")
+        .setCacheCapacity(10'000 /*l1EntriesLimit*/)
+        .setItemDestructor([&](ObjectCacheDestructorData data) {
+          data.deleteObject<ThriftFoo>();
+        })
+        .enablePersistence(
+            threadsCount, persistBaseFilePath,
+            [&](typename ObjectCache::Serializer serializer) {
+              return serializer.template serialize<ThriftFoo>();
+            },
+            [&](typename ObjectCache::Deserializer deserializer) {
+              return deserializer.template deserialize<ThriftFoo>();
+            });
+    config.objectSizeTrackingEnabled = true;
+
+    {
+      auto objcache = ObjectCache::create(config);
+
+      auto object1 = std::make_unique<ThriftFoo>(foo1);
+      auto object2 = std::make_unique<ThriftFoo>(foo2);
+      objcache->insertOrReplace("Foo1", std::move(object1), objectSize1,
+                                ttlSecs);
+      objcache->insertOrReplace("Foo2", std::move(object2), objectSize2);
+      ASSERT_EQ(objcache->persist(), true);
+    }
+
+    // No objects should expire
+    {
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), true);
+
+      auto found1 = objcache->template find<ThriftFoo>("Foo1");
+      ASSERT_NE(nullptr, found1);
+      EXPECT_EQ(1, found1->a_ref());
+      EXPECT_EQ(2, found1->b_ref());
+      EXPECT_EQ(3, found1->c_ref());
+      auto found2 = objcache->template find<ThriftFoo>("Foo2");
+      ASSERT_NE(nullptr, found2);
+      EXPECT_EQ(4, found2->a_ref());
+      EXPECT_EQ(5, found2->b_ref());
+      EXPECT_EQ(6, found2->c_ref());
+
+      EXPECT_EQ(objectSize1 + objectSize2, objcache->getTotalObjectSize());
+    }
+
+    // Let Foo1 expire
+    std::this_thread::sleep_for(std::chrono::seconds{15});
+    {
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), true);
+
+      auto found1 = objcache->template find<ThriftFoo>("Foo1");
+      ASSERT_EQ(nullptr, found1);
+
+      auto found2 = objcache->template find<ThriftFoo>("Foo2");
+      ASSERT_NE(nullptr, found2);
+      EXPECT_EQ(4, found2->a_ref());
+      EXPECT_EQ(5, found2->b_ref());
+      EXPECT_EQ(6, found2->c_ref());
+      EXPECT_EQ(objectSize2, objcache->getTotalObjectSize());
+    }
+
+    // test recover failure
+    {
+      config.enablePersistence(
+          threadsCount, "random_path",
+          [&](typename ObjectCache::Serializer serializer) {
+            return serializer.template serialize<ThriftFoo>();
+          },
+          [&](typename ObjectCache::Deserializer deserializer) {
+            return deserializer.template deserialize<ThriftFoo>();
+          });
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), false);
+    }
+
+    // test different thread count won't fail recover
+    {
+      config.enablePersistence(
+          threadsCount - 2, persistBaseFilePath,
+          [&](typename ObjectCache::Serializer serializer) {
+            return serializer.template serialize<ThriftFoo>();
+          },
+          [&](typename ObjectCache::Deserializer deserializer) {
+            return deserializer.template deserialize<ThriftFoo>();
+          });
+
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), true);
+      auto found = objcache->template find<ThriftFoo>("Foo2");
+      ASSERT_NE(nullptr, found);
+      EXPECT_EQ(4, found->a_ref());
+      EXPECT_EQ(5, found->b_ref());
+      EXPECT_EQ(6, found->c_ref());
+      EXPECT_EQ(objectSize2, objcache->getTotalObjectSize());
+    }
+  }
+
+  void testPersistenceMultiType() {
+    auto persistBaseFilePath = std::tmpnam(nullptr);
+    ThriftFoo foo1;
+    foo1.a().value() = 1;
+    foo1.b().value() = 2;
+    foo1.c().value() = 3;
+
+    ThriftFoo2 foo2;
+    foo2.d().value() = 4;
+    foo2.e().value() = 5;
+    foo2.f().value() = 6;
+
+    auto objectSize1 = 1000;
+    auto objectSize2 = 500;
+    auto ttlSecs = 10;
+
+    size_t threadsCount = 10;
+
+    ObjectCacheConfig config;
+    config.setCacheName("test")
+        .setCacheCapacity(10'000 /*l1EntriesLimit*/)
+        .setItemDestructor([&](ObjectCacheDestructorData data) {
+          if (data.key == "Foo1") {
+            data.deleteObject<ThriftFoo>();
+          } else {
+            data.deleteObject<ThriftFoo2>();
+          }
+        })
+        .enablePersistence(
+            threadsCount, persistBaseFilePath,
+            [&](typename ObjectCache::Serializer serializer) {
+              if (serializer.key == "Foo1") {
+                return serializer.template serialize<ThriftFoo>();
+              } else {
+                return serializer.template serialize<ThriftFoo2>();
+              }
+            },
+            [&](typename ObjectCache::Deserializer deserializer) {
+              if (deserializer.key == "Foo1") {
+                return deserializer.template deserialize<ThriftFoo>();
+              } else {
+                return deserializer.template deserialize<ThriftFoo2>();
+              }
+            });
+    config.objectSizeTrackingEnabled = true;
+
+    {
+      auto objcache = ObjectCache::create(config);
+
+      auto object1 = std::make_unique<ThriftFoo>(foo1);
+      auto object2 = std::make_unique<ThriftFoo2>(foo2);
+      objcache->insertOrReplace("Foo1", std::move(object1), objectSize1,
+                                ttlSecs);
+      objcache->insertOrReplace("Foo2", std::move(object2), objectSize2);
+      ASSERT_EQ(objcache->persist(), true);
+    }
+
+    // No objects should expire
+    {
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), true);
+
+      auto found1 = objcache->template find<ThriftFoo>("Foo1");
+      ASSERT_NE(nullptr, found1);
+      EXPECT_EQ(1, found1->a_ref());
+      EXPECT_EQ(2, found1->b_ref());
+      EXPECT_EQ(3, found1->c_ref());
+      auto found2 = objcache->template find<ThriftFoo2>("Foo2");
+      ASSERT_NE(nullptr, found2);
+      EXPECT_EQ(4, found2->d_ref());
+      EXPECT_EQ(5, found2->e_ref());
+      EXPECT_EQ(6, found2->f_ref());
+
+      EXPECT_EQ(objectSize1 + objectSize2, objcache->getTotalObjectSize());
+    }
+
+    // Let Foo1 expire
+    std::this_thread::sleep_for(std::chrono::seconds{15});
+    {
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), true);
+
+      auto found1 = objcache->template find<ThriftFoo>("Foo1");
+      ASSERT_EQ(nullptr, found1);
+
+      auto found2 = objcache->template find<ThriftFoo2>("Foo2");
+      ASSERT_NE(nullptr, found2);
+      EXPECT_EQ(4, found2->d_ref());
+      EXPECT_EQ(5, found2->e_ref());
+      EXPECT_EQ(6, found2->f_ref());
+      EXPECT_EQ(objectSize2, objcache->getTotalObjectSize());
+    }
+
+    // test recover failure
+    {
+      config.enablePersistence(
+          threadsCount, "random_path",
+          [&](typename ObjectCache::Serializer serializer) {
+            if (serializer.key == "Foo1") {
+              return serializer.template serialize<ThriftFoo>();
+            } else {
+              return serializer.template serialize<ThriftFoo2>();
+            }
+          },
+          [&](typename ObjectCache::Deserializer deserializer) {
+            if (deserializer.key == "Foo1") {
+              return deserializer.template deserialize<ThriftFoo>();
+            } else {
+              return deserializer.template deserialize<ThriftFoo2>();
+            }
+          });
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), false);
+    }
+    // test different thread count won't fail recover
+    {
+      config.enablePersistence(
+          threadsCount - 2, persistBaseFilePath,
+          [&](typename ObjectCache::Serializer serializer) {
+            if (serializer.key == "Foo1") {
+              return serializer.template serialize<ThriftFoo>();
+            } else {
+              return serializer.template serialize<ThriftFoo2>();
+            }
+          },
+          [&](typename ObjectCache::Deserializer deserializer) {
+            if (deserializer.key == "Foo1") {
+              return deserializer.template deserialize<ThriftFoo>();
+            } else {
+              return deserializer.template deserialize<ThriftFoo2>();
+            }
+          });
+
+      auto objcache = ObjectCache::create(config);
+      ASSERT_EQ(objcache->recover(), true);
+      auto found = objcache->template find<ThriftFoo2>("Foo2");
+      ASSERT_NE(nullptr, found);
+      EXPECT_EQ(4, found->d_ref());
+      EXPECT_EQ(5, found->e_ref());
+      EXPECT_EQ(6, found->f_ref());
+      EXPECT_EQ(objectSize2, objcache->getTotalObjectSize());
+    }
+  }
+
   void testMultithreadReplace() {
     // Sanity test to see if insertOrReplace across multiple
     // threads are safe.
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -434,8 +770,7 @@ class ObjectCacheTest : public ::testing::Test {
     // Sanity test to see if evictions across multiple
     // threads are safe.
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 1000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(1000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -458,12 +793,12 @@ class ObjectCacheTest : public ::testing::Test {
 
   void testMultithreadSizeControl() {
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 200;
-    config.setItemDestructor(
-        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
-    config.objectSizeTrackingEnabled = true;
-    config.cacheSizeLimit = 100000;
-    config.sizeControllerIntervalMs = 100;
+    config.setCacheName("test")
+        .setCacheCapacity(200 /* l1EntriesLimit*/, 100000 /* cacheSizeLimit */,
+                          100 /* sizeControllerIntervalMs */)
+        .setItemDestructor(
+            [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+
     auto objcache = ObjectCache::create(config);
 
     auto runInsertOps = [&](int id) {
@@ -491,8 +826,7 @@ class ObjectCacheTest : public ::testing::Test {
     // Sanity test to see if find and insertions at the same time
     // across mutliple threads are safe.
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 10'000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -529,8 +863,7 @@ class ObjectCacheTest : public ::testing::Test {
     // Sanity test to see if find and evictions across multiple
     // threads are safe.
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 1000;
-    config.setItemDestructor(
+    config.setCacheName("test").setCacheCapacity(1000).setItemDestructor(
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
@@ -565,10 +898,11 @@ class ObjectCacheTest : public ::testing::Test {
     // Sanity test to see if find and evictions across multiple
     // threads are safe.
     ObjectCacheConfig config;
-    config.l1EntriesLimit = 100'000;
-    config.l1NumShards = 10;
-    config.setItemDestructor(
-        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+    config.setCacheName("test")
+        .setCacheCapacity(100'000)
+        .setNumShards(10)
+        .setItemDestructor(
+            [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
     auto objcache = ObjectCache::create(config);
 
     auto runReplaceOps = [&] {
@@ -607,6 +941,7 @@ using AllocatorTypes = ::testing::Types<LruAllocator,
                                         LruAllocatorSpinBuckets>;
 TYPED_TEST_CASE(ObjectCacheTest, AllocatorTypes);
 TYPED_TEST(ObjectCacheTest, GetAllocSize) { this->testGetAllocSize(); }
+TYPED_TEST(ObjectCacheTest, ConfigValidation) { this->testConfigValidation(); }
 TYPED_TEST(ObjectCacheTest, Simple) { this->testSimple(); }
 TYPED_TEST(ObjectCacheTest, MultiType) { this->testMultiType(); }
 TYPED_TEST(ObjectCacheTest, testMultiTypePolymorphism) {
@@ -624,6 +959,11 @@ TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingBasics) {
 TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingUniqueInsert) {
   this->testObjectSizeTrackingUniqueInsert();
 }
+TYPED_TEST(ObjectCacheTest, Persistence) { this->testPersistence(); }
+TYPED_TEST(ObjectCacheTest, PersistenceMultiType) {
+  this->testPersistenceMultiType();
+}
+
 TYPED_TEST(ObjectCacheTest, MultithreadReplace) {
   this->testMultithreadReplace();
 }
@@ -646,7 +986,7 @@ TYPED_TEST(ObjectCacheTest, MultithreadFindAndReplaceWith10Shards) {
 using ObjectCache = ObjectCache<LruAllocator>;
 TEST(ObjectCacheTest, LruEviction) {
   ObjectCache::Config config;
-  config.l1EntriesLimit = 1024;
+  config.setCacheName("test").setCacheCapacity(1024);
   config.setItemDestructor(
       [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
   auto objcache = ObjectCache::create(config);
@@ -664,46 +1004,13 @@ TEST(ObjectCacheTest, LruEviction) {
   EXPECT_EQ(nullptr, found);
 }
 
-TEST(ObjectCacheTest, LruEvictionWithSizeTracking) {
-  ObjectCache::Config config;
-  config.l1EntriesLimit = 1024;
-  config.setItemDestructor(
-      [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
-  config.objectSizeTrackingEnabled = true;
-  auto objcache = ObjectCache::create(config);
-  int totalObjectSize = 0;
-
-  // After the loop, the first item will be evicted and the total object
-  // size will be the sum of remaining items.
-  for (size_t i = 0; i < config.l1EntriesLimit + 1; i++) {
-    auto foo = std::make_unique<Foo>();
-    foo->a = i;
-    auto key = folly::sformat("key_{}", i);
-    auto objectSize = 8 * (i + 1);
-    objcache->insertOrReplace(key, std::move(foo), objectSize);
-    totalObjectSize += objectSize;
-    auto found = objcache->find<Foo>(key);
-    ASSERT_NE(nullptr, found);
-    EXPECT_EQ(i, found->a);
-    if (i < config.l1EntriesLimit) {
-      ASSERT_EQ(objcache->getNumEntries(), i + 1);
-      EXPECT_EQ(totalObjectSize, objcache->getTotalObjectSize());
-    } else {
-      EXPECT_EQ(nullptr, objcache->find<Foo>("key_0"));
-      ASSERT_EQ(objcache->getNumEntries(), i);
-      EXPECT_EQ(totalObjectSize - 8, objcache->getTotalObjectSize());
-    }
-  }
-}
-
 TEST(ObjectCacheTest, LruEvictionWithSizeControl) {
   ObjectCache::Config config;
-  config.l1EntriesLimit = 50;
+  config.setCacheName("test");
   config.setItemDestructor(
       [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
-  config.objectSizeTrackingEnabled = true;
-  config.cacheSizeLimit = 100;
-  config.sizeControllerIntervalMs = 100;
+  config.setCacheCapacity(50 /* l1EntriesLimit*/, 100 /* cacheSizeLimit */,
+                          100 /* sizeControllerIntervalMs */);
   // insert objects with equal size
   {
     auto objcache = ObjectCache::create(config);
