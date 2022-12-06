@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ struct SizeVerify {};
 
 void Stats::populateGlobalCacheStats(GlobalCacheStats& ret) const {
 #ifndef SKIP_SIZE_VERIFY
-  SizeVerify<sizeof(Stats)> a = SizeVerify<16160>{};
+  SizeVerify<sizeof(Stats)> a = SizeVerify<16176>{};
   std::ignore = a;
 #endif
   ret.numCacheGets = numCacheGets.get();
@@ -59,6 +59,7 @@ void Stats::populateGlobalCacheStats(GlobalCacheStats& ret) const {
   ret.numCacheGetExpiries = numCacheGetExpiries.get();
   ret.numCacheRemoves = numCacheRemoves.get();
   ret.numCacheRemoveRamHits = numCacheRemoveRamHits.get();
+  ret.numCacheEvictions = numCacheEvictions.get();
   ret.numRamDestructorCalls = numRamDestructorCalls.get();
   ret.numDestructorExceptions = numDestructorExceptions.get();
 

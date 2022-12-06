@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -113,6 +113,7 @@ BlockCache::BlockCache(Config&& config)
 BlockCache::BlockCache(Config&& config, ValidConfigTag)
     : config_{serializeConfig(config)},
       numPriorities_{config.numPriorities},
+      checkExpired_{std::move(config.checkExpired)},
       destructorCb_{std::move(config.destructorCb)},
       checksumData_{config.checksum},
       device_{*config.device},
@@ -187,18 +188,26 @@ Status BlockCache::insert(HashedKey hk, BufferView value) {
   // After allocation a region is opened for writing. Until we close it, the
   // region would not be reclaimed and index never gets an invalid entry.
   const auto status = writeEntry(addr, slotSize, hk, value);
+  auto newObjSizeHint = encodeSizeHint(slotSize);
   if (status == Status::Ok) {
-    const auto lr = index_.insert(hk.keyHash(),
-                                  encodeRelAddress(addr.add(slotSize)),
-                                  encodeSizeHint(slotSize));
+    const auto lr = index_.insert(
+        hk.keyHash(), encodeRelAddress(addr.add(slotSize)), newObjSizeHint);
     // We replaced an existing key in the index
+    uint64_t newObjSize = decodeSizeHint(newObjSizeHint);
+    uint64_t oldObjSize = 0;
     if (lr.found()) {
-      holeSizeTotal_.add(decodeSizeHint(lr.sizeHint()));
+      oldObjSize = decodeSizeHint(lr.sizeHint());
+      holeSizeTotal_.add(oldObjSize);
       holeCount_.inc();
       insertHashCollisionCount_.inc();
     }
     succInsertCount_.inc();
     sizeDist_.addSize(slotSize);
+    if (newObjSize < oldObjSize) {
+      usedSizeBytes_.sub(oldObjSize - newObjSize);
+    } else {
+      usedSizeBytes_.add(newObjSize - oldObjSize);
+    }
   }
   allocator_.close(std::move(desc));
   return status;
@@ -357,10 +366,12 @@ Status BlockCache::remove(HashedKey hk) {
 
   auto lr = index_.remove(hk.keyHash());
   if (lr.found()) {
-    holeSizeTotal_.add(decodeSizeHint(lr.sizeHint()));
+    uint64_t removedObjectSize = decodeSizeHint(lr.sizeHint());
+    holeSizeTotal_.add(removedObjectSize);
     holeCount_.inc();
+    usedSizeBytes_.sub(removedObjectSize);
     succRemoveCount_.inc();
-    if (!value.isNull()) {
+    if (!value.isNull() && destructorCb_) {
       destructorCb_(hk, value.view(), DestructorEvent::Removed);
     }
     return Status::Ok;
@@ -413,6 +424,7 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
     switch (reinsertionRes) {
     case ReinsertionRes::kEvicted:
       evictionCount++;
+      usedSizeBytes_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
       break;
     case ReinsertionRes::kRemoved:
       holeCount_.sub(1);
@@ -467,6 +479,7 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
     auto removeRes = removeItem(hk, entrySize, RelAddress{rid, offset});
     if (removeRes) {
       evictionCount++;
+      usedSizeBytes_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
     } else {
       holeCount_.sub(1);
       holeSizeTotal_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
@@ -494,9 +507,12 @@ bool BlockCache::removeItem(HashedKey hk,
 
 BlockCache::ReinsertionRes BlockCache::reinsertOrRemoveItem(
     HashedKey hk, BufferView value, uint32_t entrySize, RelAddress currAddr) {
-  auto removeItem = [this, hk, entrySize, currAddr] {
+  auto removeItem = [this, hk, entrySize, currAddr](bool expired) {
     sizeDist_.removeSize(entrySize);
     if (index_.removeIfMatch(hk.keyHash(), encodeRelAddress(currAddr))) {
+      if (expired) {
+        evictionExpiredCount_.inc();
+      }
       return ReinsertionRes::kEvicted;
     }
     return ReinsertionRes::kRemoved;
@@ -509,8 +525,12 @@ BlockCache::ReinsertionRes BlockCache::reinsertOrRemoveItem(
     return ReinsertionRes::kRemoved;
   }
 
+  if (checkExpired_ && checkExpired_(value)) {
+    return removeItem(true);
+  }
+
   if (!reinsertionPolicy_ || !reinsertionPolicy_->shouldReinsert(hk.key())) {
-    return removeItem();
+    return removeItem(false);
   }
 
   // Priority of an re-inserted item is determined by its past accesses
@@ -534,7 +554,7 @@ BlockCache::ReinsertionRes BlockCache::reinsertOrRemoveItem(
     break;
   case OpenStatus::Retry:
     reinsertionErrorCount_.inc();
-    return removeItem();
+    return removeItem(false);
   }
   auto closeRegionGuard =
       folly::makeGuard([this, desc = std::move(desc)]() mutable {
@@ -546,7 +566,7 @@ BlockCache::ReinsertionRes BlockCache::reinsertOrRemoveItem(
   const auto status = writeEntry(addr, slotSize, hk, value);
   if (status != Status::Ok) {
     reinsertionErrorCount_.inc();
-    return removeItem();
+    return removeItem(false);
   }
 
   const auto replaced =
@@ -555,7 +575,7 @@ BlockCache::ReinsertionRes BlockCache::reinsertOrRemoveItem(
                             encodeRelAddress(currAddr));
   if (!replaced) {
     reinsertionErrorCount_.inc();
-    return removeItem();
+    return removeItem(false);
   }
   reinsertionCount_.inc();
   reinsertionBytes_.add(entrySize);
@@ -676,42 +696,65 @@ void BlockCache::reset() {
   sizeDist_.reset();
   holeCount_.set(0);
   holeSizeTotal_.set(0);
+  usedSizeBytes_.set(0);
 }
 
 void BlockCache::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bc_size", getSize());
   visitor("navy_bc_items", index_.computeSize());
-  visitor("navy_bc_inserts", insertCount_.get());
-  visitor("navy_bc_insert_hash_collisions", insertHashCollisionCount_.get());
-  visitor("navy_bc_succ_inserts", succInsertCount_.get());
-  visitor("navy_bc_lookups", lookupCount_.get());
-  visitor("navy_bc_lookup_false_positives", lookupFalsePositiveCount_.get());
+  visitor("navy_bc_inserts", insertCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_insert_hash_collisions", insertHashCollisionCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_succ_inserts", succInsertCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_lookups", lookupCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_lookup_false_positives", lookupFalsePositiveCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_lookup_entry_header_checksum_errors",
-          lookupEntryHeaderChecksumErrorCount_.get());
+          lookupEntryHeaderChecksumErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_lookup_value_checksum_errors",
-          lookupValueChecksumErrorCount_.get());
+          lookupValueChecksumErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_reclaim_entry_header_checksum_errors",
-          reclaimEntryHeaderChecksumErrorCount_.get());
+          reclaimEntryHeaderChecksumErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_reclaim_value_checksum_errors",
-          reclaimValueChecksumErrorCount_.get());
+          reclaimValueChecksumErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_cleanup_entry_header_checksum_errors",
           cleanupEntryHeaderChecksumErrorCount_.get());
   visitor("navy_bc_cleanup_value_checksum_errors",
           cleanupValueChecksumErrorCount_.get());
-  visitor("navy_bc_succ_lookups", succLookupCount_.get());
-  visitor("navy_bc_removes", removeCount_.get());
-  visitor("navy_bc_succ_removes", succRemoveCount_.get());
-  visitor("navy_bc_eviction_lookup_misses", evictionLookupMissCounter_.get());
-  visitor("navy_bc_alloc_errors", allocErrorCount_.get());
-  visitor("navy_bc_logical_written", logicalWrittenCount_.get());
+  visitor("navy_bc_succ_lookups", succLookupCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_removes", removeCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_succ_removes", succRemoveCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_eviction_lookup_misses", evictionLookupMissCounter_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_evictions_expired", evictionExpiredCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_alloc_errors", allocErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_logical_written", logicalWrittenCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_hole_count", holeCount_.get());
   visitor("navy_bc_hole_bytes", holeSizeTotal_.get());
-  visitor("navy_bc_reinsertions", reinsertionCount_.get());
-  visitor("navy_bc_reinsertion_bytes", reinsertionBytes_.get());
-  visitor("navy_bc_reinsertion_errors", reinsertionErrorCount_.get());
+  visitor("navy_bc_used_size_bytes", usedSizeBytes_.get());
+  visitor("navy_bc_reinsertions", reinsertionCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_reinsertion_bytes", reinsertionBytes_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bc_reinsertion_errors", reinsertionErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_lookup_for_item_destructor_errors",
           lookupForItemDestructorErrorCount_.get());
-  visitor("navy_bc_remove_attempt_collisions", removeAttemptCollisions_.get());
+  visitor("navy_bc_remove_attempt_collisions", removeAttemptCollisions_.get(),
+          CounterVisitor::CounterType::RATE);
 
   auto snapshot = sizeDist_.getSnapshot();
   for (auto& kv : snapshot) {
@@ -735,6 +778,7 @@ void BlockCache::persist(RecordWriter& rw) {
   *config.allocAlignSize() = allocAlignSize_;
   config.holeCount() = holeCount_.get();
   config.holeSizeTotal() = holeSizeTotal_.get();
+  *config.usedSizeBytes() = usedSizeBytes_.get();
   *config.reinsertionPolicyEnabled() = (reinsertionPolicy_ != nullptr);
   serializeProto(config, rw);
   regionManager_.persist(rw);
@@ -768,6 +812,7 @@ void BlockCache::tryRecover(RecordReader& rr) {
   sizeDist_ = SizeDistribution{*config.sizeDist()};
   holeCount_.set(*config.holeCount());
   holeSizeTotal_.set(*config.holeSizeTotal());
+  usedSizeBytes_.set(*config.usedSizeBytes());
   regionManager_.recover(rr);
   index_.recover(rr);
 }

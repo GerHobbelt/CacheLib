@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include <gtest/gtest.h>
 
 #include "cachelib/allocator/CacheAllocator.h"
@@ -297,7 +313,10 @@ class ObjectCacheTest : public ::testing::Test {
   void testExpiration() {
     ObjectCacheConfig config;
     config.setCacheName("test").setCacheCapacity(10'000).setItemDestructor(
-        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+        [&](ObjectCacheDestructorData data) {
+          EXPECT_EQ(data.context, ObjectCacheDestructorContext::kRemoved);
+          data.deleteObject<Foo>();
+        });
     auto objcache = ObjectCache::create(config);
 
     auto foo = std::make_unique<Foo>();

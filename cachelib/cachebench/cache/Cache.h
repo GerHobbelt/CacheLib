@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -74,9 +74,7 @@ class RetentionAP final : public NvmAdmissionPolicy<Cache> {
     return true;
   }
 
-  std::unordered_map<std::string, double> getCountersImpl() final override {
-    return {};
-  }
+  virtual void getCountersImpl(const util::CounterVisitor&) final override {}
 
  private:
   const uint32_t retentionThreshold_{0};
@@ -319,6 +317,9 @@ class Cache {
 
   // Get overall stats on the whole cache allocator
   Stats getStats() const;
+
+  // Get number of bytes written to NVM.
+  double getNvmBytesWritten() const;
 
   // return the stats for the pool.
   PoolStats getPoolStats(PoolId pid) const { return cache_->getPoolStats(pid); }

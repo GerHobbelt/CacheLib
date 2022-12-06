@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -95,7 +95,8 @@ class CacheStressor : public Stressor {
           });
       cacheConfig.ticker = ticker_;
     }
-
+    cacheConfig.nvmWriteBytesCallback =
+        std::bind(&CacheStressor<Allocator>::getNvmBytesWritten, this);
     cache_ = std::make_unique<CacheT>(cacheConfig, movingSync,
                                       cacheConfig.cacheDir, config_.touchValue);
     if (config_.opPoolDistribution.size() > cache_->numPools()) {
@@ -152,6 +153,17 @@ class CacheStressor : public Stressor {
         endTime_ = std::chrono::system_clock::now();
       }
     });
+  }
+
+  double getNvmBytesWritten() {
+    double bytesWritten = 0;
+    if (cache_) {
+      bytesWritten = cache_->getNvmBytesWritten();
+      XLOG_EVERY_MS(INFO, 60000) << "NVM bytes written: " << bytesWritten;
+    } else {
+      XLOG_EVERY_MS(INFO, 60000) << "Error, allocator not set";
+    }
+    return bytesWritten;
   }
 
   // Block until all stress workers are finished.

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -240,7 +240,7 @@ class RegionManager {
 
   // Tries to get a free region first, otherwise evicts one and schedules region
   // cleanup job (which will add the region to the clean list).
-  JobExitCode startReclaim();
+  void startReclaim();
 
   // Releases a region that was evicted during region reclamation.
   //

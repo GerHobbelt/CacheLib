@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -582,6 +582,18 @@ bool Cache<Allocator>::checkGet(ValueTracker::Index opId,
 }
 
 template <typename Allocator>
+double Cache<Allocator>::getNvmBytesWritten() const {
+  const auto statsMap = cache_->getNvmCacheStatsMap();
+  const auto& ratesMap = statsMap.getRates();
+  if (const auto& it = ratesMap.find("navy_device_bytes_written");
+      it != ratesMap.end()) {
+    return it->second;
+  }
+  XLOG(INFO) << "Bytes written not found";
+  return 0;
+}
+
+template <typename Allocator>
 Stats Cache<Allocator>::getStats() const {
   PoolStats aggregate = cache_->getPoolStats(pools_[0]);
   auto usageFraction =
@@ -599,7 +611,7 @@ Stats Cache<Allocator>::getStats() const {
 
   const auto cacheStats = cache_->getGlobalCacheStats();
   const auto rebalanceStats = cache_->getSlabReleaseStats();
-  const auto navyStats = cache_->getNvmCacheStatsMap();
+  const auto navyStats = cache_->getNvmCacheStatsMap().toMap();
 
   ret.numEvictions = aggregate.numEvictions();
   ret.numItems = aggregate.numItems();
@@ -609,6 +621,7 @@ Stats Cache<Allocator>::getStats() const {
 
   ret.numCacheGets = cacheStats.numCacheGets;
   ret.numCacheGetMiss = cacheStats.numCacheGetMiss;
+  ret.numCacheEvictions = cacheStats.numCacheEvictions;
   ret.numRamDestructorCalls = cacheStats.numRamDestructorCalls;
   ret.numNvmGets = cacheStats.numNvmGets;
   ret.numNvmGetMiss = cacheStats.numNvmGetMiss;
@@ -650,7 +663,7 @@ Stats Cache<Allocator>::getStats() const {
   // Populate counters.
   // TODO: Populate more counters that are interesting to cachebench.
   if (config_.printNvmCounters) {
-    ret.nvmCounters = cache_->getNvmCacheStatsMap();
+    ret.nvmCounters = cache_->getNvmCacheStatsMap().toMap();
   }
 
   // nvm stats from navy
@@ -707,9 +720,10 @@ Stats Cache<Allocator>::getStats() const {
 
 template <typename Allocator>
 bool Cache<Allocator>::hasNvmCacheWarmedUp() const {
-  const auto& nvmStats = cache_->getNvmCacheStatsMap();
-  const auto it = nvmStats.find("navy_bc_evicted");
-  if (it == nvmStats.end()) {
+  const auto nvmStats = cache_->getNvmCacheStatsMap();
+  const auto& ratesMap = nvmStats.getRates();
+  const auto it = ratesMap.find("navy_bc_evictions");
+  if (it == ratesMap.end()) {
     return false;
   }
   return it->second > 0;

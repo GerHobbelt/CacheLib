@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -88,7 +88,8 @@ std::unique_ptr<Driver> makeDriver(std::unique_ptr<Engine> largeItemCache,
                                    std::unique_ptr<Device> device = nullptr,
                                    size_t metadataSize = 0) {
   Driver::Config config;
-  config.largeItemCache = std::move(largeItemCache);
+  config.enginePairs.push_back(
+      {nullptr, std::move(largeItemCache), 0, scheduler.get()});
   config.scheduler = std::move(scheduler);
   config.metadataSize = metadataSize;
   config.device = std::move(device);
@@ -199,11 +200,14 @@ TEST(BlockCache, InsertLookup) {
     driver->flush();
     Buffer value;
     EXPECT_EQ(Status::Ok, driver->lookup(e.key(), value));
-    driver->getCounters([](folly::StringPiece name, double count) {
-      if (name == "navy_bc_lookups") {
+
+    driver->getCounters({[](folly::StringPiece name, double count,
+                            CounterVisitor::CounterType type) {
+      if (name == "navy_bc_lookups" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(1, count);
       }
-    });
+    }});
 
     EXPECT_EQ(e.value(), value.view());
     log.push_back(std::move(e));
@@ -313,27 +317,22 @@ TEST(BlockCache, AsyncCallbacks) {
   MockLookupCB cbLookup;
   EXPECT_CALL(cbLookup, call(Status::Ok, makeHK("key"), makeView("value")));
   EXPECT_CALL(cbLookup, call(Status::NotFound, makeHK("cat"), BufferView{}));
-  EXPECT_EQ(Status::Ok,
-            driver->lookupAsync(
-                makeHK("key"),
-                [&cbLookup](Status status, HashedKey key, Buffer value) {
-                  cbLookup.call(status, key, value.view());
-                }));
-  EXPECT_EQ(Status::Ok,
-            driver->lookupAsync(
-                makeHK("cat"),
-                [&cbLookup](Status status, HashedKey key, Buffer value) {
-                  cbLookup.call(status, key, value.view());
-                }));
+  driver->lookupAsync(makeHK("key"),
+                      [&cbLookup](Status status, HashedKey key, Buffer value) {
+                        cbLookup.call(status, key, value.view());
+                      });
+
+  driver->lookupAsync(makeHK("cat"),
+                      [&cbLookup](Status status, HashedKey key, Buffer value) {
+                        cbLookup.call(status, key, value.view());
+                      });
   driver->flush();
 
   MockRemoveCB cbRemove;
   EXPECT_CALL(cbRemove, call(Status::Ok, makeHK("key")));
   EXPECT_CALL(cbRemove, call(Status::NotFound, makeHK("cat")));
-  EXPECT_EQ(Status::Ok,
-            driver->removeAsync(makeHK("key"), toCallback(cbRemove)));
-  EXPECT_EQ(Status::Ok,
-            driver->removeAsync(makeHK("cat"), toCallback(cbRemove)));
+  driver->removeAsync(makeHK("key"), toCallback(cbRemove));
+  driver->removeAsync(makeHK("cat"), toCallback(cbRemove));
   driver->flush();
 }
 
@@ -385,13 +384,15 @@ TEST(BlockCache, PreciseRemove) {
     Buffer value;
     // Behavior: old "key" can remove the entry "key"+"abc": "value".
     EXPECT_EQ(Status::Ok, collision.driver->remove(makeHK("key")));
-    collision.driver->getCounters([](folly::StringPiece name, double count) {
+    collision.driver->getCounters({[](folly::StringPiece name, double count,
+                                      CounterVisitor::CounterType type) {
       // The counter is not populated because preciseRemove_ and item
       // destructors are not triggered.
-      if (name == "navy_bc_remove_attempt_collisions") {
+      if (name == "navy_bc_remove_attempt_collisions" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(0, count);
       }
-    });
+    }});
   }
 
   {
@@ -402,12 +403,14 @@ TEST(BlockCache, PreciseRemove) {
     Buffer value;
     // Behavior: old "key" can not remove the entry "key"+"abc": "value"
     EXPECT_EQ(Status::NotFound, collision.driver->remove(makeHK("key")));
-    collision.driver->getCounters([](folly::StringPiece name, double count) {
+    collision.driver->getCounters({[](folly::StringPiece name, double count,
+                                      CounterVisitor::CounterType type) {
       // The counter is populated
-      if (name == "navy_bc_remove_attempt_collisions") {
+      if (name == "navy_bc_remove_attempt_collisions" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(1, count);
       }
-    });
+    }});
   }
 
   {
@@ -424,12 +427,14 @@ TEST(BlockCache, PreciseRemove) {
 
     // Behavior: old "key" can not remove the entry "key"+"abc": "value"
     EXPECT_EQ(Status::Ok, collision.driver->remove(makeHK("key")));
-    collision.driver->getCounters([](folly::StringPiece name, double count) {
+    collision.driver->getCounters({[](folly::StringPiece name, double count,
+                                      CounterVisitor::CounterType type) {
       // The counter is populated.
-      if (name == "navy_bc_remove_attempt_collisions") {
+      if (name == "navy_bc_remove_attempt_collisions" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(1, count);
       }
-    });
+    }});
   }
 }
 
@@ -505,14 +510,14 @@ TEST(BlockCache, HoleStats) {
     driver->flush();
   }
 
-  driver->getCounters([](folly::StringPiece name, double count) {
+  driver->getCounters({[](folly::StringPiece name, double count) {
     if (name == "navy_bc_hole_count") {
       EXPECT_EQ(0, count);
     }
     if (name == "navy_bc_hole_bytes") {
       EXPECT_EQ(0, count);
     }
-  });
+  }});
 
   // Remove 3 entries from region 0
   EXPECT_EQ(Status::Ok, driver->remove(log[0].key()));
@@ -523,14 +528,14 @@ TEST(BlockCache, HoleStats) {
   EXPECT_EQ(Status::Ok, driver->remove(log[33].key()));
   EXPECT_EQ(Status::Ok, driver->remove(log[34].key()));
 
-  driver->getCounters([](folly::StringPiece name, double count) {
+  driver->getCounters({[](folly::StringPiece name, double count) {
     if (name == "navy_bc_hole_count") {
       EXPECT_EQ(5, count);
     }
     if (name == "navy_bc_hole_bytes") {
       EXPECT_EQ(5 * 1024, count);
     }
-  });
+  }});
 
   // lookup this entry from region 0 that will be soon reclaimed
   Buffer val;
@@ -548,8 +553,10 @@ TEST(BlockCache, HoleStats) {
 
   // Reclaiming region 0 should have bumped down the hole count to
   // 2 remaining (from region 2)
-  driver->getCounters([](folly::StringPiece name, double count) {
-    if (name == "navy_bc_reinsertions") {
+  driver->getCounters({[](folly::StringPiece name, double count,
+                          CounterVisitor::CounterType type) {
+    if (name == "navy_bc_reinsertions" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(1, count);
     }
     if (name == "navy_bc_hole_count") {
@@ -558,7 +565,7 @@ TEST(BlockCache, HoleStats) {
     if (name == "navy_bc_hole_bytes") {
       EXPECT_EQ(2 * 1024, count);
     }
-  });
+  }});
 }
 
 TEST(BlockCache, ReclaimCorruption) {
@@ -617,11 +624,13 @@ TEST(BlockCache, ReclaimCorruption) {
     driver->flush();
   }
   // Verify we have one header checksum error and two value checksum errors
-  driver->getCounters([](folly::StringPiece name, double count) {
-    if (name == "navy_bc_reclaim") {
+  driver->getCounters({[](folly::StringPiece name, double count,
+                          CounterVisitor::CounterType type) {
+    if (name == "navy_bc_reclaim" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(4, count);
     }
-  });
+  }});
 
   // Force reclamation on region 0 by allocating region 3. There are 4 regions
   // and the device was configured to require 1 clean region at all times
@@ -633,17 +642,21 @@ TEST(BlockCache, ReclaimCorruption) {
   driver->flush();
 
   // Verify we have one header checksum error and two value checksum errors
-  driver->getCounters([](folly::StringPiece name, double count) {
-    if (name == "navy_bc_reclaim") {
+  driver->getCounters({[](folly::StringPiece name, double count,
+                          CounterVisitor::CounterType type) {
+    if (name == "navy_bc_reclaim" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(5, count);
     }
-    if (name == "navy_bc_reclaim_entry_header_checksum_errors") {
+    if (name == "navy_bc_reclaim_entry_header_checksum_errors" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(1, count);
     }
-    if (name == "navy_bc_reclaim_value_checksum_errors") {
+    if (name == "navy_bc_reclaim_value_checksum_errors" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(2, count);
     }
-  });
+  }});
 }
 
 TEST(BlockCache, StackAlloc) {
@@ -976,7 +989,6 @@ TEST(BlockCache, ReadRegionDuringEviction) {
   // Insert finds region is full and  puts region for tracking, resets allocator
   // and retries.
   EXPECT_TRUE(exPtr->runFirstIf("insert"));
-  EXPECT_TRUE(exPtr->runFirstIf("reclaim"));
 
   Buffer value;
 
@@ -985,7 +997,7 @@ TEST(BlockCache, ReadRegionDuringEviction) {
 
   // Eviction blocks access but reclaim will fail as there is still a reader
   // outstanding
-  EXPECT_FALSE(exPtr->runFirstIf("reclaim.evict"));
+  EXPECT_FALSE(exPtr->runFirstIf("reclaim"));
 
   std::thread lookupThread2([&driver, &log] {
     Buffer value2;
@@ -998,7 +1010,7 @@ TEST(BlockCache, ReadRegionDuringEviction) {
   EXPECT_EQ(Status::Ok, driver->remove(log[2].key()));
 
   // Reclaim still fails as the last reader is still outstanding
-  EXPECT_FALSE(exPtr->runFirstIf("reclaim.evict"));
+  EXPECT_FALSE(exPtr->runFirstIf("reclaim"));
 
   // Finish read and let evict region 0 entries
   sp.reached(1);
@@ -1645,26 +1657,26 @@ TEST(BlockCache, HoleStatsRecovery) {
   EXPECT_EQ(Status::Ok, driver->remove(log[5].key()));
   EXPECT_EQ(Status::Ok, driver->remove(log[8].key()));
 
-  CounterVisitor validationFunctor = [](folly::StringPiece name, double count) {
+  CounterVisitor validationFunctor{[](folly::StringPiece name, double count) {
     if (name == "navy_bc_hole_count") {
       EXPECT_EQ(4, count);
     }
     if (name == "navy_bc_hole_bytes") {
       EXPECT_EQ(4 * 4096, count);
     }
-  };
+  }};
 
   driver->getCounters(validationFunctor);
   driver->persist();
   driver->reset();
-  driver->getCounters([](folly::StringPiece name, double count) {
+  driver->getCounters({[](folly::StringPiece name, double count) {
     if (name == "navy_bc_hole_count") {
       EXPECT_EQ(0, count);
     }
     if (name == "navy_bc_hole_bytes") {
       EXPECT_EQ(0, count);
     }
-  });
+  }});
   EXPECT_TRUE(driver->recover());
   driver->getCounters(validationFunctor);
 }
@@ -2088,14 +2100,17 @@ TEST(BlockCache, DeviceFlushFailureSync) {
   EXPECT_EQ(Status::Ok, driver->insertAsync(e.key(), e.value(), {}));
   driver->flush();
 
-  driver->getCounters([](folly::StringPiece name, double count) {
-    if (name == "navy_bc_inmem_flush_retries") {
+  driver->getCounters({[](folly::StringPiece name, double count,
+                          CounterVisitor::CounterType type) {
+    if (name == "navy_bc_inmem_flush_retries" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(kFlushRetryLimit, count);
     }
-    if (name == "navy_bc_inmem_flush_failures") {
+    if (name == "navy_bc_inmem_flush_failures" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(1, count);
     }
-  });
+  }});
 }
 
 TEST(BlockCache, DeviceFlushFailureAsync) {
@@ -2119,14 +2134,17 @@ TEST(BlockCache, DeviceFlushFailureAsync) {
   EXPECT_EQ(Status::Ok, driver->insertAsync(e.key(), e.value(), {}));
   driver->flush();
 
-  driver->getCounters([](folly::StringPiece name, double count) {
-    if (name == "navy_bc_inmem_flush_retries") {
+  driver->getCounters({[](folly::StringPiece name, double count,
+                          CounterVisitor::CounterType type) {
+    if (name == "navy_bc_inmem_flush_retries" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(kFlushRetryLimit * 2, count);
     }
-    if (name == "navy_bc_inmem_flush_failures") {
+    if (name == "navy_bc_inmem_flush_failures" &&
+        type == CounterVisitor::CounterType::RATE) {
       EXPECT_EQ(2, count);
     }
-  });
+  }});
 }
 
 TEST(BlockCache, testItemDestructor) {

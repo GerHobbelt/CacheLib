@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -48,6 +48,7 @@ class BlockCache final : public Engine {
   // See CacheProto for details
   struct Config {
     Device* device{};
+    ExpiredCheck checkExpired;
     DestructorCallback destructorCb;
     // Checksum data read/written
     bool checksum{};
@@ -329,6 +330,7 @@ class BlockCache final : public Engine {
 
   const serialization::BlockCacheConfig config_;
   const uint16_t numPriorities_{};
+  const ExpiredCheck checkExpired_;
   const DestructorCallback destructorCb_;
   const bool checksumData_{};
   // reference to the under-lying device.
@@ -376,10 +378,14 @@ class BlockCache final : public Engine {
   mutable AtomicCounter removeCount_;
   mutable AtomicCounter succRemoveCount_;
   mutable AtomicCounter evictionLookupMissCounter_;
+  mutable AtomicCounter evictionExpiredCount_;
   mutable AtomicCounter allocErrorCount_;
   mutable AtomicCounter logicalWrittenCount_;
+  // TODO: deprecate hole count and hole size when we have
+  //       confirmed usedSizeBytes is working correctly in prod
   mutable AtomicCounter holeCount_;
   mutable AtomicCounter holeSizeTotal_;
+  mutable AtomicCounter usedSizeBytes_;
   mutable AtomicCounter reinsertionErrorCount_;
   mutable AtomicCounter reinsertionCount_;
   mutable AtomicCounter reinsertionBytes_;

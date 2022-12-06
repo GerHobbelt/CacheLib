@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -76,8 +76,11 @@ class FOLLY_PACK_ATTR BucketStorage {
 
   uint32_t numAllocations() const { return numAllocations_; }
 
-  // remove the give allocation in the bucket storage.
+  // remove the given allocation in the bucket storage.
   void remove(Allocation alloc);
+
+  // remove the given list allocation in the bucket storage.
+  void remove(const std::vector<Allocation>& allocs);
 
   // Removes every single allocation from the beginning, including this one.
   void removeUntil(Allocation alloc);

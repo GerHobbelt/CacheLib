@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -433,6 +433,8 @@ class EnginesConfig {
 
   std::map<std::string, std::string> serialize() const;
 
+  bool isBigHashEnabled() const { return bigHashConfig_.getSizePct() > 0; }
+
  private:
   BlockCacheConfig blockCacheConfig_;
   BigHashConfig bigHashConfig_;
@@ -550,6 +552,9 @@ class NavyConfig {
   // Return BigHashConfig for configuration.
   BigHashConfig& bigHash() noexcept { return enginesConfigs_[0].bigHash(); }
 
+  void addEnginePair(EnginesConfig config) {
+    enginesConfigs_.push_back(std::move(config));
+  }
   void setEnginesSelector(EnginesSelector selector) {
     selector_ = std::move(selector);
   }

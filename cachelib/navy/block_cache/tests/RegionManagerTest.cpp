@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -308,11 +308,11 @@ TEST(RegionManager, Fragmentation) {
 
     // Even though we allocated, but we haven't tracked any. So fragmentation
     // stats are still zero.
-    rm->getCounters([](folly::StringPiece name, double count) {
+    rm->getCounters({[](folly::StringPiece name, double count) {
       if (name == "navy_bc_external_fragmentation") {
         EXPECT_EQ(0, count);
       }
-    });
+    }});
 
     auto rw = createMemoryRecordWriter(ioq);
     rm->persist(*rw);
@@ -328,18 +328,19 @@ TEST(RegionManager, Fragmentation) {
         std::move(cleanupCb), std::move(policy),
         kNumRegions /* numInMemBuffers */, 0, kFlushRetryLimit);
 
-    rm->getCounters([](folly::StringPiece name, double count) {
+    rm->getCounters({[](folly::StringPiece name, double count) {
       if (name == "navy_bc_external_fragmentation") {
         EXPECT_EQ(0, count);
       }
-    });
+    }});
     auto rr = createMemoryRecordReader(ioq);
     rm->recover(*rr);
-    rm->getCounters([fragmentationSize](folly::StringPiece name, double count) {
-      if (name == "navy_bc_external_fragmentation") {
-        EXPECT_EQ(fragmentationSize, count);
-      }
-    });
+    rm->getCounters(
+        {[fragmentationSize](folly::StringPiece name, double count) {
+          if (name == "navy_bc_external_fragmentation") {
+            EXPECT_EQ(fragmentationSize, count);
+          }
+        }});
 
     EXPECT_EQ(RegionId{1}, rm->evict());
     EXPECT_EQ(RegionId{2}, rm->evict());
@@ -403,13 +404,15 @@ TEST(RegionManager, cleanupRegionFailureSync) {
     bool retried = false;
     // Wait for a cleanup retry
     for (int i = 0; i < 20; i++) {
-      rm->getCounters([&retried](folly::StringPiece name, double count) {
-        if (name == "navy_bc_inmem_cleanup_retries") {
+      rm->getCounters({[&retried](folly::StringPiece name, double count,
+                                  CounterVisitor::CounterType type) {
+        if (name == "navy_bc_inmem_cleanup_retries" &&
+            type == CounterVisitor::CounterType::RATE) {
           if (count > 0) {
             retried = true;
           }
         }
-      });
+      }});
       if (retried) {
         break;
       }
@@ -419,17 +422,20 @@ TEST(RegionManager, cleanupRegionFailureSync) {
     EXPECT_TRUE(retried);
 
     // Verify other counters
-    rm->getCounters([](folly::StringPiece name, double count) {
-      if (name == "navy_bc_inmem_flush_retries") {
+    rm->getCounters({[](folly::StringPiece name, double count,
+                        CounterVisitor::CounterType type) {
+      if (name == "navy_bc_inmem_flush_retries" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(kFlushRetryLimit, count);
       }
-      if (name == "navy_bc_inmem_cleanup_failures") {
+      if (name == "navy_bc_inmem_cleanup_failures" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(1, count);
       }
       if (name == "navy_bc_inmem_waiting_flush") {
         EXPECT_EQ(0, count);
       }
-    });
+    }});
 
     // Unblock readThread to close the region
     sp.reached(1);
@@ -499,13 +505,15 @@ TEST(RegionManager, cleanupRegionFailureAsync) {
     bool retried = false;
     // Wait for a cleanup retry
     for (int i = 0; i < 20; i++) {
-      rm->getCounters([&retried](folly::StringPiece name, double count) {
-        if (name == "navy_bc_inmem_cleanup_retries") {
+      rm->getCounters({[&retried](folly::StringPiece name, double count,
+                                  CounterVisitor::CounterType type) {
+        if (name == "navy_bc_inmem_cleanup_retries" &&
+            type == CounterVisitor::CounterType::RATE) {
           if (count > 0) {
             retried = true;
           }
         }
-      });
+      }});
       if (retried) {
         break;
       }
@@ -515,17 +523,20 @@ TEST(RegionManager, cleanupRegionFailureAsync) {
     EXPECT_TRUE(retried);
 
     // Verify other counters
-    rm->getCounters([](folly::StringPiece name, double count) {
-      if (name == "navy_bc_inmem_flush_retries") {
+    rm->getCounters({[](folly::StringPiece name, double count,
+                        CounterVisitor::CounterType type) {
+      if (name == "navy_bc_inmem_flush_retries" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(kFlushRetryLimit, count);
       }
-      if (name == "navy_bc_inmem_cleanup_failures") {
+      if (name == "navy_bc_inmem_cleanup_failures" &&
+          type == CounterVisitor::CounterType::RATE) {
         EXPECT_EQ(1, count);
       }
       if (name == "navy_bc_inmem_waiting_flush") {
         EXPECT_EQ(0, count);
       }
-    });
+    }});
 
     // Unblock readThread to close the region
     sp.reached(1);

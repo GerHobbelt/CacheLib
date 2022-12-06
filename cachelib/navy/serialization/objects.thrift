@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,6 +79,7 @@ struct BlockCacheConfig {
   8: i64 holeCount = 0,
   9: i64 holeSizeTotal = 0,
   10: bool reinsertionPolicyEnabled = false,
+  11: i64 usedSizeBytes = 0,
 }
 
 struct BigHashPersistentData {
@@ -89,4 +90,5 @@ struct BigHashPersistentData {
   5: required i64 cacheBaseOffset = 0,
   6: required i64 numBuckets = 0,
   7: map<i64, i64> sizeDist,
+  8: i64 usedSizeBytes = 0,
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,6 +50,9 @@ struct Stats {
 
   // number of remove calls that resulted in a ram hit
   TLCounter numCacheRemoveRamHits{0};
+
+  // number of evictions where items leave both RAM and NvmCache entirely
+  AtomicCounter numCacheEvictions{0};
 
   // number of item destructor calls from ram
   TLCounter numRamDestructorCalls{0};

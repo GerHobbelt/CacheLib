@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@
 #include "cachelib/common/Serialization.h"
 #include "cachelib/navy/admission_policy/DynamicRandomAP.h"
 #include "cachelib/navy/common/Hash.h"
-#include "cachelib/navy/driver/NoopEngine.h"
 #include "cachelib/navy/scheduler/JobScheduler.h"
 
 namespace facebook {
@@ -43,25 +42,15 @@ std::discrete_distribution<size_t> getDist(
 } // namespace
 
 Driver::Config& Driver::Config::validate() {
-  if (smallItemCache != nullptr && smallItemMaxSize == 0) {
-    throw std::invalid_argument("invalid small item cache params");
-  }
-  if (smallItemCache != nullptr) {
-    if (smallItemMaxSize > smallItemCache->getMaxItemSize()) {
-      throw std::invalid_argument(folly::sformat(
-          "small item max size should not excceed: {}, but is set to be: {}",
-          smallItemCache->getMaxItemSize(), smallItemMaxSize));
-    }
-  }
-  if (!largeItemCache) {
-    XLOG(INFO, "Large item cache is noop");
-    largeItemCache = std::make_unique<NoopEngine>();
+  if (enginePairs.empty()) {
+    throw std::invalid_argument("There should be at least one engine pair.");
   }
 
-  if (!smallItemCache) {
-    XLOG(INFO, "Small item cache is noop");
-    smallItemCache = std::make_unique<NoopEngine>();
-    smallItemMaxSize = 0;
+  for (auto& p : enginePairs) {
+    p.validate();
+  }
+  if (enginePairs.size() > 1 && (!selector)) {
+    throw std::invalid_argument("More than one engine pairs with no selector.");
   }
   return *this;
 }
@@ -76,10 +65,8 @@ Driver::Driver(Config&& config, ValidConfigTag)
       device_{std::move(config.device)},
       scheduler_{std::move(config.scheduler)},
       selector_{std::move(config.selector)},
+      enginePairs_{std::move(config.enginePairs)},
       admissionPolicy_{std::move(config.admissionPolicy)} {
-  enginePairs_.push_back(EnginePair(std::move(config.smallItemCache),
-                                    std::move(config.largeItemCache),
-                                    config.smallItemMaxSize, scheduler_.get()));
   getRandomAllocDist = getDist(enginePairs_);
   XLOGF(INFO, "Max concurrent inserts: {}", maxConcurrentInserts_);
   XLOGF(INFO, "Max parcel memory: {}", maxParcelMemory_);
@@ -184,19 +171,17 @@ Status Driver::lookup(HashedKey hk, Buffer& value) {
   return enginePairs_[selectEnginePair(hk)].lookupSync(hk, value);
 }
 
-Status Driver::lookupAsync(HashedKey hk, LookupCallback cb) {
+void Driver::lookupAsync(HashedKey hk, LookupCallback cb) {
   XDCHECK(cb);
   enginePairs_[selectEnginePair(hk)].scheduleLookup(hk, std::move(cb));
-  return Status::Ok;
 }
 
 Status Driver::remove(HashedKey hk) {
   return enginePairs_[selectEnginePair(hk)].removeSync(hk);
 }
 
-Status Driver::removeAsync(HashedKey hk, RemoveCallback cb) {
+void Driver::removeAsync(HashedKey hk, RemoveCallback cb) {
   enginePairs_[selectEnginePair(hk)].scheduleRemove(hk, std::move(cb));
-  return Status::Ok;
 }
 
 void Driver::flush() {
@@ -279,11 +264,15 @@ uint64_t Driver::getUsableSize() const {
 }
 
 void Driver::getCounters(const CounterVisitor& visitor) const {
-  visitor("navy_rejected", rejectedCount_.get());
+  visitor("navy_rejected", rejectedCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_rejected_concurrent_inserts",
-          rejectedConcurrentInsertsCount_.get());
-  visitor("navy_rejected_parcel_memory", rejectedParcelMemoryCount_.get());
-  visitor("navy_rejected_bytes", rejectedBytes_.get());
+          rejectedConcurrentInsertsCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_rejected_parcel_memory", rejectedParcelMemoryCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_rejected_bytes", rejectedBytes_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_accepted_bytes", acceptedBytes_.get());
   visitor("navy_accepted", acceptedCount_.get());
 
@@ -293,10 +282,10 @@ void Driver::getCounters(const CounterVisitor& visitor) const {
   scheduler_->getCounters(visitor);
   if (enginePairs_.size() > 1) {
     for (size_t idx = 0; idx < enginePairs_.size(); idx++) {
-      const CounterVisitor pv = [&visitor, idx](folly::StringPiece name,
-                                                double count) {
-        visitor(folly::to<std::string>(name, "_", idx), count);
-      };
+      const CounterVisitor pv{
+          [&visitor, idx](folly::StringPiece name, double count) {
+            visitor(folly::to<std::string>(name, "_", idx), count);
+          }};
       enginePairs_[idx].getCounters(pv);
     }
     visitor("navy_total_usable_size", getUsableSize());

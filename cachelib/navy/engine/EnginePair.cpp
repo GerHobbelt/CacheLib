@@ -1,6 +1,22 @@
-// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 #include "cachelib/navy/engine/EnginePair.h"
+
+#include "cachelib/navy/engine/NoopEngine.h"
 
 namespace facebook {
 namespace cachelib {
@@ -239,13 +255,23 @@ bool EnginePair::recover(RecordReader& rr) {
 }
 
 void EnginePair::getCounters(const CounterVisitor& visitor) const {
-  visitor("navy_inserts", insertCount_.get());
-  visitor("navy_succ_inserts", succInsertCount_.get());
-  visitor("navy_lookups", lookupCount_.get());
-  visitor("navy_succ_lookups", succLookupCount_.get());
-  visitor("navy_removes", removeCount_.get());
-  visitor("navy_succ_removes", succRemoveCount_.get());
-  visitor("navy_io_errors", ioErrorCount_.get());
+  visitor(
+      "navy_inserts", insertCount_.get(), CounterVisitor::CounterType::RATE);
+  visitor("navy_succ_inserts",
+          succInsertCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor(
+      "navy_lookups", lookupCount_.get(), CounterVisitor::CounterType::RATE);
+  visitor("navy_succ_lookups",
+          succLookupCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor(
+      "navy_removes", removeCount_.get(), CounterVisitor::CounterType::RATE);
+  visitor("navy_succ_removes",
+          succRemoveCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor(
+      "navy_io_errors", ioErrorCount_.get(), CounterVisitor::CounterType::RATE);
   visitor("navy_total_usable_size", getUsableSize());
   largeItemCache_->getCounters(visitor);
   smallItemCache_->getCounters(visitor);
@@ -268,6 +294,29 @@ std::pair<Status, std::string> EnginePair::getRandomAlloc(Buffer& value) {
   }
 
   return smallItemCache_->getRandomAlloc(value);
+}
+
+void EnginePair::validate() {
+  if (smallItemCache_ != nullptr) {
+    if (smallItemMaxSize_ == 0) {
+      throw std::invalid_argument("Small item cache is set without a max size");
+    }
+    if (smallItemMaxSize_ > smallItemCache_->getMaxItemSize()) {
+      throw std::invalid_argument(folly::sformat(
+          "small item max size should not exceed {} but is set to be {}.",
+          smallItemCache_->getMaxItemSize(),
+          smallItemMaxSize_));
+    }
+  }
+
+  if (!largeItemCache_) {
+    XLOG(INFO, "Large item cache is noop.");
+    largeItemCache_ = std::make_unique<NoopEngine>();
+  }
+  if (!smallItemCache_) {
+    XLOG(INFO, "Small item cache is noop.");
+    smallItemCache_ = std::make_unique<NoopEngine>();
+  }
 }
 
 } // namespace navy

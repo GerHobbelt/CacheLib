@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -210,7 +210,7 @@ class NvmCache {
   void flushPendingOps();
 
   // Obtain stats in a <string -> double> representation.
-  std::unordered_map<std::string, double> getStatsMap() const;
+  util::StatsMap getStatsMap() const;
 
   // returns the size of the NVM device
   size_t getSize() const noexcept { return navyCache_->getSize(); }

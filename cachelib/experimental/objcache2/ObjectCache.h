@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,6 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 #pragma once
 
 #include <folly/ScopeGuard.h>
@@ -52,9 +53,21 @@ struct FOLLY_PACK_ATTR ObjectCacheItem {
   size_t objectSize;
 };
 
+enum class ObjectCacheDestructorContext {
+  // evicted from cache
+  kEvicted,
+  // removed by user calling remove()/insertOrReplace() or due to expired
+  kRemoved,
+  // unknown cases
+  kUnknown,
+};
+
 struct ObjectCacheDestructorData {
-  ObjectCacheDestructorData(uintptr_t ptr, const KAllocation::Key& k)
-      : objectPtr(ptr), key(k) {}
+  ObjectCacheDestructorData(ObjectCacheDestructorContext ctx,
+                            uintptr_t ptr,
+                            const KAllocation::Key& k,
+                            uint32_t expiryTime)
+      : context(ctx), objectPtr(ptr), key(k), expiryTime(expiryTime) {}
 
   // release the evicted/removed/expired object memory
   template <typename T>
@@ -62,11 +75,17 @@ struct ObjectCacheDestructorData {
     delete reinterpret_cast<T*>(objectPtr);
   }
 
+  // remove or eviction
+  ObjectCacheDestructorContext context;
+
   // pointer of the evicted/removed/expired object
   uintptr_t objectPtr;
 
   // the key corresponding to the evicted/removed/expired object
   const KAllocation::Key& key;
+
+  // the expiry time of the object
+  uint32_t expiryTime;
 };
 
 template <typename AllocatorT>

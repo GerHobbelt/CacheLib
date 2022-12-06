@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -72,8 +72,8 @@ class PersistorWorker : public PeriodicWorker {
         recordWriter_->writeRecord(Serializer::serializeToIOBuf(item));
       }
     }
-    XLOG(INFO) << "Failed to Serialize Key Count = "
-               << failedToSerializeKeysCount;
+    XLOG_EVERY_MS(INFO, 10000)
+        << "Failed to Serialize Key Count = " << failedToSerializeKeysCount;
   }
 
   void setBreakOut() { breakOut_ = true; }

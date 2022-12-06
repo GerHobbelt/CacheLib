@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -10,7 +10,7 @@
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing fmm permissions and
+ * See the License for the specific language governing permissions and
  * limitations under the License.
  */
 
@@ -761,17 +761,27 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
 
   // only skip destructor for evicted items that are either in the queue to put
   // into nvm or already in nvm
-  if (!nascent && config_.itemDestructor &&
-      (ctx != RemoveContext::kEviction || !it.isNvmClean() ||
-       it.isNvmEvicted())) {
-    try {
-      config_.itemDestructor(DestructorData{
-          ctx, it, viewAsChainedAllocsRange(it), allocInfo.poolId});
-      stats().numRamDestructorCalls.inc();
-    } catch (const std::exception& e) {
-      stats().numDestructorExceptions.inc();
-      XLOG_EVERY_N(INFO, 100)
-          << "Catch exception from user's item destructor: " << e.what();
+  bool skipDestructor =
+      nascent || (ctx == RemoveContext::kEviction &&
+                  // When this item is queued for NvmCache, it will be marked
+                  // as clean and the NvmEvicted bit will also be set to false.
+                  // Refer to NvmCache::put()
+                  it.isNvmClean() && !it.isNvmEvicted());
+  if (!skipDestructor) {
+    if (ctx == RemoveContext::kEviction) {
+      stats().numCacheEvictions.inc();
+    }
+    // execute ItemDestructor
+    if (config_.itemDestructor) {
+      try {
+        config_.itemDestructor(DestructorData{
+            ctx, it, viewAsChainedAllocsRange(it), allocInfo.poolId});
+        stats().numRamDestructorCalls.inc();
+      } catch (const std::exception& e) {
+        stats().numDestructorExceptions.inc();
+        XLOG_EVERY_N(INFO, 100)
+            << "Catch exception from user's item destructor: " << e.what();
+      }
     }
   }
 
@@ -3550,13 +3560,13 @@ bool CacheAllocator<CacheTrait>::startNewMemMonitor(
     std::chrono::milliseconds interval,
     MemoryMonitor::Config config,
     std::shared_ptr<RebalanceStrategy> strategy) {
-  if (!startNewWorker("MemoryMonitor", memMonitor_, interval, std::move(config),
+  if (!startNewWorker("MemoryMonitor", memMonitor_, interval, config,
                       strategy)) {
     return false;
   }
 
   config_.memMonitorInterval = interval;
-  config_.memMonitorConfig = config;
+  config_.memMonitorConfig = std::move(config);
   config_.poolAdviseStrategy = strategy;
   return true;
 }
@@ -3646,15 +3656,10 @@ uint64_t CacheAllocator<CacheTrait>::getItemPtrAsOffset(const void* ptr) {
 }
 
 template <typename CacheTrait>
-std::unordered_map<std::string, double>
-CacheAllocator<CacheTrait>::getNvmCacheStatsMap() const {
-  auto ret = nvmCache_ ? nvmCache_->getStatsMap()
-                       : std::unordered_map<std::string, double>{};
+util::StatsMap CacheAllocator<CacheTrait>::getNvmCacheStatsMap() const {
+  auto ret = nvmCache_ ? nvmCache_->getStatsMap() : util::StatsMap{};
   if (nvmAdmissionPolicy_) {
-    auto policyStats = nvmAdmissionPolicy_->getCounters();
-    for (const auto& kv : policyStats) {
-      ret[kv.first] = kv.second;
-    }
+    nvmAdmissionPolicy_->getCounters(ret.createCountVisitor());
   }
   return ret;
 }

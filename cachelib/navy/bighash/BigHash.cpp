@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -85,7 +85,8 @@ BigHash::BigHash(Config&& config)
     : BigHash{std::move(config.validate()), ValidConfigTag{}} {}
 
 BigHash::BigHash(Config&& config, ValidConfigTag)
-    : destructorCb_{[this, cb = std::move(config.destructorCb)](
+    : checkExpired_(std::move(config.checkExpired)),
+      destructorCb_{[this, cb = std::move(config.destructorCb)](
                         HashedKey hk, BufferView value, DestructorEvent event) {
         sizeDist_.removeSize(hk.key().size() + value.size());
         if (cb) {
@@ -123,6 +124,7 @@ void BigHash::reset() {
   removeCount_.set(0);
   succRemoveCount_.set(0);
   evictionCount_.set(0);
+  evictionExpiredCount_.set(0);
   logicalWrittenCount_.set(0);
   physicalWrittenCount_.set(0);
   ioErrorCount_.set(0);
@@ -175,26 +177,54 @@ std::pair<Status, std::string> BigHash::getRandomAlloc(Buffer& value) {
 void BigHash::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bh_size", getSize());
   visitor("navy_bh_items", itemCount_.get());
-  visitor("navy_bh_inserts", insertCount_.get());
-  visitor("navy_bh_succ_inserts", succInsertCount_.get());
-  visitor("navy_bh_lookups", lookupCount_.get());
-  visitor("navy_bh_succ_lookups", succLookupCount_.get());
-  visitor("navy_bh_removes", removeCount_.get());
-  visitor("navy_bh_succ_removes", succRemoveCount_.get());
-  visitor("navy_bh_evictions", evictionCount_.get());
-  visitor("navy_bh_logical_written", logicalWrittenCount_.get());
-  visitor("navy_bh_physical_written", physicalWrittenCount_.get());
-  visitor("navy_bh_io_errors", ioErrorCount_.get());
+  visitor(
+      "navy_bh_inserts", insertCount_.get(), CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_succ_inserts",
+          succInsertCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor(
+      "navy_bh_lookups", lookupCount_.get(), CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_succ_lookups",
+          succLookupCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor(
+      "navy_bh_removes", removeCount_.get(), CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_succ_removes",
+          succRemoveCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_evictions",
+          evictionCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_evictions_expired",
+          evictionExpiredCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_logical_written",
+          logicalWrittenCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_physical_written",
+          physicalWrittenCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_io_errors",
+          ioErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bh_bf_false_positive_pct", bfFalsePositivePct());
-  visitor("navy_bh_bf_lookups", bfProbeCount_.get());
-  visitor("navy_bh_bf_rebuilds", bfRebuildCount_.get());
-  visitor("navy_bh_checksum_errors", checksumErrorCount_.get());
+  visitor("navy_bh_bf_lookups",
+          bfProbeCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_bf_rebuilds",
+          bfRebuildCount_.get(),
+          CounterVisitor::CounterType::RATE);
+  visitor("navy_bh_checksum_errors",
+          checksumErrorCount_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bh_used_size_bytes", usedSizeBytes_.get());
   auto snapshot = sizeDist_.getSnapshot();
   for (auto& kv : snapshot) {
     auto statName = folly::sformat("navy_bh_approx_bytes_in_size_{}", kv.first);
     visitor(statName.c_str(), kv.second);
   }
+  bucketExpirationsDist_x100_.visitQuantileEstimator(
+      visitor, "navy_bh_expired_loop_x100");
 }
 
 void BigHash::persist(RecordWriter& rw) {
@@ -207,6 +237,7 @@ void BigHash::persist(RecordWriter& rw) {
   *pd.cacheBaseOffset() = cacheBaseOffset_;
   *pd.numBuckets() = numBuckets_;
   *pd.sizeDist() = sizeDist_.getSnapshot();
+  *pd.usedSizeBytes() = usedSizeBytes_.get();
   serializeProto(pd, rw);
 
   if (bloomFilter_) {
@@ -241,6 +272,7 @@ bool BigHash::recover(RecordReader& rr) {
     generationTime_ = std::chrono::nanoseconds{*pd.generationTime()};
     itemCount_.set(*pd.itemCount());
     sizeDist_ = SizeDistribution{*pd.sizeDist()};
+    usedSizeBytes_.set(*pd.usedSizeBytes());
     if (bloomFilter_) {
       bloomFilter_->recover<ProtoSerializer>(rr);
       XLOG(INFO, "Recovered bloom filter");
@@ -262,6 +294,7 @@ Status BigHash::insert(HashedKey hk, BufferView value) {
 
   uint32_t removed{0};
   uint32_t evicted{0};
+  uint32_t evictExpired{0};
 
   uint32_t oldRemainingBytes = 0;
   uint32_t newRemainingBytes = 0;
@@ -286,7 +319,8 @@ Status BigHash::insert(HashedKey hk, BufferView value) {
     auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
     oldRemainingBytes = bucket->remainingBytes();
     removed = bucket->remove(hk, cb);
-    evicted = bucket->insert(hk, value, cb);
+    std::tie(evicted, evictExpired) =
+        bucket->insert(hk, value, checkExpired_, cb);
     newRemainingBytes = bucket->remainingBytes();
 
     // rebuild / fix the bloom filter before we move the buffer to do the
@@ -325,6 +359,10 @@ Status BigHash::insert(HashedKey hk, BufferView value) {
   itemCount_.add(1);
   itemCount_.sub(evicted + removed);
   evictionCount_.add(evicted);
+  evictionExpiredCount_.add(evictExpired);
+  if (evictExpired > 0) {
+    bucketExpirationsDist_x100_.trackValue(evictExpired * 100);
+  }
   logicalWrittenCount_.add(hk.key().size() + value.size());
   physicalWrittenCount_.add(bucketSize_);
   succInsertCount_.inc();

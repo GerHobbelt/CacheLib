@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 
 #pragma once
+
+#include <gtest/gtest_prod.h>
 
 #include <memory>
 #include <stdexcept>
@@ -42,8 +44,7 @@ class Driver final : public AbstractCache {
   struct Config {
     std::unique_ptr<Device> device;
     std::unique_ptr<JobScheduler> scheduler;
-    std::unique_ptr<Engine> largeItemCache;
-    std::unique_ptr<Engine> smallItemCache;
+    std::vector<EnginePair> enginePairs;
     std::unique_ptr<AdmissionPolicy> admissionPolicy;
     uint32_t smallItemMaxSize{};
     // Limited by scheduler parallelism (thread), this is large enough value to
@@ -104,9 +105,7 @@ class Driver final : public AbstractCache {
   // @param key  the item key to lookup
   // @param cb   a callback function be triggered when the lookup complete,
   //             the result will be provided to the function.
-  // @return     a status indicates success or failure enqueued, and the reason
-  //             for failure
-  Status lookupAsync(HashedKey key, LookupCallback cb) override;
+  void lookupAsync(HashedKey key, LookupCallback cb) override;
 
   // remove the key from cache
   // @param key  the item key to be removed
@@ -116,9 +115,7 @@ class Driver final : public AbstractCache {
   // remove the key from cache asynchronously.
   // @param key  the item key to be removed
   // @param cb   a callback function be triggered when the remove complete.
-  // @return     a status indicates success or failure enqueued, and the reason
-  //             for failure
-  Status removeAsync(HashedKey key, RemoveCallback cb) override;
+  void removeAsync(HashedKey key, RemoveCallback cb) override;
 
   // ensure all pending job have been completed and data has been flush to
   // device(s).
@@ -189,6 +186,8 @@ class Driver final : public AbstractCache {
 
   mutable AtomicCounter parcelMemory_; // In bytes
   mutable AtomicCounter concurrentInserts_;
+
+  FRIEND_TEST(Driver, MultiRecovery);
 };
 } // namespace navy
 } // namespace cachelib

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) Facebook, Inc. and its affiliates.
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -376,6 +376,9 @@ struct GlobalCacheStats {
 
   // number of evictions from NvmCache
   uint64_t numNvmEvictions{0};
+
+  // number of evictions where items leave both RAM and NvmCache entirely
+  uint64_t numCacheEvictions{0};
 
   // number of evictions from nvm that found an inconsistent state in RAM
   uint64_t numNvmUncleanEvict{0};
