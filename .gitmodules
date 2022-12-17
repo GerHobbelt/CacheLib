@@ -1,12 +1,12 @@
 [submodule "fbthrift"]
 	path = cachelib/external/fbthrift
-	url = git@github.com:facebook/fbthrift
+	url = https://github.com/facebook/fbthrift
 [submodule "folly"]
 	path = cachelib/external/folly
-	url = git@github.com:facebook/folly
+	url = https://github.com/facebook/folly
 [submodule "fizz"]
 	path = cachelib/external/fizz
-	url = git@github.com:facebookincubator/fizz
+	url = https://github.com/facebookincubator/fizz
 [submodule "wangle"]
 	path = cachelib/external/wangle
-	url = git@github.com:facebook/wangle
+	url = https://github.com/facebook/wangle
