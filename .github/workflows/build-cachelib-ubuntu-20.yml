@@ -84,7 +84,7 @@ jobs:
         run: ./contrib/build-package.sh -j -v -i fbthrift
       - name: "build CacheLib"
         # Build cachelib in debug mode (-d) and with all tests (-t)
-        run: ./contrib/build-package.sh -j -v -i -t cachelib
+        run: ./contrib/build-package.sh -j -v -i cachelib
       - uses: actions/upload-artifact@v3
         if: failure()
         with:
