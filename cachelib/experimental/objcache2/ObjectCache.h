@@ -68,8 +68,15 @@ struct ObjectCacheDestructorData {
   ObjectCacheDestructorData(ObjectCacheDestructorContext ctx,
                             uintptr_t ptr,
                             const KAllocation::Key& k,
-                            uint32_t expiryTime)
-      : context(ctx), objectPtr(ptr), key(k), expiryTime(expiryTime) {}
+                            uint32_t expiryTime,
+                            uint32_t creationTime,
+                            uint32_t lastAccessTime)
+      : context(ctx),
+        objectPtr(ptr),
+        key(k),
+        expiryTime(expiryTime),
+        creationTime(creationTime),
+        lastAccessTime(lastAccessTime) {}
 
   // release the evicted/removed/expired object memory
   template <typename T>
@@ -88,6 +95,12 @@ struct ObjectCacheDestructorData {
 
   // the expiry time of the object
   uint32_t expiryTime;
+
+  // the creation time of the object
+  uint32_t creationTime;
+
+  // the last time this object was accessed
+  uint32_t lastAccessTime;
 };
 
 template <typename AllocatorT>
@@ -227,7 +240,9 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
   // Remove an object from cache by its key. No-op if object doesn't exist.
   // @param key   the key to the object.
-  void remove(folly::StringPiece key);
+  //
+  // @return false if the key is not found in object-cache
+  bool remove(folly::StringPiece key);
 
   // Persist all non-expired objects in the cache if cache persistence is
   // enabled.
@@ -298,6 +313,19 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
     return getReadHandleRefInternal<T>(object)->getConfiguredTTL();
   }
 
+  // Get the last access timestamp of the object
+  // @param  object   object shared pointer returned from ObjectCache APIs
+  //
+  // @return the last accessed timestamp in seconds of the object
+  //         0 if object is nullptr
+  template <typename T>
+  uint32_t getLastAccessTimeSec(std::shared_ptr<T>& object) {
+    if (object == nullptr) {
+      return 0;
+    }
+    return getReadHandleRefInternal<T>(object)->getLastAccessTime();
+  }
+
   // Update the expiry timestamp of an object
   //
   // @param  object         object shared pointer returned from ObjectCache APIs
@@ -365,11 +393,7 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
  private:
   // Minimum alloc size in bytes for l1 cache.
   static constexpr uint32_t kL1AllocSizeMin = 64;
-
-  // Generate the key for the ith placeholder.
-  static std::string getPlaceHolderKey(size_t i) {
-    return fmt::format("_cl_ph_{}", i);
-  }
+  static constexpr const char* kPlaceholderKey = "_cl_ph";
 
   void init();
 
@@ -382,7 +406,10 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // Allocate the placeholder and add it to the placeholder vector.
   //
   // @return true if the allocation is successful
-  bool allocatePlaceholder(std::string key);
+  bool allocatePlaceholder();
+
+  // Returns the total number of placeholders
+  size_t getNumPlaceholders() { return placeholders_.size(); }
 
   // Start size controller
   //
@@ -427,9 +454,6 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
   // Config passed to the cache.
   Config config_{};
-
-  // Number of shards (LRUs) to lessen the contention on L1 cache
-  size_t l1NumShards_{};
 
   // They take up space so we can control exact number of items in cache
   std::vector<typename AllocatorT::WriteHandle> placeholders_;
