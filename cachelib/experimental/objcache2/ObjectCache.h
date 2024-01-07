@@ -37,6 +37,7 @@
 #include "cachelib/experimental/objcache2/ObjectCacheBase.h"
 #include "cachelib/experimental/objcache2/ObjectCacheConfig.h"
 #include "cachelib/experimental/objcache2/ObjectCacheSizeController.h"
+#include "cachelib/experimental/objcache2/ObjectCacheSizeDistTracker.h"
 #include "cachelib/experimental/objcache2/persistence/Persistence.h"
 #include "cachelib/experimental/objcache2/persistence/gen-cpp2/persistent_data_types.h"
 #include "cachelib/experimental/objcache2/util/ThreadMemoryTracker.h"
@@ -159,6 +160,7 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   using Persistor = Persistor<ObjectCache<AllocatorT>>;
   using Restorer = Restorer<ObjectCache<AllocatorT>>;
   using EvictionIterator = typename AllocatorT::EvictionIterator;
+  using AccessIterator = typename AllocatorT::AccessIterator;
 
   enum class AllocStatus { kSuccess, kAllocError, kKeyAlreadyExists };
 
@@ -271,6 +273,11 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // This is only used in tests.
   AllocatorT& getL1Cache() { return *this->l1Cache_; }
 
+  // Get an iterator to iterate over all items in object-cache.
+  AccessIterator begin() { return this->l1Cache_->begin(); }
+
+  AccessIterator end() { return this->l1Cache_->end(); }
+
   // Get the default l1 allocation size in bytes.
   static uint32_t getL1AllocSize(uint8_t maxKeySizeBytes);
 
@@ -363,12 +370,9 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // @param  object       shared pointer of the object to be mutated (must be
   //                      fetched from ObjectCache APIs)
   // @param  mutateCb     callback containing the mutation logic
-  // @param  mutateCtx    context string of this mutation operation, for
-  //                      logging purpose
   template <typename T>
   void mutateObject(const std::shared_ptr<T>& object,
-                    std::function<void()> mutateCb,
-                    const std::string& mutateCtx = "");
+                    std::function<void()> mutateCb);
 
   // Get the size of the object
   //
@@ -386,6 +390,32 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
         ->objectSize;
   }
 
+  size_t getObjectSize(AccessIterator& itr) const {
+    if (!itr.asHandle()) {
+      return 0;
+    }
+    return reinterpret_cast<const ObjectCacheItem*>(itr.asHandle()->getMemory())
+        ->objectSize;
+  }
+
+  // Stop all workers
+  //
+  // @return true if all workers have been successfully stopped
+  bool stopAllWorkers(std::chrono::seconds timeout = std::chrono::seconds{0}) {
+    bool success = true;
+    success &=
+        util::stopPeriodicWorker(kSizeControllerName, sizeController_, timeout);
+    success &= util::stopPeriodicWorker(
+        kSizeDistTrackerName, sizeDistTracker_, timeout);
+    success &= this->l1Cache_->stopWorkers(timeout);
+    return success;
+  }
+
+  // No-op for workers that are already running. Typically user uses this in
+  // conjunction with `config.setDelayCacheWorkersStart()` to avoid
+  // initialization ordering issues with user callback for cachelib's workers.
+  void startCacheWorkers();
+
  protected:
   // Serialize cache allocator config for exporting to Scuba
   std::map<std::string, std::string> serializeConfigParams() const override;
@@ -395,7 +425,13 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   static constexpr uint32_t kL1AllocSizeMin = 64;
   static constexpr const char* kPlaceholderKey = "_cl_ph";
 
+  // Names of periodic workers
+  static constexpr folly::StringPiece kSizeControllerName{"SizeController"};
+  static constexpr folly::StringPiece kSizeDistTrackerName{"SizeDistTracker"};
+
   void init();
+
+  void initWorkers();
 
   // Allocate an item handle from the interal cache allocator. This item's
   // storage is used to cache pointer to objects in object-cache.
@@ -410,20 +446,6 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
   // Returns the total number of placeholders
   size_t getNumPlaceholders() const { return placeholders_.size(); }
-
-  // Start size controller
-  //
-  // @param interval   the period this worker fires
-  // @param config     throttling config
-  // @return true if size controller has been successfully started
-  bool startSizeController(std::chrono::milliseconds interval,
-                           const util::Throttler::Config& config);
-
-  // Stop size controller
-  //
-  // @return true if size controller has been successfully stopped
-  bool stopSizeController(std::chrono::seconds timeout = std::chrono::seconds{
-                              0});
 
   // Get a ReadHandle reference from the object shared_ptr
   template <typename T>
@@ -461,6 +483,10 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // A periodic worker that controls the total object size to be limited by
   // cache size limit
   std::unique_ptr<ObjectCacheSizeController<AllocatorT>> sizeController_;
+
+  // A periodic worker that tracks the object size distribution stats.
+  std::unique_ptr<ObjectCacheSizeDistTracker<ObjectCache<AllocatorT>>>
+      sizeDistTracker_;
 
   // Actual object size in total
   std::atomic<size_t> totalObjectSizeBytes_{0};
