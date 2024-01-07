@@ -351,7 +351,7 @@ class Cache {
   // returns the initialized size of the cache.
   // TODO (sathya) deprecate this after cleaning up FastShutdownStressor
   size_t getCacheSize() const {
-    return cache_->getCacheMemoryStats().cacheSize;
+    return cache_->getCacheMemoryStats().ramCacheSize;
   }
 
   // empties the cache entries by removing the keys, this will schedule the
@@ -466,7 +466,9 @@ inline typename LruAllocator::MMConfig makeMMConfig(CacheConfig const& config) {
                                 config.lruUpdateOnWrite,
                                 config.lruUpdateOnRead,
                                 config.tryLockUpdate,
-                                static_cast<uint8_t>(config.lruIpSpec));
+                                static_cast<uint8_t>(config.lruIpSpec),
+                                0,
+                                config.useCombinedLockForIterators);
 }
 
 // LRU
@@ -480,7 +482,9 @@ inline typename Lru2QAllocator::MMConfig makeMMConfig(
                                   config.tryLockUpdate,
                                   false,
                                   config.lru2qHotPct,
-                                  config.lru2qColdPct);
+                                  config.lru2qColdPct,
+                                  0,
+                                  config.useCombinedLockForIterators);
 }
 
 } // namespace cachebench
