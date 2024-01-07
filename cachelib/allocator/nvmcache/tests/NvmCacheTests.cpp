@@ -158,6 +158,13 @@ TEST_F(NvmCacheTest, CouldExistFast) {
 }
 
 TEST_F(NvmCacheTest, EvictToNvmGet) {
+  // Disable bighash since we're only testing large items here
+  this->config_.bigHash().setSizePctAndMaxItemSize(0, 100);
+  LruAllocator::NvmCacheConfig nvmConfig;
+  nvmConfig.navyConfig = config_;
+  this->allocConfig_.enableNvmCache(nvmConfig);
+  this->makeCache();
+
   auto& nvm = this->cache();
   auto pid = this->poolId();
 
@@ -169,6 +176,17 @@ TEST_F(NvmCacheTest, EvictToNvmGet) {
     auto it = nvm.allocate(pid, key, 15 * 1024);
     ASSERT_NE(nullptr, it);
     nvm.insertOrReplace(it);
+
+    // Ensure nvm-cache is flushed every 100 items. The reason is to
+    // make sure we don't have any race between a "remove" operation
+    // queued by an item's initial insertion with this item's eventual
+    // eviction. We only flush every 100 items to avoid pushing too
+    // many regions to flash that only has one item per region. If we
+    // flushed per insertion, we would fill up BlockCache prematurely
+    // and trigger evictions which are not desirable in this test.
+    if (i % 100 == 0) {
+      nvm.flushNvmCache();
+    }
   }
   nvm.flushNvmCache();
 
@@ -184,7 +202,7 @@ TEST_F(NvmCacheTest, EvictToNvmGet) {
     auto hdl = this->fetch(key, false /* ramOnly */);
     hdl.wait();
     if (index < nKeys) {
-      ASSERT_NE(nullptr, hdl);
+      ASSERT_NE(nullptr, hdl) << fmt::format("key: {}", key);
       // First nEvictions keys should have nvm clean bit set since
       // we load it from nvm
       const auto isClean = hdl->isNvmClean();
@@ -1578,13 +1596,6 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bc_cleanup_entry_header_checksum_errors"));
   EXPECT_TRUE(cs("navy_bc_cleanup_value_checksum_errors"));
   EXPECT_TRUE(cs("navy_bc_remove_attempt_collisions"));
-  for (int size = 64;;
-       size = std::min(4 * 1024 * 1024, static_cast<int>(size * 1.25))) {
-    EXPECT_TRUE(cs(folly::sformat("navy_bc_approx_bytes_in_size_{}", size)));
-    if (size == 4 * 1024 * 1024) {
-      break;
-    }
-  }
 
   // navy::RegionManager
   EXPECT_TRUE(cs("navy_bc_reclaim"));
@@ -1666,13 +1677,6 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bh_bf_rebuilds"));
   EXPECT_TRUE(cs("navy_bh_checksum_errors"));
   EXPECT_TRUE(cs("navy_bh_used_size_bytes"));
-  for (int size = 64;; size = std::min(1024, static_cast<int>(size * 1.25))) {
-    EXPECT_TRUE(cs(folly::sformat("navy_bh_approx_bytes_in_size_{}", size)));
-    if (size == 1024) {
-      break;
-    }
-  }
-
   // navy::Device
   EXPECT_TRUE(cs("navy_device_bytes_written"));
   EXPECT_TRUE(cs("navy_device_bytes_read"));

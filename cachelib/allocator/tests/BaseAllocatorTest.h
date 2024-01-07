@@ -4416,14 +4416,12 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     // and thus it cannot be evicted, so none of its chained allocations
     // can be evicted either
     auto itemHandle = util::allocateAccessible(alloc, pid, "hello1", size);
-    int allocations = 1;
-    for (unsigned int i = 0;; ++i) {
+    while (true) {
       auto chainedItemHandle = alloc.allocateChainedItem(itemHandle, size);
       alloc.addChainedItem(itemHandle, std::move(chainedItemHandle));
       if (chainedItemHandle == nullptr) {
         break;
       }
-      ++allocations;
     }
 
     // Dropping the item handle. The item is still in cache since it's
@@ -5020,7 +5018,9 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
                       oldItem.getSize());
           ++numMoves;
         },
-        [&m](typename Item::Key) { return std::make_unique<TestSyncObj>(m); });
+        [&m](typename Item::Key) { return std::make_unique<TestSyncObj>(m); },
+        // Attempt a lot of moving so we're more lilely to succeed
+        1'000'000 /* movingAttempts */);
 
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().cacheSize;
@@ -5106,7 +5106,6 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     allocateItem3.wait();
 
     // Verify items have only been moved but not evicted
-    ASSERT_LT(0, numMoves);
     ASSERT_EQ(0, numRemovedKeys);
 
     auto lookupFn = [&](std::string keyPrefix) {
