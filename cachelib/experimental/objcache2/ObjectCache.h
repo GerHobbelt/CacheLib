@@ -94,6 +94,43 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // make constructor private, but constructable by std::make_unique
   struct InternalConstructor {};
 
+  template <typename T>
+  class Deleter {
+   public:
+    using ReadHandle = typename AllocatorT::ReadHandle;
+    using WriteHandle = typename AllocatorT::WriteHandle;
+    using Handle = std::variant<ReadHandle, WriteHandle>;
+
+    explicit Deleter(typename AllocatorT::ReadHandle&& hdl)
+        : hdl_(std::move(hdl)) {}
+    explicit Deleter(typename AllocatorT::WriteHandle&& hdl)
+        : hdl_(std::move(hdl)) {}
+
+    void operator()(T*) {
+      // Just release the handle.
+      // Cache destorys object when all handles released.
+      std::holds_alternative<ReadHandle>(hdl_)
+          ? std::get<ReadHandle>(hdl_).reset()
+          : std::get<WriteHandle>(hdl_).reset();
+    }
+
+    WriteHandle& getWriteHandleRef() {
+      if (std::holds_alternative<ReadHandle>(hdl_)) {
+        hdl_ = std::move(std::get<ReadHandle>(hdl_)).toWriteHandle();
+      }
+      return std::get<WriteHandle>(hdl_);
+    }
+
+    ReadHandle& getReadHandleRef() {
+      return std::holds_alternative<ReadHandle>(hdl_)
+                 ? std::get<ReadHandle>(hdl_)
+                 : std::get<WriteHandle>(hdl_);
+    }
+
+   private:
+    Handle hdl_;
+  };
+
  public:
   using ItemDestructor = std::function<void(ObjectCacheDestructorData)>;
   using Key = KAllocation::Key;
@@ -230,6 +267,63 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
                : sizeController_->getCurrentEntriesLimit();
   }
 
+  // Get the expiry timestamp of the object
+  // @param  object   object shared pointer returned from ObjectCache APIs
+  //
+  // @return the expiry timestamp in seconds of the object
+  //         0 if object is nullptr
+  template <typename T>
+  uint32_t getExpiryTimeSec(const std::shared_ptr<T>& object) const {
+    if (object == nullptr) {
+      return 0;
+    }
+    return getReadHandleRefInternal<T>(object)->getExpiryTime();
+  }
+
+  // Get the configured TTL of the object
+  // @param  object   object shared pointer returned from ObjectCache APIs
+  //
+  // @return the configured TTL in seconds of the object
+  //         0 if object is nullptr
+  template <typename T>
+  std::chrono::seconds getConfiguredTtl(
+      const std::shared_ptr<T>& object) const {
+    if (object == nullptr) {
+      return std::chrono::seconds{0};
+    }
+    return getReadHandleRefInternal<T>(object)->getConfiguredTTL();
+  }
+
+  // Update the expiry timestamp of an object
+  //
+  // @param  object         object shared pointer returned from ObjectCache APIs
+  // @param  expiryTimeSecs the expiryTime in seconds to update
+  //
+  // @return boolean indicating whether expiry time was successfully updated
+  template <typename T>
+  bool updateExpiryTimeSec(std::shared_ptr<T>& object,
+                           uint32_t expiryTimeSecs) {
+    if (object == nullptr) {
+      return false;
+    }
+    return getWriteHandleRefInternal<T>(object)->updateExpiryTime(
+        expiryTimeSecs);
+  }
+
+  // Update expiry time to @ttl seconds from now.
+  //
+  // @param  object    object shared pointer returned from ObjectCache APIs
+  // @param  ttl       TTL in seconds (from now)
+  //
+  // @return boolean indicating whether TTL was successfully extended
+  template <typename T>
+  bool extendTtl(std::shared_ptr<T>& object, std::chrono::seconds ttl) {
+    if (object == nullptr) {
+      return false;
+    }
+    return getWriteHandleRefInternal<T>(object)->extendTTL(ttl);
+  }
+
  protected:
   // Serialize cache allocator config for exporting to Scuba
   std::map<std::string, std::string> serializeConfigParams() const override;
@@ -269,6 +363,28 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // @return true if size controller has been successfully stopped
   bool stopSizeController(std::chrono::seconds timeout = std::chrono::seconds{
                               0});
+
+  // Get a ReadHandle reference from the object shared_ptr
+  template <typename T>
+  typename AllocatorT::ReadHandle& getReadHandleRefInternal(
+      const std::shared_ptr<T>& object) const {
+    auto* deleter = std::get_deleter<Deleter<T>>(object);
+    XDCHECK(deleter != nullptr);
+    auto& hdl = deleter->getReadHandleRef();
+    XDCHECK(hdl != nullptr);
+    return hdl;
+  }
+
+  // Get a WriteHandle reference from the object shared_ptr
+  template <typename T>
+  typename AllocatorT::WriteHandle& getWriteHandleRefInternal(
+      std::shared_ptr<T>& object) {
+    auto* deleter = std::get_deleter<Deleter<T>>(object);
+    XDCHECK(deleter != nullptr);
+    auto& hdl = deleter->getWriteHandleRef();
+    XDCHECK(hdl != nullptr);
+    return hdl;
+  }
 
   // Config passed to the cache.
   Config config_{};
