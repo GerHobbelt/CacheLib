@@ -52,8 +52,7 @@ jobs:
           g++ - || true
       - name: "checkout sources"
         uses: actions/checkout@v3
-      - name: "Add Git safe directory"
-        # Workaround for Docker image bug (GitHub issue #199).
+      - name: "Add workspace as a safe directory"
         run: git config --system --add safe.directory $GITHUB_WORKSPACE
       - name: "Install Prerequisites"
         run: ./contrib/build.sh -S -B
@@ -77,6 +76,8 @@ jobs:
         run: ./contrib/build-package.sh -j -v -i fizz
       - name: "Install dependency: wangle"
         run: ./contrib/build-package.sh -j -v -i wangle
+      - name: "Install dependency: mvfst"
+        run: ./contrib/build-package.sh -j -v -i mvfst
       - name: "Install dependency: fbthrift"
         run: ./contrib/build-package.sh -j -v -i fbthrift
       - name: "build CacheLib"

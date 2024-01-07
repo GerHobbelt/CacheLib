@@ -63,7 +63,16 @@ RandomAPConfig& RandomAPConfig::setAdmProbability(double admProbability) {
   return *this;
 }
 
-// file settings
+// device settings
+void NavyConfig::enableAsyncIo(unsigned int qDepth, bool enableIoUring) {
+  if (qDepth == 0) {
+    throw std::invalid_argument(
+        folly::sformat("qdepth {} should be >=1 to use async IO", qDepth));
+  }
+  ioEngine_ = enableIoUring ? IoEngine::IoUring : IoEngine::LibAio;
+  qDepth_ = qDepth;
+}
+
 void NavyConfig::setSimpleFile(const std::string& fileName,
                                uint64_t fileSize,
                                bool truncateFile) {
@@ -210,6 +219,8 @@ std::map<std::string, std::string> NavyConfig::serialize() const {
   configMap["navyConfig::truncateFile"] = truncateFile_ ? "true" : "false";
   configMap["navyConfig::deviceMaxWriteSize"] =
       folly::to<std::string>(deviceMaxWriteSize_);
+  configMap["navyConfig::ioEngine"] = getIoEngineName(ioEngine_).str();
+  configMap["navyConfig::QDepth"] = folly::to<std::string>(qDepth_);
 
   // Job scheduler settings
   configMap["navyConfig::readerThreads"] =

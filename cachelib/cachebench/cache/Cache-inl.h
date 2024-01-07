@@ -212,6 +212,12 @@ Cache<Allocator>::Cache(const CacheConfig& config,
 
     nvmConfig.navyConfig.setMaxParcelMemoryMB(config_.navyParcelMemoryMB);
 
+    // Enable async IO if qdepth is greater than 0
+    if (config_.navyQDepth > 0) {
+      nvmConfig.navyConfig.enableAsyncIo(config_.navyQDepth,
+                                         config_.navyEnableIoUring);
+    }
+
     nvmConfig.navyConfig.setReaderAndWriterThreads(config_.navyReaderThreads,
                                                    config_.navyWriterThreads);
 
@@ -254,7 +260,7 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     allocatorConfig_.setNvmAdmissionMinTTL(config_.memoryOnlyTTL);
   }
 
-  allocatorConfig_.cacheName = "cachebench";
+  allocatorConfig_.cacheName = kCachebenchCacheName;
 
   bool isRecovered = false;
   if (!allocatorConfig_.cacheDir.empty()) {

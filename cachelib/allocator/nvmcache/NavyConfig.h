@@ -440,6 +440,21 @@ class EnginesConfig {
   BigHashConfig bigHashConfig_;
 };
 
+enum class IoEngine : uint8_t { IoUring, LibAio, Sync };
+
+inline const folly::StringPiece getIoEngineName(IoEngine e) {
+  switch (e) {
+  case IoEngine::IoUring:
+    return "io_uring";
+  case IoEngine::LibAio:
+    return "libaio";
+  case IoEngine::Sync:
+    return "sync";
+  }
+  XDCHECK(false);
+  return "invalid";
+}
+
 /**
  * NavyConfig provides APIs for users to set up Navy related settings for
  * NvmCache.
@@ -485,6 +500,8 @@ class NavyConfig {
   uint64_t getFileSize() const { return fileSize_; }
   bool getTruncateFile() const { return truncateFile_; }
   uint32_t getDeviceMaxWriteSize() const { return deviceMaxWriteSize_; }
+  IoEngine getIoEngine() const { return ioEngine_; }
+  unsigned int getQDepth() const { return qDepth_; }
 
   // Return a const BlockCacheConfig to read values of its parameters.
   const BigHashConfig& bigHash() const {
@@ -520,6 +537,7 @@ class NavyConfig {
   RandomAPConfig& enableRandomAdmPolicy();
 
   // ============ Device settings =============
+  // Set the device block size, i.e., minimum unit of IO
   void setBlockSize(uint64_t blockSize) noexcept { blockSize_ = blockSize; }
   // Set the parameters for a simple file.
   // @throw std::invalid_argument if RAID files have been already set.
@@ -542,6 +560,9 @@ class NavyConfig {
   void setDeviceMaxWriteSize(uint32_t deviceMaxWriteSize) noexcept {
     deviceMaxWriteSize_ = deviceMaxWriteSize;
   }
+
+  // Enable AsyncIo
+  void enableAsyncIo(unsigned int qDepth, bool enableIoUring);
 
   // ============ BlockCache settings =============
   // Return BlockCacheConfig for configuration.
@@ -612,6 +633,13 @@ class NavyConfig {
   // This controls granularity of the writes when we flush the region.
   // This is only used when in-mem buffer is enabled.
   uint32_t deviceMaxWriteSize_{};
+
+  // IoEngine type used for IO
+  IoEngine ioEngine_{IoEngine::Sync};
+
+  // Number of queue depth per thread for async IO.
+  // 0 for Sync io engine and >1 for libaio and io_uring
+  unsigned int qDepth_{0};
 
   // ============ Engines settings =============
   // Currently we support one pair of engines.
