@@ -89,11 +89,14 @@ void RegionManager::reset() {
     regions_[i]->reset();
   }
   {
-    std::lock_guard<std::mutex> lock{cleanRegionsMutex_};
+    std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
     // Reset is inherently single threaded. All pending jobs, including
     // reclaims, have to be finished first.
     XDCHECK_EQ(reclaimsScheduled_, 0u);
     cleanRegions_.clear();
+    if (cleanRegionsCond_.numWaiters() > 0) {
+      cleanRegionsCond_.notifyAll();
+    }
   }
   seqNumber_.store(0, std::memory_order_release);
 
@@ -157,46 +160,66 @@ void RegionManager::releaseCleanedupRegion(RegionId rid) {
   // used by a region allocator.
   region.reset();
   {
-    std::lock_guard<std::mutex> lock{cleanRegionsMutex_};
+    std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
     cleanRegions_.push_back(rid);
+    if (cleanRegionsCond_.numWaiters() > 0) {
+      cleanRegionsCond_.notifyAll();
+    }
   }
 }
 
-OpenStatus RegionManager::assignBufferToRegion(RegionId rid) {
+std::pair<OpenStatus, std::unique_ptr<CondWaiter>>
+RegionManager::assignBufferToRegion(RegionId rid, bool addWaiter) {
   XDCHECK(rid.valid());
-  auto buf = claimBufferFromPool();
+  auto [buf, waiter] = claimBufferFromPool(addWaiter);
   if (!buf) {
-    return OpenStatus::Retry;
+    XLOG_EVERY_MS(ERR, 10'000) << fmt::format(
+        "Failed to assign buffers. All buffers({}) are being used",
+        numInMemBuffers_);
+    return {OpenStatus::Retry, std::move(waiter)};
   }
+
   auto& region = getRegion(rid);
   region.attachBuffer(std::move(buf));
-  return OpenStatus::Ready;
+  return {OpenStatus::Ready, std::move(waiter)};
 }
 
-std::unique_ptr<Buffer> RegionManager::claimBufferFromPool() {
+std::pair<std::unique_ptr<Buffer>, std::unique_ptr<CondWaiter>>
+RegionManager::claimBufferFromPool(bool addWaiter) {
   std::unique_ptr<Buffer> buf;
   {
-    std::lock_guard<std::mutex> bufLock{bufferMutex_};
+    std::lock_guard<TimedMutex> bufLock{bufferMutex_};
     if (buffers_.empty()) {
-      return nullptr;
+      std::unique_ptr<CondWaiter> waiter;
+      if (addWaiter) {
+        waiter = std::make_unique<CondWaiter>();
+        bufferCond_.addWaiter(waiter.get());
+      }
+      return {nullptr, std::move(waiter)};
     }
     buf = std::move(buffers_.back());
     buffers_.pop_back();
   }
   numInMemBufActive_.inc();
-  return buf;
+  return {std::move(buf), nullptr};
 }
 
-OpenStatus RegionManager::getCleanRegion(RegionId& rid) {
+std::pair<OpenStatus, std::unique_ptr<CondWaiter>>
+RegionManager::getCleanRegion(RegionId& rid, bool addWaiter) {
   auto status = OpenStatus::Retry;
+  std::unique_ptr<CondWaiter> waiter;
   uint32_t newSched = 0;
   {
-    std::lock_guard<std::mutex> lock{cleanRegionsMutex_};
+    std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
     if (!cleanRegions_.empty()) {
       rid = cleanRegions_.back();
       cleanRegions_.pop_back();
       status = OpenStatus::Ready;
     } else {
+      if (addWaiter) {
+        waiter = std::make_unique<CondWaiter>();
+        cleanRegionsCond_.addWaiter(waiter.get());
+      }
       status = OpenStatus::Retry;
     }
     auto plannedClean = cleanRegions_.size() + reclaimsScheduled_;
@@ -205,18 +228,26 @@ OpenStatus RegionManager::getCleanRegion(RegionId& rid) {
       reclaimsScheduled_ += newSched;
     }
   }
+
   for (uint32_t i = 0; i < newSched; i++) {
     startReclaim();
   }
 
   if (status == OpenStatus::Ready) {
-    status = assignBufferToRegion(rid);
+    XDCHECK(!waiter);
+    std::tie(status, waiter) = assignBufferToRegion(rid, addWaiter);
     if (status != OpenStatus::Ready) {
-      std::lock_guard<std::mutex> lock{cleanRegionsMutex_};
+      std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
       cleanRegions_.push_back(rid);
+      if (cleanRegionsCond_.numWaiters() > 0) {
+        cleanRegionsCond_.notifyAll();
+      }
     }
+  } else if (status == OpenStatus::Retry && newSched > 0) {
+    cleanRegionRetries_.inc();
   }
-  return status;
+
+  return {status, std::move(waiter)};
 }
 
 void RegionManager::doFlush(RegionId rid, bool async) {
@@ -391,9 +422,12 @@ void RegionManager::releaseEvictedRegion(RegionId rid,
   // used by a region allocator.
   region.reset();
   {
-    std::lock_guard<std::mutex> lock{cleanRegionsMutex_};
+    std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
     reclaimsScheduled_--;
     cleanRegions_.push_back(rid);
+    if (cleanRegionsCond_.numWaiters() > 0) {
+      cleanRegionsCond_.notifyAll();
+    }
   }
   reclaimTimeCountUs_.add(toMicros(getSteadyClock() - startTime).count());
   reclaimCount_.inc();
@@ -547,6 +581,7 @@ void RegionManager::getCounters(const CounterVisitor& visitor) const {
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_num_regions", numRegions_);
   visitor("navy_bc_num_clean_regions", cleanRegions_.size());
+  visitor("navy_bc_num_clean_region_retries", cleanRegionRetries_.get());
   visitor("navy_bc_external_fragmentation", externalFragmentation_.get());
   visitor("navy_bc_physical_written", physicalWrittenCount_.get(),
           CounterVisitor::CounterType::RATE);

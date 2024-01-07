@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <folly/SharedMutex.h>
+#include <folly/fibers/TimedMutex.h>
 
 #include <chrono>
 #include <stdexcept>
@@ -35,6 +35,9 @@
 namespace facebook {
 namespace cachelib {
 namespace navy {
+// SharedMutex is write priority by default
+using SharedMutex =
+    folly::fibers::TimedRWMutexWritePriority<folly::fibers::Baton>;
 // BigHash is a small item flash-based cache engine. It divides the device into
 // a series of buckets. One can think of it as a on-device hash table.
 //
@@ -172,8 +175,12 @@ class BigHash final : public Engine {
   // could overwrite another's writes.
   //
   // In short, just hold the lock during the entire operation!
-  folly::SharedMutex& getMutex(BucketId bid) const {
+  SharedMutex& getMutex(BucketId bid) const {
     return mutex_[bid.index() & (kNumMutexes - 1)];
+  }
+
+  folly::SpinLock& getBfLock(BucketId bid) const {
+    return bfLock_[bid.index() & (kNumMutexes - 1)];
   }
 
   BucketId getBucketId(HashedKey hk) const {
@@ -185,6 +192,8 @@ class BigHash final : public Engine {
   }
 
   double bfFalsePositivePct() const;
+  void bfSet(BucketId bid, uint64_t bucket);
+  void bfClear(BucketId bid);
   void bfRebuild(BucketId bid, const Bucket* bucket);
   bool bfReject(BucketId bid, uint64_t keyHash) const;
 
@@ -203,8 +212,15 @@ class BigHash final : public Engine {
   std::unique_ptr<BloomFilter> bloomFilter_;
   std::chrono::nanoseconds generationTime_{};
   Device& device_;
-  std::unique_ptr<folly::SharedMutex[]> mutex_{
-      new folly::SharedMutex[kNumMutexes]};
+  std::unique_ptr<SharedMutex[]> mutex_{new SharedMutex[kNumMutexes]};
+  // Spinlocks for bloom filter operations
+  // We use spinlock in addition to the mutex to avoid contentions of
+  // couldExist which needs to be fast against other long running or
+  // even blocking operations including insert/remove. When the race
+  // happens against the remove or evict of the given item, there could
+  // be a false positive which is ok.
+  // Nested lock orders are always mutex-then-spinlock
+  std::unique_ptr<folly::SpinLock[]> bfLock_{new folly::SpinLock[kNumMutexes]};
 
   // thread local counters in synchronized path
   mutable TLCounter lookupCount_;

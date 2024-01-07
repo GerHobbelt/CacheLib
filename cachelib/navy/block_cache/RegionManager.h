@@ -18,13 +18,14 @@
 
 #include <folly/Random.h>
 #include <folly/container/F14Map.h>
+#include <folly/fibers/TimedMutex.h>
 
 #include <cassert>
 #include <memory>
-#include <mutex>
 #include <utility>
 
 #include "cachelib/common/AtomicCounter.h"
+#include "cachelib/common/ConditionVariable.h"
 #include "cachelib/navy/block_cache/EvictionPolicy.h"
 #include "cachelib/navy/block_cache/Region.h"
 #include "cachelib/navy/block_cache/Types.h"
@@ -38,6 +39,8 @@
 namespace facebook {
 namespace cachelib {
 namespace navy {
+using folly::fibers::TimedMutex;
+using CondWaiter = util::ConditionVariable::Waiter;
 
 // Callback that is used to clear index.
 //   @rid       Region ID
@@ -154,13 +157,17 @@ class RegionManager {
   }
 
   // Assigns a buffer from buffer pool.
-  std::unique_ptr<Buffer> claimBufferFromPool();
+  std::pair<std::unique_ptr<Buffer>, std::unique_ptr<CondWaiter>>
+  claimBufferFromPool(bool addWaiter);
 
   // Returns the buffer to the pool.
   void returnBufferToPool(std::unique_ptr<Buffer> buf) {
     {
-      std::lock_guard<std::mutex> bufLock{bufferMutex_};
+      std::lock_guard<TimedMutex> bufLock{bufferMutex_};
       buffers_.push_back(std::move(buf));
+      if (bufferCond_.numWaiters() > 0) {
+        bufferCond_.notifyAll();
+      }
     }
     numInMemBufActive_.dec();
   }
@@ -238,7 +245,8 @@ class RegionManager {
   // attached to the fetched clean region.
   // Returns OpenStatus::Ready if all the operations are successful;
   // OpenStatus::Retry otherwise.
-  OpenStatus getCleanRegion(RegionId& rid);
+  std::pair<OpenStatus, std::unique_ptr<CondWaiter>> getCleanRegion(
+      RegionId& rid, bool addWaiter);
 
   // Tries to get a free region first, otherwise evicts one and schedules region
   // cleanup job (which will add the region to the clean list).
@@ -255,7 +263,7 @@ class RegionManager {
   void doEviction(RegionId rid, BufferView buffer) const;
 
  private:
-  using LockGuard = std::lock_guard<std::mutex>;
+  using LockGuard = std::lock_guard<TimedMutex>;
   uint64_t physicalOffset(RelAddress addr) const {
     return baseOffset_ + toAbsolute(addr).offset();
   }
@@ -263,7 +271,8 @@ class RegionManager {
   bool deviceWrite(RelAddress addr, BufferView buf);
 
   bool isValidIORange(uint32_t offset, uint32_t size) const;
-  OpenStatus assignBufferToRegion(RegionId rid);
+  std::pair<OpenStatus, std::unique_ptr<CondWaiter>> assignBufferToRegion(
+      RegionId rid, bool addWaiter);
 
   // Initializes the eviction policy. Even on a clean start, we will track all
   // the regions. The difference is that these regions will have no items in
@@ -283,9 +292,11 @@ class RegionManager {
   mutable AtomicCounter physicalWrittenCount_;
   mutable AtomicCounter reclaimRegionErrors_;
 
-  mutable std::mutex cleanRegionsMutex_;
+  mutable TimedMutex cleanRegionsMutex_;
+  mutable util::ConditionVariable cleanRegionsCond_;
   std::vector<RegionId> cleanRegions_;
   const uint32_t numCleanRegions_{};
+  mutable AtomicCounter cleanRegionRetries_;
 
   std::atomic<uint64_t> seqNumber_{0};
 
@@ -313,7 +324,8 @@ class RegionManager {
 
   const uint32_t numInMemBuffers_{0};
   // Locking order is region lock, followed by bufferMutex_;
-  mutable std::mutex bufferMutex_;
+  mutable TimedMutex bufferMutex_;
+  mutable util::ConditionVariable bufferCond_;
   std::vector<std::unique_ptr<Buffer>> buffers_;
 };
 } // namespace navy
