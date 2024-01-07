@@ -70,6 +70,9 @@ class RegionManager {
   // @param numCleanRegions           How many regions reclamator maintains in
   //                                  the clean pool
   // @param scheduler                 JobScheduler to run reclamation jobs
+  // @param numWorkers                Number of threads to run reclamation jobs
+  // @param stackSize                 Fiber stack size for each worker thread.
+  //                                  0 for default
   // @param evictCb                   Callback invoked when region evicted
   // @param cleanupCb                 Callback invoked when region cleaned up
   // @param policy                    eviction policy
@@ -84,6 +87,7 @@ class RegionManager {
                 Device& device,
                 uint32_t numCleanRegions,
                 uint32_t numWorkers,
+                uint32_t stackSize,
                 RegionEvictCallback evictCb,
                 RegionCleanupCallback cleanupCb,
                 std::unique_ptr<EvictionPolicy> policy,
@@ -307,8 +311,8 @@ class RegionManager {
 
   uint32_t reclaimsOutstanding_{0};
 
-  // The thread that runs the flush and reclaim. Flush is always run by
-  // the last worker thread
+  // The thread that runs the flush and reclaim. For Navy-async thread mode, the
+  // async flushes will be run in-line on fiber by the async NavyThread itself
   std::vector<std::unique_ptr<NavyThread>> workers_;
   mutable AtomicCounter numReclaimScheduled_;
 

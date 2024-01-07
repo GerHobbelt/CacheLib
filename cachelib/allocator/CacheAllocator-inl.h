@@ -1790,15 +1790,13 @@ CacheAllocator<CacheTrait>::findFast(typename Item::Key key) {
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::WriteHandle
-CacheAllocator<CacheTrait>::findFastToWrite(typename Item::Key key,
-                                            bool doNvmInvalidation) {
+CacheAllocator<CacheTrait>::findFastToWrite(typename Item::Key key) {
   auto handle = findFastImpl(key, AccessMode::kWrite);
   if (handle == nullptr) {
     return nullptr;
   }
-  if (doNvmInvalidation) {
-    invalidateNvm(*handle);
-  }
+
+  invalidateNvm(*handle);
   return handle;
 }
 
@@ -1824,15 +1822,12 @@ CacheAllocator<CacheTrait>::findImpl(typename Item::Key key, AccessMode mode) {
 
 template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::WriteHandle
-CacheAllocator<CacheTrait>::findToWrite(typename Item::Key key,
-                                        bool doNvmInvalidation) {
+CacheAllocator<CacheTrait>::findToWrite(typename Item::Key key) {
   auto handle = findImpl(key, AccessMode::kWrite);
   if (handle == nullptr) {
     return nullptr;
   }
-  if (doNvmInvalidation) {
-    invalidateNvm(*handle);
-  }
+  invalidateNvm(*handle);
   return handle;
 }
 
@@ -2128,7 +2123,7 @@ PoolId CacheAllocator<CacheTrait>::addPool(
     std::shared_ptr<RebalanceStrategy> rebalanceStrategy,
     std::shared_ptr<RebalanceStrategy> resizeStrategy,
     bool ensureProvisionable) {
-  folly::SharedMutex::WriteHolder w(poolsResizeAndRebalanceLock_);
+  std::unique_lock w(poolsResizeAndRebalanceLock_);
   auto pid = allocator_->addPool(name, size, allocSizes, ensureProvisionable);
   createMMContainers(pid, std::move(config));
   setRebalanceStrategy(pid, std::move(rebalanceStrategy));
@@ -2999,7 +2994,7 @@ CCacheT* CacheAllocator<CacheTrait>::addCompactCache(folly::StringPiece name,
     throw std::logic_error("Compact cache is not enabled");
   }
 
-  folly::SharedMutex::WriteHolder lock(compactCachePoolsLock_);
+  std::unique_lock lock(compactCachePoolsLock_);
   auto poolId = allocator_->addPool(name, size, {Slab::kSize});
   isCompactCachePool_[poolId] = true;
 
@@ -3019,7 +3014,7 @@ CCacheT* CacheAllocator<CacheTrait>::attachCompactCache(folly::StringPiece name,
   auto poolId = allocator.getPoolId();
   // if a compact cache with this name already exists, return without creating
   // new instance
-  folly::SharedMutex::WriteHolder lock(compactCachePoolsLock_);
+  std::unique_lock lock(compactCachePoolsLock_);
   if (compactCaches_.find(poolId) != compactCaches_.end()) {
     return static_cast<CCacheT*>(compactCaches_[poolId].get());
   }

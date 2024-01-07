@@ -27,6 +27,7 @@ RegionManager::RegionManager(uint32_t numRegions,
                              Device& device,
                              uint32_t numCleanRegions,
                              uint32_t numWorkers,
+                             uint32_t stackSize,
                              RegionEvictCallback evictCb,
                              RegionCleanupCallback cleanupCb,
                              std::unique_ptr<EvictionPolicy> policy,
@@ -59,7 +60,8 @@ RegionManager::RegionManager(uint32_t numRegions,
 
   for (uint32_t i = 0; i < numWorkers; i++) {
     auto name = fmt::format("region_manager_{}", i);
-    workers_.emplace_back(std::make_unique<NavyThread>(name));
+    workers_.emplace_back(
+        std::make_unique<NavyThread>(name, NavyThread::Options(stackSize)));
     workers_.back()->addTaskRemote(
         [name]() { XLOGF(INFO, "{} started", name); });
   }
@@ -260,12 +262,10 @@ void RegionManager::doFlush(RegionId rid, bool async) {
   getRegion(rid).setPendingFlush();
   numInMemBufWaitingFlush_.inc();
 
-  if (async) {
-    // The flushes are pinned to the last worker thread to make sure all flushes
-    // requested from the reclaims are completed when drained in order
-    workers_.back()->addTaskRemote([this, rid]() { doFlushInternal(rid); });
-  } else {
+  if (!async || folly::fibers::onFiber()) {
     doFlushInternal(rid);
+  } else {
+    getNextWorker().addTaskRemote([this, rid]() { doFlushInternal(rid); });
   }
 }
 
@@ -569,7 +569,6 @@ Buffer RegionManager::read(const RegionDescriptor& desc,
 }
 
 void RegionManager::drain() {
-  // Drain all outstanding reclaims and flushes in the order in the worker list.
   for (auto& worker : workers_) {
     worker->drain();
   }
@@ -593,7 +592,8 @@ void RegionManager::getCounters(const CounterVisitor& visitor) const {
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_num_regions", numRegions_);
   visitor("navy_bc_num_clean_regions", cleanRegions_.size());
-  visitor("navy_bc_num_clean_region_retries", cleanRegionRetries_.get());
+  visitor("navy_bc_num_clean_region_retries", cleanRegionRetries_.get(),
+          CounterVisitor::CounterType::RATE);
   visitor("navy_bc_external_fragmentation", externalFragmentation_.get());
   visitor("navy_bc_physical_written", physicalWrittenCount_.get(),
           CounterVisitor::CounterType::RATE);
