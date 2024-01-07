@@ -16,6 +16,7 @@
 
 #include "cachelib/navy/block_cache/RegionManager.h"
 
+#include "cachelib/common/inject_pause.h"
 #include "cachelib/navy/common/Utils.h"
 #include "cachelib/navy/scheduler/JobScheduler.h"
 
@@ -25,7 +26,6 @@ RegionManager::RegionManager(uint32_t numRegions,
                              uint64_t baseOffset,
                              Device& device,
                              uint32_t numCleanRegions,
-                             JobScheduler& scheduler,
                              RegionEvictCallback evictCb,
                              RegionCleanupCallback cleanupCb,
                              std::unique_ptr<EvictionPolicy> policy,
@@ -41,7 +41,7 @@ RegionManager::RegionManager(uint32_t numRegions,
       policy_{std::move(policy)},
       regions_{std::make_unique<std::unique_ptr<Region>[]>(numRegions)},
       numCleanRegions_{numCleanRegions},
-      scheduler_{scheduler},
+      worker_{std::make_unique<NavyThread>("region_manager")},
       evictCb_{evictCb},
       cleanupCb_{cleanupCb},
       numInMemBuffers_{numInMemBuffers} {
@@ -120,18 +120,15 @@ Region::FlushRes RegionManager::flushBuffer(const RegionId& rid) {
   return region.flushBuffer(std::move(callBack));
 }
 
-bool RegionManager::detachBuffer(const RegionId& rid) {
+void RegionManager::detachBuffer(const RegionId& rid) {
   auto& region = getRegion(rid);
   // detach buffer can return nullptr if there are active readers
   auto buf = region.detachBuffer();
-  if (!buf) {
-    return false;
-  }
+  XDCHECK(!!buf);
   returnBufferToPool(std::move(buf));
-  return true;
 }
 
-bool RegionManager::cleanupBufferOnFlushFailure(const RegionId& regionId) {
+void RegionManager::cleanupBufferOnFlushFailure(const RegionId& regionId) {
   auto& region = getRegion(regionId);
   auto callBack = [this](RegionId rid, BufferView buffer) {
     cleanupCb_(rid, buffer);
@@ -140,11 +137,8 @@ bool RegionManager::cleanupBufferOnFlushFailure(const RegionId& regionId) {
   };
 
   // This is no-op if the buffer is already cleaned up.
-  if (!region.cleanupBuffer(std::move(callBack))) {
-    return false;
-  }
-
-  return detachBuffer(regionId);
+  region.cleanupBuffer(std::move(callBack));
+  detachBuffer(regionId);
 }
 
 void RegionManager::releaseCleanedupRegion(RegionId rid) {
@@ -162,6 +156,7 @@ void RegionManager::releaseCleanedupRegion(RegionId rid) {
   {
     std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
     cleanRegions_.push_back(rid);
+    INJECT_PAUSE(pause_blockcache_clean_free_locked);
     if (cleanRegionsCond_.numWaiters() > 0) {
       cleanRegionsCond_.notifyAll();
     }
@@ -214,6 +209,7 @@ RegionManager::getCleanRegion(RegionId& rid, bool addWaiter) {
     if (!cleanRegions_.empty()) {
       rid = cleanRegions_.back();
       cleanRegions_.pop_back();
+      INJECT_PAUSE(pause_blockcache_clean_alloc_locked);
       status = OpenStatus::Ready;
     } else {
       if (addWaiter) {
@@ -239,6 +235,7 @@ RegionManager::getCleanRegion(RegionId& rid, bool addWaiter) {
     if (status != OpenStatus::Ready) {
       std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
       cleanRegions_.push_back(rid);
+      INJECT_PAUSE(pause_blockcache_clean_free_locked);
       if (cleanRegionsCond_.numWaiters() > 0) {
         cleanRegionsCond_.notifyAll();
       }
@@ -257,100 +254,94 @@ void RegionManager::doFlush(RegionId rid, bool async) {
   getRegion(rid).setPendingFlush();
   numInMemBufWaitingFlush_.inc();
 
-  Job flushJob = [this, rid, retryAttempts = 0, flushed = false]() mutable {
-    if (!flushed) {
-      if (retryAttempts >= inMemBufFlushRetryLimit_) {
-        // Flush failure reaches retry limit, stop flushing and start to
-        // clean up the buffer.
-        if (cleanupBufferOnFlushFailure(rid)) {
-          releaseCleanedupRegion(rid);
-          return JobExitCode::Done;
-        }
-        numInMemBufCleanupRetries_.inc();
-        return JobExitCode::Reschedule;
-      }
-      auto res = flushBuffer(rid);
-      if (res == Region::FlushRes::kSuccess) {
-        flushed = true;
-      } else {
-        // We have a limited retry limit for flush errors due to device
-        if (res == Region::FlushRes::kRetryDeviceFailure) {
-          retryAttempts++;
-          numInMemBufFlushRetries_.inc();
-        }
-        return JobExitCode::Reschedule;
-      }
-    }
-    // If the buffer has been successfully flushed or the current flush
-    // succeeds, detach the buffer until it succeeds
-    if (flushed) {
-      if (detachBuffer(rid)) {
-        // Flush completed, track the region
-        track(rid);
-        return JobExitCode::Done;
-      }
-    }
-    return JobExitCode::Reschedule;
-  };
-
   if (async) {
-    scheduler_.enqueue(std::move(flushJob), "flush", JobType::Flush);
+    worker_->addTaskRemote([this, rid]() { doFlushInternal(rid); });
   } else {
-    while (flushJob() == JobExitCode::Reschedule) {
-      // We intentionally sleep here to slow it down since this is only
-      // triggered on shutdown. On cleanup failures, we will sleep a bit before
-      // retrying to avoid maxing out cpu.
-      /* sleep override */
-      std::this_thread::sleep_for(std::chrono::milliseconds{100});
-    }
+    doFlushInternal(rid);
   }
 }
 
-void RegionManager::startReclaim() {
-  scheduler_.enqueue(
-      [this, rid = RegionId()]() mutable {
-        if (!rid.valid()) {
-          rid = evict();
-          // evict() can fail to find a victim, where it needs to be retried
-          if (!rid.valid()) {
-            return JobExitCode::Reschedule;
-          }
-        }
+void RegionManager::doFlushInternal(RegionId rid) {
+  INJECT_PAUSE(pause_flush_begin);
+  int retryAttempts = 0;
+  while (retryAttempts < inMemBufFlushRetryLimit_) {
+    auto res = flushBuffer(rid);
+    if (res == Region::FlushRes::kSuccess) {
+      break;
+    } else if (res == Region::FlushRes::kRetryDeviceFailure) {
+      // We have a limited retry limit for flush errors due to device
+      retryAttempts++;
+      numInMemBufFlushRetries_.inc();
+    }
 
-        const auto startTime = getSteadyClock();
-        auto& region = getRegion(rid);
-        if (!region.readyForReclaim()) {
-          // Once a region is set exclusive, all future accesses will be
-          // blocked. However there might still be accesses in-flight,
-          // so we would retry if that's the case.
-          return JobExitCode::Reschedule;
-        }
-        // We know now we're the only thread working with this region.
-        // Hence, it's safe to access @Region without lock.
-        if (region.getNumItems() != 0) {
-          XDCHECK(!region.hasBuffer());
-          auto desc = RegionDescriptor::makeReadDescriptor(
-              OpenStatus::Ready, RegionId{rid}, true /* physRead */);
-          auto sizeToRead = region.getLastEntryEndOffset();
-          auto buffer = read(desc, RelAddress{rid, 0}, sizeToRead);
-          if (buffer.size() != sizeToRead) {
-            // TODO: remove when we fix T95777575
-            XLOGF(ERR,
-                  "Failed to read region {} during reclaim. Region size to "
-                  "read: {}, Actually read: {}",
-                  rid.index(),
-                  sizeToRead,
-                  buffer.size());
-            reclaimRegionErrors_.inc();
-          } else {
-            doEviction(rid, buffer.view());
-          }
-        }
-        releaseEvictedRegion(rid, startTime);
-        return JobExitCode::Done;
-      },
-      "reclaim",
-      JobType::Reclaim);
+    // Device write failed; retry after 100ms
+    folly::fibers::Baton b;
+    b.try_wait_for(std::chrono::milliseconds(100));
+  }
+
+  if (retryAttempts >= inMemBufFlushRetryLimit_) {
+    // Flush failure reaches retry limit, stop flushing and start to
+    // clean up the buffer.
+    cleanupBufferOnFlushFailure(rid);
+    releaseCleanedupRegion(rid);
+    INJECT_PAUSE(pause_flush_failure);
+    return;
+  }
+
+  INJECT_PAUSE(pause_flush_detach_buffer);
+  detachBuffer(rid);
+
+  // Flush completed, track the region
+  track(rid);
+  INJECT_PAUSE(pause_flush_done);
+  return;
+}
+
+void RegionManager::startReclaim() {
+  worker_->addTaskRemote([&]() { doReclaim(); });
+}
+
+void RegionManager::doReclaim() {
+  RegionId rid;
+  INJECT_PAUSE(pause_reclaim_begin);
+  while (true) {
+    rid = evict();
+    // evict() can fail to find a victim, where it needs to be retried
+    if (rid.valid()) {
+      break;
+    }
+    // This should never happen
+    XDCHECK(false);
+  }
+
+  const auto startTime = getSteadyClock();
+  auto& region = getRegion(rid);
+  bool status = region.readyForReclaim(true);
+  XDCHECK(status);
+
+  // We know now we're the only thread working with this region.
+  // Hence, it's safe to access @Region without lock.
+  if (region.getNumItems() != 0) {
+    XDCHECK(!region.hasBuffer());
+    auto desc = RegionDescriptor::makeReadDescriptor(
+        OpenStatus::Ready, RegionId{rid}, true /* physRead */);
+    auto sizeToRead = region.getLastEntryEndOffset();
+    auto buffer = read(desc, RelAddress{rid, 0}, sizeToRead);
+    if (buffer.size() != sizeToRead) {
+      // TODO: remove when we fix T95777575
+      XLOGF(ERR,
+            "Failed to read region {} during reclaim. Region size to "
+            "read: {}, Actually read: {}",
+            rid.index(),
+            sizeToRead,
+            buffer.size());
+      reclaimRegionErrors_.inc();
+    } else {
+      doEviction(rid, buffer.view());
+    }
+  }
+  releaseEvictedRegion(rid, startTime);
+  INJECT_PAUSE(pause_reclaim_done);
 }
 
 RegionDescriptor RegionManager::openForRead(RegionId rid, uint64_t seqNumber) {
@@ -425,6 +416,7 @@ void RegionManager::releaseEvictedRegion(RegionId rid,
     std::lock_guard<TimedMutex> lock{cleanRegionsMutex_};
     reclaimsScheduled_--;
     cleanRegions_.push_back(rid);
+    INJECT_PAUSE(pause_blockcache_clean_free_locked);
     if (cleanRegionsCond_.numWaiters() > 0) {
       cleanRegionsCond_.notifyAll();
     }
@@ -434,6 +426,7 @@ void RegionManager::releaseEvictedRegion(RegionId rid,
 }
 
 void RegionManager::doEviction(RegionId rid, BufferView buffer) const {
+  INJECT_PAUSE(pause_do_eviction_start);
   if (buffer.isNull()) {
     XLOGF(ERR, "Error reading region {} on reclamation", rid.index());
   } else {
@@ -446,6 +439,7 @@ void RegionManager::doEviction(RegionId rid, BufferView buffer) const {
           toMicros(getSteadyClock() - evictStartTime).count());
     evictedCount_.add(numEvicted);
   }
+  INJECT_PAUSE(pause_do_eviction_done);
 }
 
 void RegionManager::persist(RecordWriter& rw) const {
@@ -566,7 +560,12 @@ Buffer RegionManager::read(const RegionDescriptor& desc,
   return device_.read(physicalOffset(addr), size);
 }
 
-void RegionManager::flush() { device_.flush(); }
+void RegionManager::drain() { worker_->drain(); }
+
+void RegionManager::flush() {
+  drain(); // Flush any pending reclaims
+  device_.flush();
+}
 
 void RegionManager::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bc_reclaim", reclaimCount_.get(),
@@ -590,8 +589,6 @@ void RegionManager::getCounters(const CounterVisitor& visitor) const {
   visitor("navy_bc_inmem_flush_retries", numInMemBufFlushRetries_.get(),
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_inmem_flush_failures", numInMemBufFlushFailures_.get(),
-          CounterVisitor::CounterType::RATE);
-  visitor("navy_bc_inmem_cleanup_retries", numInMemBufCleanupRetries_.get(),
           CounterVisitor::CounterType::RATE);
   policy_->getCounters(visitor);
 }

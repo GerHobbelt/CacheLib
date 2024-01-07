@@ -18,10 +18,15 @@
 
 #include <folly/fibers/FiberManager.h>
 #include <folly/fibers/FiberManagerMap.h>
+#include <folly/fibers/TimedMutex.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/io/async/ScopedEventBaseThread.h>
+#include <folly/logging/xlog.h>
 
+#include <atomic>
 #include <memory>
+
+#include "cachelib/common/ConditionVariable.h"
 
 namespace facebook {
 namespace cachelib {
@@ -38,12 +43,26 @@ namespace navy {
  */
 class NavyThread {
  public:
+  struct Options {
+    static constexpr size_t kDefaultStackSize{64 * 1024};
+    constexpr Options() {}
+
+    /**
+     * Maximum stack size for fibers which will be used for executing all the
+     * tasks.
+     */
+    size_t stackSize{kDefaultStackSize};
+  };
+
   /**
    * Initializes with current EventBaseManager and passed-in thread name.
    */
-  explicit NavyThread(folly::StringPiece name) {
+  explicit NavyThread(folly::StringPiece name, Options options = Options()) {
     th_ = std::make_unique<folly::ScopedEventBaseThread>(name.str());
-    fm_ = &folly::fibers::getFiberManager(*th_->getEventBase());
+
+    folly::fibers::FiberManager::Options opts;
+    opts.stackSize = options.stackSize;
+    fm_ = &folly::fibers::getFiberManager(*th_->getEventBase(), opts);
   }
 
   ~NavyThread() { th_.reset(); }
@@ -54,7 +73,21 @@ class NavyThread {
    * @param func Task functor; must have a signature of `void func()`.
    *             The object will be destroyed once task execution is complete.
    */
-  void addTaskRemote(folly::Func func) { fm_->addTaskRemote(std::move(func)); }
+  void addTaskRemote(folly::Func func) {
+    {
+      std::unique_lock<folly::fibers::TimedMutex> lk(drainMutex_);
+      numRunning_++;
+    }
+
+    fm_->addTaskRemote([this, func = std::move(func)]() mutable {
+      func();
+      std::unique_lock<folly::fibers::TimedMutex> lk(drainMutex_);
+      XDCHECK_GT(numRunning_, 0u);
+      if (--numRunning_ == 0u) {
+        drainCond_.notifyAll();
+      }
+    });
+  }
 
   /**
    * Add the passed-in task to the FiberManager.
@@ -63,7 +96,32 @@ class NavyThread {
    * @param func Task functor; must have a signature of `void func()`.
    *             The object will be destroyed once task execution is complete.
    */
-  void addTask(folly::Func func) { fm_->addTask(std::move(func)); }
+  void addTask(folly::Func func) {
+    {
+      std::unique_lock<folly::fibers::TimedMutex> lk(drainMutex_);
+      numRunning_++;
+    }
+
+    fm_->addTask([this, func = std::move(func)]() mutable {
+      func();
+      std::unique_lock<folly::fibers::TimedMutex> lk(drainMutex_);
+      XDCHECK_GT(numRunning_, 0u);
+      if (--numRunning_ == 0u) {
+        drainCond_.notifyAll();
+      }
+    });
+  }
+
+  /**
+   * Wait until tasks are drained
+   */
+  void drain() {
+    std::unique_lock<folly::fibers::TimedMutex> lk(drainMutex_);
+    if (numRunning_ == 0) {
+      return;
+    }
+    drainCond_.wait(lk);
+  }
 
  private:
   NavyThread(NavyThread&& other) = delete;
@@ -77,6 +135,10 @@ class NavyThread {
 
   // FiberManager which are driven by the thread
   folly::fibers::FiberManager* fm_;
+
+  size_t numRunning_{0};
+  folly::fibers::TimedMutex drainMutex_;
+  util::ConditionVariable drainCond_;
 };
 
 } // namespace navy
