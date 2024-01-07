@@ -1224,7 +1224,7 @@ class CacheAllocator : public CacheBase {
   // run the benchmarks after flushing.
   void flushNvmCache();
 
-  // Dump the last N items for an evictable MM Container
+  // Dump the last N items for an MM Container
   // @return  vector of the string of each item. Empty if nothing in LRU
   // @throw  std::invalid_argument if <pid, cid> does not exist
   std::vector<std::string> dumpEvictionIterator(PoolId pid,
@@ -1482,16 +1482,21 @@ class CacheAllocator : public CacheBase {
     return accessContainer_->find(key);
   }
 
-  // look up an item by its key. This ignores the nvm cache and only does RAM
-  // lookup.
+  // TODO: do another round of audit to refactor our lookup paths. This is
+  //       still convoluted.
   //
-  // @param key         the key for lookup
-  // @param mode        the mode of access for the lookup.
-  //                    AccessMode::kRead or AccessMode::kWrite
+  // internal helper that grabs a refcounted handle to the item. This does
+  // not record the access to reflect in the mmContainer. This also checks
+  // expiration and also bumps stats if caller is a regular find or findFast.
   //
-  // @return      the handle for the item or a handle to nullptr if the key does
-  //              not exist.
-  FOLLY_ALWAYS_INLINE WriteHandle findFastInternal(Key key, AccessMode mode);
+  // @param key     key to look up in the access container
+  // @param event   cachelib lookup operation
+  //
+  // @return handle if item is found and not expired, nullptr otherwise
+  //
+  // @throw std::overflow_error is the maximum item refcount is execeeded by
+  //        creating this item handle.
+  WriteHandle findInternalWithExpiration(Key key, AllocatorApiEvent event);
 
   // look up an item by its key across the nvm cache as well if enabled.
   //
@@ -1670,8 +1675,23 @@ class CacheAllocator : public CacheBase {
   //
   // @param  pid  the id of the pool to look for evictions inside
   // @param  cid  the id of the class to look for evictions inside
-  // @return An evicted item or nullptr  if there is no suitable candidate.
+  // @return An evicted item or nullptr  if there is no suitable candidate found
+  // within the configured number of attempts.
   Item* findEviction(PoolId pid, ClassId cid);
+
+  // Get next eviction candidate from MMContainer, remove from AccessContainer,
+  // MMContainer and insert into NVMCache if enabled.
+  //
+  // @param pid  the id of the pool to look for evictions inside
+  // @param cid  the id of the class to look for evictions inside
+  // @param searchTries number of search attempts so far.
+  //
+  // @return pair of [candidate, toRecycle]. Pair of null if reached the end of
+  // the eviction queue or no suitable candidate found
+  // within the configured number of attempts
+  std::pair<Item*, Item*> getNextCandidate(PoolId pid,
+                                           ClassId cid,
+                                           unsigned int& searchTries);
 
   using EvictionIterator = typename MMContainer::LockedIterator;
 
