@@ -519,11 +519,6 @@ struct CacheMemoryStats {
   // slab headers and the memory returned temporarily to system (i.e., advised).
   size_t ramCacheSize{0};
 
-  // TODO: this means the same as ramCacheSize. Deprecate as soon as we land
-  //       the change to migrate iOS code to use ramCacheSize instead.
-  //       DO NOT USE THIS IN NEW CODE.
-  size_t cacheSize{0};
-
   // configured total ram cache size, excluding memory used for slab headers.
   size_t configuredRamCacheSize{0};
 
@@ -611,6 +606,32 @@ struct CCacheStats {
 
     return *this;
   }
+};
+
+class RateMap {
+ public:
+  static constexpr std::chrono::seconds kRateInterval{60};
+
+  // Update stat with the newest count and compute the latest delta.
+  void updateDelta(const std::string& name, uint64_t value);
+
+  // Only update stat with the newest count. Do not compute delta.
+  void updateCount(const std::string& name, uint64_t value);
+
+  // Return latest delta associated with the stat.
+  uint64_t getDelta(const std::string& name) const;
+
+  // Update stats via callback.
+  // Each stat name will be suffixed with ".<aggregationInterval>".
+  void exportStats(std::chrono::seconds aggregationInterval,
+                   std::function<void(folly::StringPiece, uint64_t)> cb);
+
+ private:
+  folly::F14FastMap<std::string, uint64_t> count_;
+  folly::F14FastMap<std::string, uint64_t> delta_;
+
+  // Internal count map for generating deltas
+  folly::F14FastMap<std::string, uint64_t> internalCount_;
 };
 
 // Types of background workers

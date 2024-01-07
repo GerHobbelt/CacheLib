@@ -496,8 +496,8 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       ASSERT_NE(handle, nullptr);
 
       ASSERT_EQ(alloc.find(key), nullptr);
-      ASSERT_TRUE(alloc.insert(std::move(handle)));
       memset(handle->getMemory(), magicVal2, handle->getSize());
+      ASSERT_TRUE(alloc.insert(handle));
     }
 
     evictedKeys.clear();
@@ -2111,7 +2111,6 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       const std::string key = keyPrefix + folly::to<std::string>(i);
       auto itemHandle = alloc.find(key);
       auto itemIOBuf = alloc.convertToIOBuf(std::move(itemHandle));
-      ASSERT_EQ(nullptr, itemHandle);
       ASSERT_EQ(i, itemIOBuf.data()[0]);
 
       const unsigned int nSizes = 2;
@@ -2125,10 +2124,9 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       // This one key should still be here
       auto itemHandle2 = alloc.find(key);
       auto itemIOBuf2 = alloc.convertToIOBuf(std::move(itemHandle2));
-      ASSERT_EQ(nullptr, itemHandle2);
 
       ASSERT_EQ(i, itemIOBuf.data()[0]);
-      ASSERT_EQ(itemIOBuf.data()[0], itemIOBuf2.data()[0]);
+      ASSERT_EQ(itemIOBuf.data(), itemIOBuf2.data());
     }
   }
 
@@ -4420,10 +4418,10 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     auto itemHandle = util::allocateAccessible(alloc, pid, "hello1", size);
     while (true) {
       auto chainedItemHandle = alloc.allocateChainedItem(itemHandle, size);
-      alloc.addChainedItem(itemHandle, std::move(chainedItemHandle));
       if (chainedItemHandle == nullptr) {
         break;
       }
+      alloc.addChainedItem(itemHandle, std::move(chainedItemHandle));
     }
 
     // Dropping the item handle. The item is still in cache since it's
@@ -6182,6 +6180,115 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     handle2.reset();
     r2.wait();
     ASSERT_EQ(0, alloc.getSlabReleaseStats().numSlabReleaseStuck);
+  }
+
+  void testRateMap() {
+    RateMap counters;
+    counters.updateCount("stat1", 11);
+    counters.updateDelta("stat2", 22);
+    counters.updateDelta("stat2", 44);
+    EXPECT_EQ(22, counters.getDelta("stat2"));
+
+    int seen = 0;
+    counters.exportStats(
+        std::chrono::seconds{60},
+        [&seen](folly::StringPiece name, uint64_t value) mutable {
+          if (name == "stat1") {
+            EXPECT_EQ(11, value);
+            seen++;
+          } else if (name == folly::sformat("stat2.60")) {
+            EXPECT_EQ(22, value);
+            seen++;
+          }
+        });
+    EXPECT_EQ(2, seen);
+
+    seen = 0;
+    counters.exportStats(
+        std::chrono::seconds{30},
+        [&seen](folly::StringPiece name, uint64_t value) mutable {
+          if (name == "stat1") {
+            EXPECT_EQ(11, value);
+            seen++;
+          } else if (name == folly::sformat("stat2.60")) {
+            EXPECT_EQ(44, value);
+            seen++;
+          }
+        });
+    EXPECT_EQ(2, seen);
+  }
+
+  void testStatSnapshotTest() {
+    typename AllocatorT::Config config;
+    config.setCacheSize(20 * Slab::kSize);
+    config.cacheName = "foobar";
+    AllocatorT alloc(config);
+
+    const std::string statPrefix = "cachelib." + config.cacheName + ".";
+    const std::string numNvmGets = statPrefix + "nvm.gets";
+    const std::string numNvmGetMiss = statPrefix + "nvm.gets.miss";
+    const std::string numCacheGets = statPrefix + "cache.gets";
+    const std::string numCacheGetMiss = statPrefix + "cache.gets.miss";
+
+    alloc.counters_.updateDelta(numNvmGets, 2);
+    alloc.counters_.updateDelta(numCacheGets, 4);
+    alloc.counters_.updateDelta(numNvmGetMiss, 1);
+    alloc.counters_.updateDelta(numCacheGetMiss, 2);
+
+    const auto cacheHitRate = alloc.calculateCacheHitRate(statPrefix);
+    EXPECT_EQ(cacheHitRate.ram, 50);
+    EXPECT_EQ(cacheHitRate.nvm, 50);
+    EXPECT_EQ(cacheHitRate.overall, 75);
+    EXPECT_EQ(alloc.counters_.getDelta(numNvmGets), 2);
+    EXPECT_EQ(alloc.counters_.getDelta(numCacheGets), 4);
+    EXPECT_EQ(alloc.counters_.getDelta(numNvmGetMiss), 1);
+    EXPECT_EQ(alloc.counters_.getDelta(numCacheGetMiss), 2);
+
+    alloc.counters_.updateDelta(numNvmGets, 4);
+    alloc.counters_.updateDelta(numCacheGets, 9);
+    alloc.counters_.updateDelta(numNvmGetMiss, 2);
+    alloc.counters_.updateDelta(numCacheGetMiss, 4);
+    const auto cacheHitRate1 = alloc.calculateCacheHitRate(statPrefix);
+    EXPECT_EQ(cacheHitRate1.ram, 60);
+    EXPECT_EQ(cacheHitRate1.nvm, 50);
+    EXPECT_EQ(cacheHitRate1.overall, 80);
+
+    // Bad stats
+    alloc.counters_.updateDelta(numNvmGets, 0);
+    alloc.counters_.updateDelta(numCacheGets, 0);
+    alloc.counters_.updateDelta(numNvmGetMiss, 0);
+    alloc.counters_.updateDelta(numCacheGetMiss, 0);
+    const auto cacheHitRate2 = alloc.calculateCacheHitRate(statPrefix);
+    EXPECT_EQ(cacheHitRate2.ram, 0);
+    EXPECT_EQ(cacheHitRate2.nvm, 0);
+    EXPECT_EQ(cacheHitRate2.overall, 0);
+
+    int intervalNameExists = 0;
+    alloc.exportStats(
+        statPrefix, std::chrono::seconds{60},
+        [&intervalNameExists](auto name, auto value) {
+          if (name == "cachelib.foobar.nvm.gets.60" && value == 0) {
+            intervalNameExists++;
+          }
+          if (name == "cachelib.foobar.nvm.gets.miss.60" && value == 0) {
+            intervalNameExists++;
+          }
+        });
+    alloc.find("some non-existent key");
+    alloc.exportStats(
+        statPrefix,
+        // We will convert a custom interval to 60 seconds interval. So the
+        // one "FIND" will become two operations when averaged out to 60
+        // seocnds.
+        std::chrono::seconds{30}, [&intervalNameExists](auto name, auto value) {
+          if (name == "cachelib.foobar.cache.gets.60" && value == 2) {
+            intervalNameExists++;
+          }
+          if (name == "cachelib.foobar.cache.gets.miss.60" && value == 2) {
+            intervalNameExists++;
+          }
+        });
+    EXPECT_EQ(intervalNameExists, 4);
   }
 };
 } // namespace tests

@@ -17,7 +17,7 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 
-#include "cachelib/cachebench/workload/ReplayGenerator.h"
+#include "cachelib/cachebench/workload/KVReplayGenerator.h"
 
 namespace facebook {
 namespace cachelib {
@@ -69,12 +69,12 @@ struct TraceEntry {
   bool valid_;
 };
 
-TEST(ReplayGeneratorTest, BasicFormat) {
+TEST(KVReplayGeneratorTest, BasicFormat) {
   StressorConfig config;
-  ReplayGenerator replayer{config};
+  KVReplayGenerator replayer{config};
   std::mt19937_64 gen;
 
-  ReqWrapper req;
+  auto req = std::make_unique<ReqWrapper>();
   // blank line
   ASSERT_FALSE(replayer.parseRequest("", req));
   // header lines
@@ -96,7 +96,7 @@ TEST(ReplayGeneratorTest, BasicFormat) {
 
   for (auto& trace : traces) {
     ASSERT_EQ(replayer.parseRequest(trace.line_, req), trace.valid_);
-    trace.validate(req);
+    trace.validate(*req);
   }
 
   // trailing comma
@@ -104,8 +104,10 @@ TEST(ReplayGeneratorTest, BasicFormat) {
     trace.line_.append(",");
 
     ASSERT_EQ(replayer.parseRequest(trace.line_, req), trace.valid_);
-    trace.validate(req);
+    trace.validate(*req);
   }
+
+  replayer.markShutdown();
 }
 
 } // namespace tests
