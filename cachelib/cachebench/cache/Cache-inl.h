@@ -119,8 +119,6 @@ Cache<Allocator>::Cache(const CacheConfig& config,
   if (!isRamOnly()) {
     typename Allocator::NvmCacheConfig nvmConfig;
 
-    nvmConfig.enableFastNegativeLookups = true;
-
     if (config_.nvmCachePaths.size() == 1) {
       // if we get a directory, create a file. we will clean it up. If we
       // already have a file, user provided it. We will also keep it around
@@ -179,7 +177,8 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     // configure BlockCache
     auto& bcConfig = nvmConfig.navyConfig.blockCache()
                          .setDataChecksum(config_.navyDataChecksum)
-                         .setCleanRegions(config_.navyCleanRegions)
+                         .setCleanRegions(config_.navyCleanRegions,
+                                          config_.navyCleanRegionThreads)
                          .setRegionSize(config_.navyRegionSizeMB * MB);
 
     // by default lru. if more than one fifo ratio is present, we use
