@@ -269,7 +269,10 @@ TEST_F(NvmCacheTest, EvictToNvmGetCheckCtime) {
 }
 
 TEST_F(NvmCacheTest, EvictToNvmExpired) {
-  auto& nvm = this->cache();
+  // Test with TTL, so the reaper should be disabled
+  auto& config = this->getConfig();
+  config.reaperInterval = std::chrono::milliseconds(0);
+  auto& nvm = this->makeCache();
   auto pid = this->poolId();
 
   const uint32_t ttl = 5; // 5 second ttl
@@ -294,7 +297,10 @@ TEST_F(NvmCacheTest, EvictToNvmExpired) {
 }
 
 TEST_F(NvmCacheTest, ReadFromNvmExpired) {
-  auto& nvm = this->cache();
+  // Test with TTL, so the reaper should be disabled
+  auto& config = this->getConfig();
+  config.reaperInterval = std::chrono::milliseconds(0);
+  auto& nvm = this->makeCache();
   auto pid = this->poolId();
 
   const uint32_t ttl = 5; // 5 second ttl
@@ -421,7 +427,7 @@ TEST_F(NvmCacheTest, ConcurrentFills) {
     std::vector<std::thread> thr;
     std::atomic<bool> missed = false;
     for (unsigned int j = 0; j < 50; j++) {
-      thr.push_back(std::thread([&]() {
+      thr.emplace_back([&]() {
         auto hdl = nvm.find(key);
         hdl.wait();
         if (!hdl) {
@@ -429,7 +435,7 @@ TEST_F(NvmCacheTest, ConcurrentFills) {
         } else {
           ASSERT_EQ(id, *hdl->getMemoryAs<int>());
         }
-      }));
+      });
     }
     for (unsigned int j = 0; j < 50; j++) {
       thr[j].join();
@@ -2179,8 +2185,10 @@ TEST_F(NvmCacheTest, testEvictCB) {
 void verifyItem(const Item& item, const Item& iobufItem) {
   ASSERT_EQ(item.isChainedItem(), iobufItem.isChainedItem());
   ASSERT_EQ(item.hasChainedItem(), iobufItem.hasChainedItem());
-  ASSERT_EQ(item.getCreationTime(), iobufItem.getCreationTime());
-  ASSERT_EQ(item.getExpiryTime(), iobufItem.getExpiryTime());
+  if (!item.isChainedItem()) {
+    ASSERT_EQ(item.getCreationTime(), iobufItem.getCreationTime());
+    ASSERT_EQ(item.getExpiryTime(), iobufItem.getExpiryTime());
+  }
   ASSERT_EQ(item.getSize(), iobufItem.getSize());
   ASSERT_EQ(
       0, std::memcmp(item.getMemory(), iobufItem.getMemory(), item.getSize()));

@@ -21,8 +21,7 @@
 #include "folly/synchronization/Rcu.h"
 #include "rocksdb/version.h"
 
-namespace facebook {
-namespace rocks_secondary_cache {
+namespace facebook::rocks_secondary_cache {
 
 #define FB_CACHE_MAX_ITEM_SIZE 4 << 20
 using ApiWrapper = cachelib::FbInternalRuntimeUpdateWrapper<FbCache>;
@@ -49,7 +48,7 @@ class RocksCachelibWrapperHandle : public rocksdb::SecondaryCacheResultHandle {
         charge_(0),
         is_value_ready_(false),
         guard_(std::move(guard)) {}
-  ~RocksCachelibWrapperHandle() override {}
+  ~RocksCachelibWrapperHandle() override = default;
 
   RocksCachelibWrapperHandle(const RocksCachelibWrapperHandle&) = delete;
   RocksCachelibWrapperHandle& operator=(const RocksCachelibWrapperHandle&) =
@@ -125,6 +124,10 @@ class RocksCachelibWrapperHandle : public rocksdb::SecondaryCacheResultHandle {
 
       const char* item = static_cast<const char*>(handle_->getMemory());
       s = helper_->create_cb(rocksdb::Slice(item, size),
+#if ROCKSDB_MAJOR > 8 || (ROCKSDB_MAJOR == 8 && ROCKSDB_MINOR >= 7)
+                             rocksdb::CompressionType::kNoCompression,
+                             rocksdb::CacheTier::kVolatileTier,
+#endif
                              create_context_,
                              /*allocator*/ nullptr,
                              &val_,
@@ -143,12 +146,8 @@ RocksCachelibWrapper::~RocksCachelibWrapper() { Close(); }
 rocksdb::Status RocksCachelibWrapper::Insert(
     const rocksdb::Slice& key,
     void* value,
-    const rocksdb::Cache::CacheItemHelper* helper
-#if ROCKSDB_MAJOR > 8 || (ROCKSDB_MAJOR == 8 && ROCKSDB_MINOR >= 6)
-    ,
-    bool /* force_erase */
-#endif
-) {
+    const rocksdb::Cache::CacheItemHelper* helper,
+    bool /* force_erase */) {
   FbCacheKey k(key.data(), key.size());
   size_t size;
   rocksdb::Status s;
@@ -293,5 +292,4 @@ std::unique_ptr<rocksdb::SecondaryCache> NewRocksCachelibWrapper(
       std::move(cache), std::move(admin), std::move(defaultPool)));
 }
 
-} // namespace rocks_secondary_cache
-} // namespace facebook
+} // namespace facebook::rocks_secondary_cache

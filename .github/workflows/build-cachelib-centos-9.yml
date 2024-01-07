@@ -11,19 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-name: build-cachelib-rockylinux-8.6
+name: build-cachelib-centos-9
 on:
 #   push:
   pull_request:
   workflow_dispatch:
   schedule:
-     - cron:  '0 15 * * 2,4,6'
+     - cron:  '0 10 * * *'
 jobs:
   build-cachelib-centos8-latest:
-    name: "RockyLinux-8.6 - Build CacheLib with all dependencies"
+    name: "CentOS/9 - Build CacheLib with all dependencies"
     runs-on: ubuntu-latest
     # Docker container image name
-    container: "rockylinux:8.6"
+    container: "quay.io/centos/centos:stream9"
     steps:
       - name: "Show Head Commit"
         env:
