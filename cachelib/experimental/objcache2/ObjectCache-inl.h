@@ -381,7 +381,8 @@ ObjectCache<AllocatorT>::serializeConfigParams() const {
   config["l1NumShards"] = std::to_string(config_.l1NumShards);
   if (config_.objectSizeTrackingEnabled &&
       config_.sizeControllerIntervalMs > 0) {
-    config["l1CacheSizeLimit"] = std::to_string(config_.cacheSizeLimit);
+    config["totalObjectSizeLimit"] =
+        std::to_string(config_.totalObjectSizeLimit);
     config["sizeControllerIntervalMs"] =
         std::to_string(config_.sizeControllerIntervalMs);
   }
@@ -443,6 +444,42 @@ void ObjectCache<AllocatorT>::mutateObject(const std::shared_ptr<T>& object,
         memUsageDiff);
     totalObjectSizeBytes_.fetch_sub(memUsageDiff, std::memory_order_relaxed);
   }
+}
+
+template <typename AllocatorT>
+template <typename T>
+bool ObjectCache<AllocatorT>::updateObjectSize(const std::shared_ptr<T>& object,
+                                               size_t newSize) {
+  if (!object) {
+    return false;
+  }
+  if (!config_.objectSizeTrackingEnabled) {
+    XLOG_EVERY_MS(
+        WARN, 60'000,
+        "Object size tracking is not enabled but object size being updated.");
+    return false;
+  }
+  if (newSize == 0) {
+    XLOG_EVERY_MS(
+        WARN, 60'000,
+        "Object size tracking is enabled but object size is updated to be 0.");
+    return false;
+  }
+
+  // do atomic update on objectSize
+  const auto oldSize = __sync_lock_test_and_set(
+      &(reinterpret_cast<ObjectCacheItem*>(
+            getWriteHandleRefInternal<T>(object)->getMemory())
+            ->objectSize),
+      newSize);
+  if (newSize > oldSize) {
+    totalObjectSizeBytes_.fetch_add(newSize - oldSize,
+                                    std::memory_order_relaxed);
+  } else if (newSize < oldSize) {
+    totalObjectSizeBytes_.fetch_sub(oldSize - newSize,
+                                    std::memory_order_relaxed);
+  }
+  return true;
 }
 
 } // namespace objcache2

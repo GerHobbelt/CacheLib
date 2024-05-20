@@ -273,6 +273,15 @@ class RegionManager {
     return *(workers_[numReclaimScheduled_.add_fetch(1) % workers_.size()]);
   }
 
+  bool isOnWorker() {
+    auto* thread = getCurrentNavyThread();
+    if (!thread) {
+      return false;
+    }
+
+    return workerSet_.count(thread) > 0;
+  }
+
   void doReclaim();
   void doFlushInternal(RegionId rid);
 
@@ -294,7 +303,6 @@ class RegionManager {
   const uint64_t baseOffset_{};
   Device& device_;
   const std::unique_ptr<EvictionPolicy> policy_;
-  mutable util::ConditionVariable evictCond_;
   std::unique_ptr<std::unique_ptr<Region>[]> regions_;
   mutable AtomicCounter externalFragmentation_;
 
@@ -314,6 +322,7 @@ class RegionManager {
   // The thread that runs the flush and reclaim. For Navy-async thread mode, the
   // async flushes will be run in-line on fiber by the async NavyThread itself
   std::vector<std::unique_ptr<NavyThread>> workers_;
+  std::unordered_set<NavyThread*> workerSet_;
   mutable AtomicCounter numReclaimScheduled_;
 
   const RegionEvictCallback evictCb_;

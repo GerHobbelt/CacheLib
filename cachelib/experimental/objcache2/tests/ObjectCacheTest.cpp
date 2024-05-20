@@ -112,7 +112,7 @@ class ObjectCacheTest : public ::testing::Test {
       EXPECT_THROW(config.setCacheCapacity(10'000, 100'000),
                    std::invalid_argument);
 
-      // missing cacheSizeLimit
+      // missing totalObjectSizeLimit
       EXPECT_THROW(config.setCacheCapacity(10'000, 0, 10),
                    std::invalid_argument);
 
@@ -520,7 +520,7 @@ class ObjectCacheTest : public ::testing::Test {
     ObjectCacheConfig config;
     config.setCacheName("test")
         .setCacheCapacity(10'000 /* l1EntriesLimit*/,
-                          10'000'000 /* cacheSizeLimit */,
+                          10'000'000 /* totalObjectSizeLimit */,
                           100 /* sizeControllerIntervalMs */)
         .setItemDestructor(
             [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
@@ -580,7 +580,7 @@ class ObjectCacheTest : public ::testing::Test {
     ObjectCacheConfig config;
     config.setCacheName("test")
         .setCacheCapacity(10'000 /* l1EntriesLimit*/,
-                          10'000'000 /* cacheSizeLimit */,
+                          10'000'000 /* totalObjectSizeLimit */,
                           100 /* sizeControllerIntervalMs */)
         .setItemDestructor(
             [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
@@ -805,6 +805,34 @@ class ObjectCacheTest : public ::testing::Test {
     checkObjectSizeTrackingUnorderedMap();
     checkObjectSizeTrackingVector();
     checkObjectSizeTrackingString();
+  }
+
+  void testObjectSizeTrackingWithSizeUpdate() {
+    using ObjectType = std::string;
+    ObjectCacheConfig config;
+    config.setCacheName("test")
+        .setCacheCapacity(10'000 /* l1EntriesLimit*/)
+        .setItemDestructor([&](ObjectCacheDestructorData data) {
+          data.deleteObject<ObjectType>();
+        });
+    config.objectSizeTrackingEnabled = true;
+    auto objcache = ObjectCache::create(config);
+
+    auto [_, ptr, __] = objcache->insertOrReplace(
+        "foo", std::make_unique<ObjectType>(), sizeof(ObjectType));
+    EXPECT_EQ(sizeof(ObjectType), objcache->template getObjectSize(ptr));
+    EXPECT_EQ(sizeof(ObjectType), objcache->getTotalObjectSize());
+
+    auto found = objcache->template findToWrite<ObjectType>("foo");
+    ASSERT_NE(nullptr, found);
+
+    *found = "longgggggggggggggggggggggggggggstringgggggggggggg";
+    const size_t newSize = sizeof(*found) + found->size();
+    const auto updated = objcache->updateObjectSize(ptr, newSize);
+    ASSERT_TRUE(updated);
+
+    EXPECT_EQ(newSize, objcache->template getObjectSize(ptr));
+    EXPECT_EQ(newSize, objcache->getTotalObjectSize());
   }
 
   void testMultithreadObjectSizeTrackingWithMutation() {
@@ -1606,7 +1634,8 @@ class ObjectCacheTest : public ::testing::Test {
   void testMultithreadSizeControl() {
     ObjectCacheConfig config;
     config.setCacheName("test")
-        .setCacheCapacity(200 /* l1EntriesLimit*/, 100000 /* cacheSizeLimit */,
+        .setCacheCapacity(200 /* l1EntriesLimit*/,
+                          100000 /* totalObjectSizeLimit */,
                           100 /* sizeControllerIntervalMs */)
         .setItemDestructor(
             [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
@@ -1809,6 +1838,9 @@ TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingUniqueInsert) {
 TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingWithMutation) {
   this->testObjectSizeTrackingWithMutation();
 }
+TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingWithSizeUpdate) {
+  this->testObjectSizeTrackingWithSizeUpdate();
+}
 TYPED_TEST(ObjectCacheTest, MultithreadObjectSizeTrackingWithMutation) {
   this->testMultithreadObjectSizeTrackingWithMutation();
 }
@@ -1889,7 +1921,8 @@ TEST(ObjectCacheTest, LruEvictionWithSizeControl) {
   config.setCacheName("test");
   config.setItemDestructor(
       [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
-  config.setCacheCapacity(50 /* l1EntriesLimit*/, 100 /* cacheSizeLimit */,
+  config.setCacheCapacity(50 /* l1EntriesLimit*/,
+                          100 /* totalObjectSizeLimit */,
                           100 /* sizeControllerIntervalMs */);
   // insert objects with equal size
   {
