@@ -33,7 +33,7 @@ using testing::_;
 namespace facebook::cachelib::navy::tests {
 TEST(Device, BytesWritten) {
   MockDevice device{100, 1};
-  EXPECT_CALL(device, writeImpl(_, _, _))
+  EXPECT_CALL(device, writeImpl(_, _, _, _))
       .WillOnce(testing::Return(true))
       .WillOnce(testing::Return(true))
       .WillOnce(testing::Return(false));
@@ -109,14 +109,14 @@ TEST(Device, Latency) {
         std::this_thread::sleep_for(std::chrono::milliseconds{100});
         return true;
       }));
-  EXPECT_CALL(device, writeImpl(0, 1, _))
+  EXPECT_CALL(device, writeImpl(0, 1, _, _))
       .WillOnce(testing::InvokeWithoutArgs([] {
         std::this_thread::sleep_for(std::chrono::milliseconds{100});
         return true;
       }));
 
   Buffer buf{1};
-  device.read(0, 1, nullptr);
+  device.read(0, 1, buf.data());
   device.write(0, std::move(buf));
 
   MockCounterVisitor visitor;
@@ -135,7 +135,7 @@ TEST(Device, IOError) {
   MockDevice device{1, 1};
   EXPECT_CALL(device, readImpl(0, 1, _))
       .WillOnce(testing::InvokeWithoutArgs([] { return false; }));
-  EXPECT_CALL(device, writeImpl(0, 1, _))
+  EXPECT_CALL(device, writeImpl(0, 1, _, _))
       .WillOnce(testing::InvokeWithoutArgs([] { return false; }));
 
   Buffer buf{1};
@@ -213,13 +213,38 @@ struct DeviceParamTest
       uint32_t maxDeviceWriteSize,
       std::shared_ptr<DeviceEncryptor> encryptor) {
     device_ = createDirectIoFileDevice(std::move(fVec),
+                                       {},
                                        fileSize,
                                        blockSize,
                                        stripeSize,
                                        maxDeviceWriteSize,
                                        ioEngine_,
                                        qDepth_,
+                                       false,
                                        std::move(encryptor));
+    return device_;
+  }
+
+  std::shared_ptr<Device> createFileDeviceNew(
+      std::vector<std::string> filePaths,
+      uint64_t fileSize,
+      uint32_t blockSize,
+      uint32_t stripeSize,
+      uint32_t maxDeviceWriteSize,
+      std::shared_ptr<DeviceEncryptor> encryptor,
+      bool isExclusiveOwner) {
+    device_ =
+        facebook::cachelib::navy::createFileDevice(std::move(filePaths),
+                                                   fileSize,
+                                                   false, /* truncateFile */
+                                                   blockSize,
+                                                   stripeSize,
+                                                   maxDeviceWriteSize,
+                                                   ioEngine_,
+                                                   qDepth_,
+                                                   false /* isFDPEnabled */,
+                                                   std::move(encryptor),
+                                                   isExclusiveOwner);
     return device_;
   }
 
@@ -229,6 +254,25 @@ struct DeviceParamTest
   uint32_t qDepth_;
   std::shared_ptr<Device> device_;
 };
+
+TEST_P(DeviceParamTest, ExclusiveOwner) {
+  auto filePath =
+      folly::sformat("/tmp/DEVICE_EXCLUSIVE_OWNER_TEST-{}", ::getpid());
+
+  int deviceSize = 16 * 1024;
+  int ioAlignSize = 1024;
+
+  std::vector<folly::File> fVec;
+  fVec.emplace_back(filePath, O_RDWR | O_CREAT, S_IRWXU);
+
+  EXPECT_NO_THROW(createFileDevice(std::move(fVec), deviceSize, ioAlignSize,
+                                   ioAlignSize, 1024, nullptr));
+
+  EXPECT_THROW(createFileDeviceNew(std::vector<std::string>{filePath},
+                                   deviceSize, ioAlignSize, ioAlignSize, 1024,
+                                   nullptr, true /* isExclusiveOwner */),
+               std::system_error);
+}
 
 TEST_P(DeviceParamTest, MaxWriteSize) {
   auto filePath = folly::sformat("/tmp/DEVICE_MAXWRITE_TEST-{}", ::getpid());
