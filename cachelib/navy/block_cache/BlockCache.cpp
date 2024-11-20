@@ -312,20 +312,26 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
   // Iterate the entries backward until we find the entry
   // where the randOffset falls into
   while (offset > 0) {
+    RelAddress addrEnd{rid, offset};
     auto entryEnd = buffer.data() + offset;
     auto desc =
         *reinterpret_cast<const EntryDesc*>(entryEnd - sizeof(EntryDesc));
     if (desc.csSelf != desc.computeChecksum()) {
       XLOGF(ERR,
-            "Item header checksum mismatch. Region {} is likely corrupted. "
-            "Expected:{}, Actual: {}",
+            "Item header checksum mismatch in getRandomAlloc(). Region {} is "
+            "likely corrupted. Expected: {}, Actual: {}, Offset-end: {}, "
+            "Physical-offset-end: {}, Header size: {}, Header (hex): {}",
             rid.index(),
             desc.csSelf,
-            desc.computeChecksum());
+            desc.computeChecksum(),
+            addrEnd.offset(),
+            regionManager_.physicalOffset(addrEnd),
+            sizeof(EntryDesc),
+            folly::hexlify(
+                folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
       break;
     }
 
-    RelAddress addrEnd{rid, offset};
     const auto entrySize = serializedSize(desc.keySize, desc.valueSize);
 
     XDCHECK_GE(offset, entrySize);
@@ -337,11 +343,15 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
     BufferView valueView{desc.valueSize, entryEnd - entrySize};
     if (checksumData_ && desc.cs != checksum(valueView)) {
       XLOGF(ERR,
-            "Item value checksum mismatch. Region {} is likely corrupted. "
-            "Expected:{}, Actual: {}, Payload (hex): {}",
+            "Item value checksum mismatch in getRandomAlloc(). Region {} is "
+            "likely corrupted. Expected: {}, Actual: {}, Offset: {}, "
+            "Physical-offset: {}, Value-size: {}, Payload (hex): {}",
             rid.index(),
             desc.cs,
             checksum(valueView),
+            addrEnd.offset() - entrySize,
+            regionManager_.physicalOffset(addrEnd) - entrySize,
+            desc.valueSize,
             // call folly::unhexlify to convert it back to binary data
             folly::hexlify(
                 folly::ByteRange(valueView.data(), valueView.dataEnd())));
@@ -421,18 +431,26 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
   auto& region = regionManager_.getRegion(rid);
   auto offset = region.getLastEntryEndOffset();
   while (offset > 0) {
+    RelAddress addrEnd(rid, offset);
     auto entryEnd = buffer.data() + offset;
     auto desc =
         *reinterpret_cast<const EntryDesc*>(entryEnd - sizeof(EntryDesc));
     if (desc.csSelf != desc.computeChecksum()) {
       reclaimEntryHeaderChecksumErrorCount_.inc();
       XLOGF(ERR,
-            "Item header checksum mismatch. Region {} is likely corrupted. "
-            "Expected:{}, Actual: {}. Aborting reclaim. Remaining items in the "
-            "region will not be cleaned up (destructor won't be invoked).",
+            "Item header checksum mismatch in onRegionReclaim(). Region {} is "
+            "likely corrupted. Aborting reclaim. Remaining items in the region "
+            "will not be cleaned up (destructor won't be invoked). ",
+            "Expected: {}, Actual: {}, Offset-end: {}, Physical-offset-end: {},"
+            " Header size: {}, Header (hex): {}",
             rid.index(),
             desc.csSelf,
-            desc.computeChecksum());
+            desc.computeChecksum(),
+            addrEnd.offset(),
+            regionManager_.physicalOffset(addrEnd),
+            sizeof(EntryDesc),
+            folly::hexlify(
+                folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
       break;
     }
 
@@ -446,13 +464,17 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
       // We do not need to abort here since the EntryDesc checksum was good, so
       // we can safely proceed to read the next entry.
       XLOGF(ERR,
-            "Item value checksum mismatch. Region {} is likely corrupted. "
-            "Expected:{}, Actual: {}. Aborting reclaim. Remaining items in the "
-            "region will not be cleaned up (destructor won't be invoked). "
-            "Payload (hex): {}",
+            "Item value checksum mismatch in onRegionReclaim(). Region {} is "
+            "likely corrupted. Aborting reclaim. Remaining items in the region "
+            "will not be cleaned up (destructor won't be invoked). ",
+            "Expected: {}, Actual: {}, Offset: {}, Physical-offset: {}, "
+            "Value-size: {}, Payload (hex): {}",
             rid.index(),
             desc.cs,
             checksum(value),
+            addrEnd.offset() - entrySize,
+            regionManager_.physicalOffset(addrEnd) - entrySize,
+            desc.valueSize,
             folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
       reclaimValueChecksumErrorCount_.inc();
       if (removeItem(hk, RelAddress{rid, offset})) {
@@ -500,11 +522,17 @@ void BlockCache::onRegionCleanup(RegionId rid, BufferView buffer) {
     if (desc.csSelf != desc.computeChecksum()) {
       cleanupEntryHeaderChecksumErrorCount_.inc();
       XLOGF(ERR,
-            "Item header checksum mismatch. Region {} is likely corrupted. "
-            "Expected:{}, Actual: {}",
+            "Item header checksum mismatch in onRegionCleanup(). Region {} is "
+            "likely corrupted. Expected: {}, Actual: {}, Offset-end: {}, "
+            "Physical-offset-end: {}, Header size: {}, Header (hex): {}",
             rid.index(),
             desc.csSelf,
-            desc.computeChecksum());
+            desc.computeChecksum(),
+            offset,
+            regionManager_.physicalOffset(RelAddress{rid, offset}),
+            sizeof(EntryDesc),
+            folly::hexlify(
+                folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
       break;
     }
 
@@ -648,7 +676,7 @@ Status BlockCache::writeEntry(RelAddress addr,
 }
 
 Status BlockCache::readEntry(const RegionDescriptor& readDesc,
-                             RelAddress addr,
+                             RelAddress addrEnd,
                              uint32_t approxSize,
                              HashedKey expected,
                              Buffer& value) {
@@ -663,7 +691,7 @@ Status BlockCache::readEntry(const RegionDescriptor& readDesc,
   // Because we either use a predefined read buffer size, or align the size
   // up by kMinAllocAlignSize, our size might be bigger than the actual item
   // size. So we need to ensure we're not reading past the region's beginning.
-  approxSize = std::min(approxSize, addr.offset());
+  approxSize = std::min(approxSize, addrEnd.offset());
 
   XDCHECK_EQ(approxSize % allocAlignSize_, 0ULL) << folly::sformat(
       " alignSize={}, approxSize={}", allocAlignSize_, approxSize);
@@ -672,7 +700,8 @@ Status BlockCache::readEntry(const RegionDescriptor& readDesc,
   // must be atleast as big as EntryDesc aligned to next 2 power
   XDCHECK_GE(approxSize, folly::nextPowTwo(sizeof(EntryDesc)));
 
-  auto buffer = regionManager_.read(readDesc, addr.sub(approxSize), approxSize);
+  auto buffer =
+      regionManager_.read(readDesc, addrEnd.sub(approxSize), approxSize);
   if (buffer.isNull()) {
     return Status::DeviceError;
   }
@@ -682,7 +711,14 @@ Status BlockCache::readEntry(const RegionDescriptor& readDesc,
   if (desc.csSelf != desc.computeChecksum()) {
     lookupEntryHeaderChecksumErrorCount_.inc();
     XLOG_N_PER_MS(ERR, 10, 10'000) << folly::sformat(
-        "Header checksum mismatch at offset: {} ", addr.offset());
+        "Header checksum mismatch in readEntry() at Region: {}, Expected: {}, "
+        "Actual: {}, Offset-end: {}, Physical-offset-end: {}, Header size: {}, "
+        "Header (hex): {}",
+        addrEnd.rid().index(), desc.csSelf, desc.computeChecksum(),
+        addrEnd.offset(), regionManager_.physicalOffset(addrEnd),
+        sizeof(EntryDesc),
+        folly::hexlify(
+            folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
     return Status::DeviceError;
   }
 
@@ -701,7 +737,7 @@ Status BlockCache::readEntry(const RegionDescriptor& readDesc,
     buffer.trimStart(buffer.size() - size);
   } else if (buffer.size() < size) {
     // Read less than actual size. Read again with proper buffer.
-    buffer = regionManager_.read(readDesc, addr.sub(size), size);
+    buffer = regionManager_.read(readDesc, addrEnd.sub(size), size);
     if (buffer.isNull()) {
       return Status::DeviceError;
     }
@@ -711,9 +747,12 @@ Status BlockCache::readEntry(const RegionDescriptor& readDesc,
   value.shrink(desc.valueSize);
   if (checksumData_ && desc.cs != checksum(value.view())) {
     XLOG_N_PER_MS(ERR, 10, 10'000) << folly::sformat(
-        "Item value checksum mismatch when looking up key {}. "
-        "Expected:{}, Actual: {}, Item Offset: {}, Payload (hex): {}",
-        key, desc.cs, checksum(value.view()), addr.offset(),
+        "Item value checksum mismatch in readEntry() looking up key {} in "
+        "Region {}. Expected: {}, Actual: {}, Offset: {}, Physical-offset: {}, "
+        "Value-size: {} Payload (hex): {}",
+        key, addrEnd.rid().index(), desc.cs, checksum(value.view()),
+        addrEnd.offset() - size, regionManager_.physicalOffset(addrEnd) - size,
+        value.size(),
         folly::hexlify(
             folly::ByteRange(value.data(), value.data() + value.size())));
     value.reset();
