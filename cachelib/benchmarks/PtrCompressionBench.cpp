@@ -24,7 +24,7 @@
 #include "cachelib/allocator/memory/MemoryAllocator.h"
 
 using namespace facebook::cachelib;
-using CompressedPtrType = CompressedPtr;
+using CompressedPtrType = CompressedPtr4B;
 using AllocPair = std::pair<void*, CompressedPtrType>;
 
 namespace {
@@ -59,7 +59,7 @@ void buildAllocs(size_t poolSize) {
       numAllocations = 0;
       for (const auto size : sizes) {
         void* alloc = ma->allocate(pid, size);
-        XDCHECK_GE(size, CompressedPtrType::getMinAllocSize());
+        XDCHECK_GE(size, ma->getMinAllocSize());
         if (alloc != nullptr) {
           validAllocs.emplace_back(alloc,
                                    ma->compress<CompressedPtrType>(
