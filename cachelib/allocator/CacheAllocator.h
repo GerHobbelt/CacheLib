@@ -819,6 +819,16 @@ class CacheAllocator : public CacheBase {
   bool provisionPool(PoolId poolId,
                      const std::vector<uint32_t>& slabsDistribution);
 
+  // Provision slabs to a memory pool using power law from small AC to large.
+  // @param poolId          id of the pool to provision
+  // @param power           power for the power law
+  // @param minSlabsPerAC   min number of slabs for each AC before power law
+  // @return true if we have enough memory and filled each AC successfully
+  //         false otherwise. On false, we also revert all provisioned ACs.
+  bool provisionPoolWithPowerLaw(PoolId poolId,
+                                 double power,
+                                 uint32_t minSlabsPerAC = 1);
+
   // update an existing pool's config
   //
   // @param pid       pool id for the pool to be updated
@@ -1574,6 +1584,11 @@ class CacheAllocator : public CacheBase {
   CacheChainedAllocs<CacheT, Handle, Iter> viewAsChainedAllocsT(
       const Handle& parent);
 
+  // return an iterator to the item's chained allocations. The order of
+  // iteration on the item will be LIFO of the addChainedItem calls.
+  template <typename Iter>
+  folly::Range<Iter> viewAsChainedAllocsRangeT(const Item& parent) const;
+
   // template class for convertToIOBuf that takes either ReadHandle or
   // WriteHandle
   template <typename Handle>
@@ -2054,10 +2069,15 @@ class CacheAllocator : public CacheBase {
 
   void initStats();
 
-  // return a read-only iterator to the item's chained allocations. The order of
-  // iteration on the item will be LIFO of the addChainedItem calls.
   folly::Range<ChainedItemIter> viewAsChainedAllocsRange(
-      const Item& parent) const;
+      const Item& parent) const {
+    return viewAsChainedAllocsRangeT<ChainedItemIter>(parent);
+  }
+
+  folly::Range<WritableChainedItemIter> viewAsWritableChainedAllocsRange(
+      const Item& parent) const {
+    return viewAsChainedAllocsRangeT<WritableChainedItemIter>(parent);
+  }
 
   // updates the maxWriteRate for DynamicRandomAdmissionPolicy
   // returns true if update successfully
@@ -3830,14 +3850,14 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
 }
 
 template <typename CacheTrait>
-folly::Range<typename CacheAllocator<CacheTrait>::ChainedItemIter>
-CacheAllocator<CacheTrait>::viewAsChainedAllocsRange(const Item& parent) const {
+template <typename Iter>
+folly::Range<Iter> CacheAllocator<CacheTrait>::viewAsChainedAllocsRangeT(
+    const Item& parent) const {
   return parent.hasChainedItem()
-             ? folly::Range<ChainedItemIter>{ChainedItemIter{
-                                                 findChainedItem(parent).get(),
-                                                 compressor_},
-                                             ChainedItemIter{}}
-             : folly::Range<ChainedItemIter>{};
+             ? folly::Range<Iter>{Iter{findChainedItem(parent).get(),
+                                       compressor_},
+                                  Iter{}}
+             : folly::Range<Iter>{};
 }
 
 template <typename CacheTrait>
@@ -4578,6 +4598,47 @@ bool CacheAllocator<CacheTrait>::provisionPool(
     PoolId poolId, const std::vector<uint32_t>& slabsDistribution) {
   std::unique_lock w(poolsResizeAndRebalanceLock_);
   return allocator_->provisionPool(poolId, slabsDistribution);
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::provisionPoolWithPowerLaw(
+    PoolId poolId, double power, uint32_t minSlabsPerAC) {
+  const auto& poolSize = allocator_->getPool(poolId).getPoolSize();
+  const uint32_t numACs =
+      allocator_->getPool(poolId).getStats().classIds.size();
+  const uint32_t numSlabs = poolSize / Slab::kSize;
+  const uint32_t minSlabsRequired = numACs * minSlabsPerAC;
+  if (numSlabs < minSlabsRequired) {
+    XLOGF(ERR,
+          "Insufficinet slabs to satisfy minSlabPerAC. PoolID: {}, Need: {}, "
+          "Actual: {}",
+          poolId, minSlabsRequired, numSlabs);
+    return false;
+  }
+
+  std::vector<uint32_t> slabsDistribution(numACs, minSlabsPerAC);
+  const uint32_t remainingSlabs = numSlabs - minSlabsRequired;
+
+  auto calcPowerLawSum = [](int n, double p) {
+    double sum = 0;
+    for (int i = 1; i <= n; ++i) {
+      sum += std::pow(i, -p);
+    }
+    return sum;
+  };
+
+  const double powerLawSum = calcPowerLawSum(numACs, power);
+  for (uint32_t i = 0, allocatedSlabs = 0;
+       i < numACs && allocatedSlabs < remainingSlabs; i++) {
+    const uint32_t slabsToAllocate =
+        std::min(static_cast<uint32_t>(remainingSlabs *
+                                       std::pow(i + 1, -power) / powerLawSum),
+                 remainingSlabs - allocatedSlabs);
+    slabsDistribution[i] += slabsToAllocate;
+    allocatedSlabs += slabsToAllocate;
+  }
+
+  return provisionPool(poolId, slabsDistribution);
 }
 
 template <typename CacheTrait>
