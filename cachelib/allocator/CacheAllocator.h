@@ -21,6 +21,7 @@
 #include <folly/Random.h>
 #include <folly/ScopeGuard.h>
 #include <folly/fibers/TimedMutex.h>
+#include <folly/json/DynamicConverter.h>
 #include <folly/logging/xlog.h>
 #include <folly/synchronization/SanitizeThread.h>
 #include <gtest/gtest.h>
@@ -803,6 +804,18 @@ class CacheAllocator : public CacheBase {
                  std::shared_ptr<RebalanceStrategy> rebalanceStrategy = nullptr,
                  std::shared_ptr<RebalanceStrategy> resizeStrategy = nullptr,
                  bool ensureProvisionable = false);
+
+  // This should only be called on cache startup on a new memory pool. Provision
+  // a pool by filling up each allocation class with prescribed number of slabs.
+  // This is useful for users that know their workload distribution in
+  // allocation sizes.
+  //
+  // @param poolId              id of the pool to provision
+  // @param slabsDistribution   number of slabs in each AC
+  // @return true if we have enough memory and filled each AC successfully
+  //         false otherwise. On false, we also revert all provisioned ACs.
+  bool provisionPool(PoolId poolId,
+                     const std::vector<uint32_t>& slabsDistribution);
 
   // update an existing pool's config
   //
@@ -1939,7 +1952,28 @@ class CacheAllocator : public CacheBase {
 
   std::map<std::string, std::string> serializeConfigParams()
       const override final {
-    return config_.serialize();
+    auto configMap = config_.serialize();
+
+    auto exportRebalanceStrategyConfig = [this](PoolId poolId) {
+      auto strategy = getRebalanceStrategy(poolId);
+      if (!strategy) {
+        return std::map<std::string, std::string>{};
+      }
+      return strategy->exportConfig();
+    };
+
+    auto regularPoolIds = getRegularPoolIds();
+    std::map<std::string, std::map<std::string, std::string>>
+        mapRebalancePolicyConfigs;
+    for (const auto poolId : regularPoolIds) {
+      auto poolName = getPoolName(poolId);
+      mapRebalancePolicyConfigs[poolName] =
+          exportRebalanceStrategyConfig(poolId);
+    }
+    configMap["rebalance_policy_configs"] =
+        folly::json::serialize(folly::toDynamic(mapRebalancePolicyConfigs), {});
+
+    return configMap;
   }
 
   typename Item::PtrCompressor createPtrCompressor() const {
@@ -4496,6 +4530,13 @@ PoolId CacheAllocator<CacheTrait>::addPool(
   }
 
   return pid;
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::provisionPool(
+    PoolId poolId, const std::vector<uint32_t>& slabsDistribution) {
+  std::unique_lock w(poolsResizeAndRebalanceLock_);
+  return allocator_->provisionPool(poolId, slabsDistribution);
 }
 
 template <typename CacheTrait>
