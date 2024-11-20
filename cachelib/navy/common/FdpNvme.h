@@ -83,6 +83,7 @@ enum nvme_io_opcode {
   nvme_cmd_io_mgmt_recv = 0x12,
   nvme_cmd_io_mgmt_send = 0x1d,
 };
+#endif
 
 // NVMe specific data for a device
 //
@@ -92,6 +93,12 @@ class NvmeData {
  public:
   NvmeData() = default;
   NvmeData& operator=(const NvmeData&) = default;
+
+  NvmeData(const NvmeData& data)
+      : nsId_(data.nsId_),
+        lbaShift_(data.lbaShift_),
+        maxTfrSize_(data.maxTfrSize_),
+        startLba_(data.startLba_) {}
 
   explicit NvmeData(int nsId,
                     uint32_t lbaShift,
@@ -121,7 +128,6 @@ class NvmeData {
   uint32_t maxTfrSize_;
   uint64_t startLba_;
 };
-#endif
 
 // FDP specific info and handling
 //
@@ -131,6 +137,10 @@ class NvmeData {
 class FdpNvme {
  public:
   explicit FdpNvme(const std::string& fileName);
+
+  // This constructor allows user to experiment with FdpNvme without having the
+  // actual FDP device. Ex: FDP Unit Tests
+  explicit FdpNvme(NvmeData& data, struct nvme_fdp_ruh_status* ruh_status);
 
   FdpNvme(const FdpNvme&) = delete;
   FdpNvme& operator=(const FdpNvme&) = delete;
@@ -181,8 +191,8 @@ class FdpNvme {
   // Reads NvmeData for a NVMe device
   NvmeData readNvmeInfo(const std::string& blockDevice);
 
-  // Initialize the FDP device and populate necessary info.
-  void initializeFDP(const std::string& blockDevice);
+  // This function populate placement handles of the FDP device
+  void initializeFDPHandles(struct nvme_fdp_ruh_status* ruh_status);
 
   // Generic NVMe IO mgmnt receive cmd
   int nvmeIOMgmtRecv(uint32_t nsid,
