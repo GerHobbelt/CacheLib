@@ -80,9 +80,13 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
     if (config_.evictionPolicy) {
       throw std::invalid_argument("There's already an eviction policy set");
     }
-    config_.numPriorities = static_cast<uint16_t>(segmentRatio.size());
     config_.evictionPolicy =
         std::make_unique<SegmentedFifoPolicy>(std::move(segmentRatio));
+  }
+
+  void setNumAllocatorsPerPriority(
+      std::vector<uint32_t> allocatorsPerPriority) override {
+    config_.allocatorsPerPriority = std::move(allocatorsPerPriority);
   }
 
   void setReadBufferSize(uint32_t size) override {
@@ -116,6 +120,10 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
 
   void setPreciseRemove(bool preciseRemove) override {
     config_.preciseRemove = preciseRemove;
+  }
+
+  void setRegionManagerFlushAsync(bool asyn) override {
+    config_.regionManagerFlushAsync = asyn;
   }
 
   std::unique_ptr<Engine> create(JobScheduler& scheduler,
@@ -188,6 +196,7 @@ class EnginePairProtoImpl final : public EnginePairProto {
     bigHashProto_ = std::move(proto.bigHashProto_);
     blockCacheProto_ = std::move(proto.blockCacheProto_);
     smallItemMaxSize_ = proto.smallItemMaxSize_;
+    name_ = std::move(proto.name_);
   }
 
   void setBigHash(std::unique_ptr<BigHashProto> proto,
@@ -201,8 +210,8 @@ class EnginePairProtoImpl final : public EnginePairProto {
   }
 
   EnginePair create(Device* device,
-                    ExpiredCheck checkExpired,
-                    DestructorCallback destructorCb,
+                    const ExpiredCheck& checkExpired,
+                    const DestructorCallback& destructorCb,
                     JobScheduler& scheduler) {
     std::unique_ptr<Engine> bh;
 
@@ -225,13 +234,16 @@ class EnginePairProtoImpl final : public EnginePairProto {
     }
 
     return EnginePair{std::move(bh), std::move(bc), smallItemMaxSize_,
-                      &scheduler};
+                      &scheduler, std::move(name_)};
   }
+
+  void setName(const std::string& name) override { name_ = name; }
 
  private:
   std::unique_ptr<BigHashProto> bigHashProto_;
   std::unique_ptr<BlockCacheProto> blockCacheProto_;
   uint32_t smallItemMaxSize_;
+  std::string name_;
 };
 
 class CacheProtoImpl final : public CacheProto {

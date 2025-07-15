@@ -86,6 +86,13 @@ class BlockCacheProto {
 
   // (Optional) Set if the preciseRemove flag.
   virtual void setPreciseRemove(bool preciseRemove) = 0;
+
+  // (Optional) Set if the region manager worker flush should be async.
+  virtual void setRegionManagerFlushAsync(bool flushAsync) = 0;
+
+  // Set number of allocators per priority.
+  virtual void setNumAllocatorsPerPriority(
+      std::vector<uint32_t> numAllocatorsPerPriority) = 0;
 };
 
 // BigHash engine proto. BigHash is used to cache small objects (under 2KB)
@@ -122,6 +129,8 @@ class EnginePairProto {
   // Set up big hash engine.
   virtual void setBigHash(std::unique_ptr<BigHashProto> proto,
                           uint32_t smallItemMaxSize) = 0;
+
+  virtual void setName(const std::string& name) = 0;
 };
 
 // Cache object prototype. Setup cache desired parameters and pass proto to

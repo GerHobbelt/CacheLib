@@ -273,9 +273,16 @@ class BlockCacheConfig {
   //             {1, 2, 3} gives the 1/6th of the items in the first segment (P0
   //             least important), 2/6th of the items in the second segment
   //             (P1), and finally 3/6th of the items in the third segment (P2).
+  // @param Number of allocators for each priority. If not set, each priority
+  // would have one allocator.
   BlockCacheConfig& enableSegmentedFifo(
-      std::vector<unsigned int> sFifoSegmentRatio) noexcept {
+      std::vector<unsigned int> sFifoSegmentRatio,
+      std::vector<uint32_t> allocatorCounts = {}) noexcept {
     sFifoSegmentRatio_ = std::move(sFifoSegmentRatio);
+    if (allocatorCounts.size() > 0) {
+      XDCHECK_EQ(sFifoSegmentRatio_.size(), allocatorCounts.size());
+      allocatorsPerPriority_ = std::move(allocatorCounts);
+    }
     lru_ = false;
     return *this;
   }
@@ -337,6 +344,16 @@ class BlockCacheConfig {
     return *this;
   }
 
+  BlockCacheConfig& setRegionManagerFlushAsync(bool async) noexcept {
+    regionManagerFlushAsync_ = async;
+    return *this;
+  }
+
+  BlockCacheConfig& setAllocatorCount(uint32_t numAllocators) noexcept {
+    allocatorsPerPriority_ = {numAllocators};
+    return *this;
+  }
+
   bool isLruEnabled() const { return lru_; }
 
   const std::vector<unsigned int>& getSFifoSegmentRatio() const {
@@ -355,11 +372,17 @@ class BlockCacheConfig {
 
   uint64_t getSize() const { return size_; }
 
+  bool isRegionManagerFlushAsync() const { return regionManagerFlushAsync_; }
+
   const BlockCacheReinsertionConfig& getReinsertionConfig() const {
     return reinsertionConfig_;
   }
 
   bool isPreciseRemove() const { return preciseRemove_; }
+
+  const std::vector<uint32_t>& getNumAllocatorsPerPriority() const {
+    return allocatorsPerPriority_;
+  }
 
  private:
   // Whether Navy BlockCache will use region-based LRU eviction policy.
@@ -389,6 +412,14 @@ class BlockCacheConfig {
   // Intended size of the block cache.
   // If 0, this block cache takes all the space left on the device.
   uint64_t size_{0};
+
+  // Whether the region manager workers flushes asynchronously.
+  bool regionManagerFlushAsync_{false};
+
+  // Number of allocators per priority.
+  // Do not set this directly. This should be configured by setAllocatorCount
+  // for FIFO and LRU, and enableSegmentedFifio for segmented FIFO.
+  std::vector<uint32_t> allocatorsPerPriority_{1};
 
   friend class NavyConfig;
 };
@@ -468,9 +499,14 @@ class EnginesConfig {
 
   bool isBigHashEnabled() const { return bigHashConfig_.getSizePct() > 0; }
 
+  const std::string& getName() const { return name_; }
+
+  void setName(std::string&& name) { name_ = std::move(name); }
+
  private:
   BlockCacheConfig blockCacheConfig_;
   BigHashConfig bigHashConfig_;
+  std::string name_;
 };
 
 enum class IoEngine : uint8_t { IoUring, LibAio, Sync };
@@ -575,6 +611,7 @@ class NavyConfig {
   uint32_t getMaxConcurrentInserts() const { return maxConcurrentInserts_; }
   uint64_t getMaxParcelMemoryMB() const { return maxParcelMemoryMB_; }
   bool getUseEstimatedWriteSize() const { return useEstimatedWriteSize_; }
+  size_t getNumShards() const { return numShards_; }
 
   // Setters:
   // Enable "dynamic_random" admission policy.
@@ -678,6 +715,7 @@ class NavyConfig {
   void setUseEstimatedWriteSize(bool useEstimatedWriteSize) noexcept {
     useEstimatedWriteSize_ = useEstimatedWriteSize;
   }
+  void setNumShards(size_t numShards) noexcept { numShards_ = numShards; }
 
   const std::vector<EnginesConfig>& enginesConfigs() const {
     return enginesConfigs_;
@@ -689,7 +727,7 @@ class NavyConfig {
   // ============ AP settings =============
   // Name of the admission policy.
   // This could only be "dynamic_random" or "random" (or empty).
-  std::string admissionPolicy_{""};
+  std::string admissionPolicy_;
   DynamicRandomAPConfig dynamicRandomAPConfig_{};
   RandomAPConfig randomAPConfig_{};
 
@@ -762,6 +800,8 @@ class NavyConfig {
   // Whether Navy support the NVMe FDP data placement(TP4146) directives or not.
   // Reference: https://nvmexpress.org/nvmeflexible-data-placement-fdp-blog/
   bool enableFDP_{false};
+  // Number of nvm lock shards
+  size_t numShards_{8192};
 };
 } // namespace navy
 } // namespace cachelib

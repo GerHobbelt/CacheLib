@@ -172,6 +172,10 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   }
   blockCache->setCleanRegionsPool(blockCacheConfig.getCleanRegions(),
                                   blockCacheConfig.getCleanRegionThreads());
+  blockCache->setRegionManagerFlushAsync(
+      blockCacheConfig.isRegionManagerFlushAsync());
+  blockCache->setNumAllocatorsPerPriority(
+      blockCacheConfig.getNumAllocatorsPerPriority());
 
   blockCache->setReinsertionConfig(blockCacheConfig.getReinsertionConfig());
 
@@ -247,6 +251,7 @@ void setupCacheProtos(const navy::NavyConfig& config,
     const auto& enginesConfig = config.enginesConfigs()[idx];
     uint64_t blockCacheSize = enginesConfig.blockCache().getSize();
     auto enginePairProto = cachelib::navy::createEnginePairProto();
+    enginePairProto->setName(enginesConfig.getName());
 
     if (enginesConfig.isBigHashEnabled()) {
       uint64_t bigHashSize =
