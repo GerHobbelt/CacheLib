@@ -75,6 +75,7 @@ BlockCache::Config& BlockCache::Config::validate() {
   }
 
   reinsertionConfig.validate();
+  indexConfig.validate();
 
   return *this;
 }
@@ -116,6 +117,13 @@ uint32_t BlockCache::calcAllocAlignSize() const {
   return folly::nextPowTwo(allocAlignSize);
 }
 
+std::unique_ptr<Index> BlockCache::createIndex(
+    const BlockCacheIndexConfig& indexConfig) {
+  // always SparseMapIndex for now
+  return std::make_unique<SparseMapIndex>(indexConfig.getNumSparseMapBuckets(),
+                                          indexConfig.getNumBucketsPerMutex());
+}
+
 BlockCache::BlockCache(Config&& config)
     : BlockCache{std::move(config.validate()), ValidConfigTag{}} {}
 
@@ -134,9 +142,7 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
       regionSize_{config.regionSize},
       itemDestructorEnabled_{config.itemDestructorEnabled},
       preciseRemove_{config.preciseRemove},
-      // TODO: index will be created depending on the HT type specified in
-      // config
-      index_(std::make_unique<SparseMapIndex>()),
+      index_(createIndex(config.indexConfig)),
       regionManager_{config.getNumRegions(),
                      config.regionSize,
                      config.cacheBaseOffset,
@@ -233,7 +239,7 @@ Status BlockCache::insert(HashedKey hk, BufferView value) {
 }
 
 bool BlockCache::couldExist(HashedKey hk) {
-  const auto lr = index_->lookup(hk.keyHash());
+  const auto lr = index_->peek(hk.keyHash());
   if (!lr.found()) {
     lookupCount_.inc();
     return false;
@@ -385,7 +391,7 @@ std::pair<Status, std::string> BlockCache::getRandomAlloc(Buffer& value) {
     // confirm that the chosen NvmItem is still being mapped with the key
     HashedKey hk =
         makeHK(entryEnd - sizeof(EntryDesc) - desc.keySize, desc.keySize);
-    const auto lr = index_->lookup(hk.keyHash());
+    const auto lr = index_->peek(hk.keyHash());
     if (!lr.found() || addrEnd != decodeRelAddress(lr.address())) {
       // overwritten
       break;

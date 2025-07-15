@@ -49,16 +49,26 @@ using SharedMutex =
 // but we do not want people to rely on that).
 class SparseMapIndex : public Index {
  public:
-  SparseMapIndex() = default;
+  static constexpr uint32_t kDefaultNumBucketMaps{64 * 1024};
+  static constexpr uint32_t kDefaultBucketMapsPerMutex{64};
+
+  explicit SparseMapIndex(uint32_t numBucketMaps,
+                          uint32_t numBucketMapsPerMutex)
+      : numBucketMaps_(numBucketMaps),
+        numBucketMapsPerMutex_(numBucketMapsPerMutex) {
+    initialize();
+  }
+  SparseMapIndex()
+      : SparseMapIndex(kDefaultNumBucketMaps, kDefaultBucketMapsPerMutex) {}
   ~SparseMapIndex() override = default;
   SparseMapIndex(const SparseMapIndex&) = delete;
   SparseMapIndex(SparseMapIndex&&) = delete;
   SparseMapIndex& operator=(const SparseMapIndex&) = delete;
   SparseMapIndex& operator=(SparseMapIndex&&) = delete;
 
-  // Writes index to a Thrift object one bucket at a time and passes each bucket
-  // to @persistCb. The reason for this is because the index can be very large
-  // and serializing everything at once uses a lot of RAM.
+  // Writes index to a Thrift object one bucket map at a time and passes each
+  // bucket map to @persistCb. The reason for this is because the index can be
+  // very large and serializing everything at once uses a lot of RAM.
   void persist(RecordWriter& rw) const override;
 
   // Resets index then inserts entries read from @deserializer. Throws
@@ -98,17 +108,14 @@ class SparseMapIndex : public Index {
   // @return true if removed successfully, false otherwise.
   bool removeIfMatch(uint64_t key, uint32_t address) override;
 
-  // Updates hits information of a key.
-  void setHits(uint64_t key, uint8_t currentHits, uint8_t totalHits) override;
-
   // Resets all the buckets to the initial state.
   void reset() override;
 
-  // Walks buckets and computes total index entry count
+  // Walks bucket maps and computes total index entry count
   size_t computeSize() const override;
 
-  // Walks buckets and computes max/min memory footprint range that index will
-  // currently use for the entries it currently has. (Since sparse_map is
+  // Walks bucket maps and computes max/min memory footprint range that index
+  // will currently use for the entries it currently has. (Since sparse_map is
   // difficult to get the internal status without modifying its implementaion
   // directly, this function will calculate max/min memory footprint range by
   // considering the current entry count and sparse_map's implementation)
@@ -118,44 +125,51 @@ class SparseMapIndex : public Index {
   void getCounters(const CounterVisitor& visitor) const override;
 
  private:
-  static constexpr uint32_t kNumBuckets{64 * 1024};
-  static constexpr uint32_t kNumMutexes{1024};
+  // Configuration related variables
+  const uint32_t numBucketMaps_{64 * 1024};
+  const uint32_t numBucketMapsPerMutex_{64};
+
+  uint32_t totalMutexes_{1024};
+
+  void initialize();
+
+  // Updates hits information of a key.
+  void setHitsTestOnly(uint64_t key,
+                       uint8_t currentHits,
+                       uint8_t totalHits) override;
 
   using Map = tsl::sparse_map<uint32_t, ItemRecord>;
 
-  static uint32_t bucket(uint64_t hash) {
-    return (hash >> 32) & (kNumBuckets - 1);
+  uint32_t bucketMap(uint64_t hash) const {
+    return (hash >> 32) & (numBucketMaps_ - 1);
   }
 
-  static uint32_t subkey(uint64_t hash) { return hash & 0xffffffffu; }
+  uint32_t subkey(uint64_t hash) const { return hash & 0xffffffffu; }
 
-  SharedMutex& getMutexOfBucket(uint32_t bucket) const {
-    XDCHECK(folly::isPowTwo(kNumMutexes));
-    return mutex_[bucket & (kNumMutexes - 1)];
+  SharedMutex& getMutexOfBucketMap(uint32_t bucketMap) const {
+    XDCHECK(folly::isPowTwo(totalMutexes_));
+    return mutex_[bucketMap & (totalMutexes_ - 1)];
   }
 
   SharedMutex& getMutex(uint64_t hash) const {
-    auto b = bucket(hash);
-    return getMutexOfBucket(b);
+    auto b = bucketMap(hash);
+    return getMutexOfBucketMap(b);
   }
 
   Map& getMap(uint64_t hash) const {
-    auto b = bucket(hash);
-    return buckets_[b];
+    auto b = bucketMap(hash);
+    return bucketMaps_[b];
   }
 
   void trackRemove(uint8_t totalHits);
 
   // Experiments with 64 byte alignment didn't show any throughput test
   // performance improvement.
-  std::unique_ptr<SharedMutex[]> mutex_{new SharedMutex[kNumMutexes]};
-  std::unique_ptr<Map[]> buckets_{new Map[kNumBuckets]};
+  std::unique_ptr<SharedMutex[]> mutex_;
+  std::unique_ptr<Map[]> bucketMaps_;
 
   mutable util::PercentileStats hitsEstimator_{kQuantileWindowSize};
   mutable AtomicCounter unAccessedItems_;
-
-  static_assert((kNumMutexes & (kNumMutexes - 1)) == 0,
-                "number of mutexes must be power of two");
 
 // For unit tests private member access
 #ifdef SparseMapIndex_TEST_FRIENDS

@@ -183,6 +183,7 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   blockCache->setItemDestructorEnabled(itemDestructorEnabled);
   blockCache->setStackSize(stackSize);
   blockCache->setPreciseRemove(blockCacheConfig.isPreciseRemove());
+  blockCache->setIndexConfig(blockCacheConfig.getIndexConfig());
 
   proto.setBlockCache(std::move(blockCache));
   return blockCacheOffset + blockCacheSize;
@@ -197,7 +198,7 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
 // @param proto             the output CacheProto
 //
 // @throw std::invalid_argument if input arguments are invalid
-// Below is an illustration on how the cache engines anre metadata are laid out
+// Below is an illustration on how the cache engines and metadata are laid out
 // on the device address space.
 // |--------------------------------- Device -------------------------------|
 // |--- Metadata ---|--- BC-0 ---|--- BC-1 ---|...|--- BH-1 ---|--- BH-0 ---|
