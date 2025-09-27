@@ -887,6 +887,7 @@ void BlockCache::getCounters(const CounterVisitor& visitor) const {
           CounterVisitor::CounterType::RATE);
   visitor("navy_bc_remove_attempt_collisions", removeAttemptCollisions_.get(),
           CounterVisitor::CounterType::RATE);
+  bcLifetimeSecs_.visitQuantileEstimator(visitor, "navy_bc_item_lifetime_secs");
   // Allocator visits region manager
   allocator_.getCounters(visitor);
   index_->getCounters(visitor);
@@ -942,13 +943,12 @@ void BlockCache::tryRecover(RecordReader& rr) {
 
 bool BlockCache::isValidRecoveryData(
     const serialization::BlockCacheConfig& recoveredConfig) const {
-  return *config_.cacheBaseOffset_ref() ==
-             *recoveredConfig.cacheBaseOffset_ref() &&
-         *config_.cacheSize_ref() == *recoveredConfig.cacheSize_ref() &&
+  return *config_.cacheBaseOffset() == *recoveredConfig.cacheBaseOffset() &&
+         *config_.cacheSize() == *recoveredConfig.cacheSize() &&
          static_cast<int32_t>(allocAlignSize_) ==
-             *recoveredConfig.allocAlignSize_ref() &&
-         *config_.checksum_ref() == *recoveredConfig.checksum_ref() &&
-         *config_.version_ref() == *recoveredConfig.version_ref();
+             *recoveredConfig.allocAlignSize() &&
+         *config_.checksum() == *recoveredConfig.checksum() &&
+         *config_.version() == *recoveredConfig.version();
 }
 
 serialization::BlockCacheConfig BlockCache::serializeConfig(
