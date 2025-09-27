@@ -135,7 +135,6 @@ class BlockCacheProtoImpl final : public BlockCacheProto {
     config_.scheduler = &scheduler;
     config_.checkExpired = std::move(checkExpired);
     config_.destructorCb = std::move(cb);
-    config_.validate();
     return std::make_unique<BlockCache>(std::move(config_));
   }
 
@@ -272,6 +271,10 @@ class CacheProtoImpl final : public CacheProto {
 
   void setMetadataSize(size_t size) override { config_.metadataSize = size; }
 
+  void setMaxKeySize(uint32_t keySize) override {
+    config_.maxKeySize = keySize;
+  }
+
   void setExpiredCheck(ExpiredCheck checkExpired) override {
     checkExpired_ = std::move(checkExpired);
   }
@@ -319,6 +322,7 @@ class CacheProtoImpl final : public CacheProto {
       apConfig.probFactorLowerBound = probFactorLowerBound;
       apConfig.probFactorUpperBound = probFactorUpperBound;
     }
+    apConfig.enableLogging = config.getEnableLogging();
     auto fnBypass = config.getFnBypass();
     if (fnBypass) {
       apConfig.fnBypass = std::move(fnBypass);

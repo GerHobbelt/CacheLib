@@ -53,7 +53,7 @@ class RandomAPConfig {
 };
 
 /**
- * RandomDynamicAPConfig provides APIs for users to configure one of the
+ * DynamicRandomAPConfig provides APIs for users to configure one of the
  * admission policy - "dynamic_random". Admission policy is one part of
  * NavyConfig.
  *
@@ -110,6 +110,12 @@ class DynamicRandomAPConfig {
     return *this;
   }
 
+  DynamicRandomAPConfig& enableLogging(bool enable) noexcept {
+    enableLogging_ = enable;
+    return *this;
+  }
+
+  // Set a function to determine which items bypass the admission policy.
   DynamicRandomAPConfig& setFnBypass(FnBypass fn) {
     fnBypass_ = std::move(fn);
     return *this;
@@ -126,6 +132,8 @@ class DynamicRandomAPConfig {
   double getProbFactorLowerBound() const { return probFactorLowerBound_; }
 
   double getProbFactorUpperBound() const { return probFactorUpperBound_; }
+
+  bool getEnableLogging() const { return enableLogging_; }
 
   FnBypass getFnBypass() const { return fnBypass_; }
 
@@ -146,6 +154,8 @@ class DynamicRandomAPConfig {
   // Upper bound of the probability factor. Non-positive value would be
   // replaced the default value from DynamicRandomAP::Config
   double probFactorUpperBound_{0};
+  // Whether to putting out logs for more information
+  bool enableLogging_{false};
   // Bypass function to determine keys to bypass in admission policy.
   FnBypass fnBypass_;
 };
@@ -162,12 +172,13 @@ class DynamicRandomAPConfig {
  *
  * With sparse_map index, it will dynamically adjust the number of buckets
  * depending on the number of entries stored and hash distribution to avoid hash
- * collision. However, it will kepp rehashing on the runtime, meaning that it
- * will increase resizing costs (accompanying memory allocations and copies) and
- * also memory footprint that it uses can't be controlled (Adding more
- * entries will consume more memory)
- * Another side effect caused by sparse_map index implementatoin is, it may
- * consume much more memory per entries than fixed sized one even with the same
+ * collision. However, it will keep rehashing at runtime, meaning that it will
+ * increase resizing costs (accompanying memory allocations and copies) and also
+ * memory footprint that it uses can't be controlled (Adding more entries will
+ * consume more memory).
+ *
+ * Another side effect caused by sparse_map index implementation is that it may
+ * consume much more memory per entries than fixed sized one even when the same
  * number of buckets are populated and stored.
  *
  * TODO: For now, only SparseMapIndex related configs are supported here
@@ -251,8 +262,10 @@ class BlockCacheIndexConfig {
  * BlockCacheReinsertionConfig provides APIs for users to configure BlockCache
  * reinsertion policy, which is a part of NavyConfig.
  *
- * By this class, user can:
- * - enable hits-based OR probability based reinsertion policy (but not both)
+ * By this class, users can enable one of the following reinsertion policies:
+ * - hits-based
+ * - probability-based
+ * - custom
  */
 class BlockCacheReinsertionConfig {
  public:
@@ -696,6 +709,7 @@ class NavyConfig {
   const std::string& getFileName() const;
   const std::vector<std::string>& getRaidPaths() const;
   uint64_t getDeviceMetadataSize() const { return deviceMetadataSize_; }
+  uint32_t getMaxKeySize() const { return maxKeySize_; }
   uint64_t getFileSize() const { return fileSize_; }
   bool getTruncateFile() const { return truncateFile_; }
   uint32_t getDeviceMaxWriteSize() const { return deviceMaxWriteSize_; }
@@ -785,6 +799,9 @@ class NavyConfig {
     deviceMaxWriteSize_ = deviceMaxWriteSize;
   }
 
+  // Configure the max key size for Navy
+  void setMaxKeySize(uint32_t maxKeySize) noexcept { maxKeySize_ = maxKeySize; }
+
   // Enable AsyncIo
   // If enabled already via job config settings, this will override
   // the qDepth_ or enableIoUring_.
@@ -850,6 +867,8 @@ class NavyConfig {
   // ============ Device settings =============
   // Navy specific device block size in bytes.
   uint64_t blockSize_{4096};
+  // The maximum key size (in bytes) for items cached in Navy.
+  uint32_t maxKeySize_{255};
   // If true, Navy will only start if it's the sole owner of the file.
   bool isExclusiveOwner_{false};
   // The file name/path for caching.
