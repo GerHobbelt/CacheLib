@@ -31,12 +31,6 @@
 
 namespace facebook::cachelib::navy {
 
-constexpr uint32_t BlockCache::kMinAllocAlignSize;
-constexpr uint32_t BlockCache::kMaxItemSize;
-constexpr uint32_t BlockCache::kFormatVersion;
-constexpr uint32_t BlockCache::kDefReadBufferSize;
-constexpr uint16_t BlockCache::kDefaultItemPriority;
-
 BlockCache::Config& BlockCache::Config::validate() {
   XDCHECK_NE(scheduler, nullptr);
   if (!device || !evictionPolicy) {
@@ -119,8 +113,12 @@ uint32_t BlockCache::calcAllocAlignSize() const {
 std::unique_ptr<Index> BlockCache::createIndex(
     const BlockCacheIndexConfig& indexConfig) {
   // always SparseMapIndex for now
-  return std::make_unique<SparseMapIndex>(indexConfig.getNumSparseMapBuckets(),
-                                          indexConfig.getNumBucketsPerMutex());
+  return std::make_unique<SparseMapIndex>(
+      indexConfig.getNumSparseMapBuckets(),
+      indexConfig.getNumBucketsPerMutex(),
+      indexConfig.isTrackItemHistoryEnabled()
+          ? SparseMapIndex::ExtraField::kItemHitHistory
+          : SparseMapIndex::ExtraField::kTotalHits);
 }
 
 BlockCache::BlockCache(Config&& config)
