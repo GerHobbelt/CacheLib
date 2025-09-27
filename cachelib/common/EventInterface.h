@@ -19,6 +19,8 @@
 #include <folly/Optional.h>
 #include <folly/logging/xlog.h>
 
+#include "cachelib/allocator/KAllocation.h"
+
 namespace facebook {
 namespace cachelib {
 
@@ -92,6 +94,8 @@ enum class AllocatorApiResult : uint8_t {
   REMOVED = 7,             // Removed an item.
   EVICTED = 8,             // Evicted an item.
   EXPIRED = 9,             // An item has expired.
+  REINSERTED = 10,         // Reinserted an item.
+  NVM_ADMITTED = 11,       // Admit item to NVM
 };
 
 inline const char* toString(AllocatorApiResult result) {
@@ -116,6 +120,10 @@ inline const char* toString(AllocatorApiResult result) {
     return "EVICTED";
   case AllocatorApiResult::EXPIRED:
     return "EXPIRED";
+  case AllocatorApiResult::REINSERTED:
+    return "REINSERTED";
+  case AllocatorApiResult::NVM_ADMITTED:
+    return "NVM_ADMITTED";
   default:
     XDCHECK(false);
     return "** CORRUPT RESULT **";
@@ -149,6 +157,8 @@ class EventInterface {
   virtual void getStats(
       std::unordered_map<std::string, uint64_t>& statsMap) const = 0;
 };
+
+using EventTracker = EventInterface<KAllocation::Key>;
 
 } // namespace cachelib
 } // namespace facebook

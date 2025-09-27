@@ -422,8 +422,9 @@ class NvmCache {
   void removeFromFillMap(HashedKey hk) {
     std::unique_ptr<GetCtx> to_delete;
     {
-      auto lock = getFillLock(hk);
-      auto& map = getFillMap(hk);
+      const auto shard = getShardForKey(hk);
+      auto lock = getFillLockForShard(shard);
+      auto& map = getFillMapForShard(shard);
       auto it = map.find(hk.key());
       if (it == map.end()) {
         return;
@@ -436,7 +437,7 @@ class NvmCache {
   // Erase entry for the ctx from the fill map
   // @param     key   item key
   void invalidateFill(HashedKey hk) {
-    auto shard = getShardForKey(hk);
+    const auto shard = getShardForKey(hk);
     auto lock = getFillLockForShard(shard);
     auto& map = getFillMapForShard(shard);
     auto it = map.find(hk.key());
@@ -458,24 +459,20 @@ class NvmCache {
     return hk.keyHash() % numShards_;
   }
 
-  size_t getNumShards() const { return numShards_; }
-
-  size_t getShardForKey(folly::StringPiece key) const {
-    return getShardForKey(HashedKey{key});
-  }
-
   FillMap& getFillMapForShard(size_t shard) { return fills_[shard].fills_; }
 
-  FillMap& getFillMap(HashedKey hk) {
-    return getFillMapForShard(getShardForKey(hk));
+  /**
+   * Obtains an exclusive fill lock for the shard.
+   */
+  auto getFillLockForShard(size_t shard) {
+    return std::unique_lock{fillLock_[shard].fillLock_};
   }
 
-  std::unique_lock<TimedMutex> getFillLockForShard(size_t shard) {
-    return std::unique_lock<TimedMutex>(fillLock_[shard].fillLock_);
-  }
-
-  std::unique_lock<TimedMutex> getFillLock(HashedKey hk) {
-    return getFillLockForShard(getShardForKey(hk));
+  /**
+   * Obtains a shared fill lock for the shard.
+   */
+  auto getSharedFillLockForShard(size_t shard) {
+    return std::shared_lock{fillLock_[shard].fillLock_};
   }
 
   void onGetComplete(GetCtx& ctx,
@@ -506,7 +503,8 @@ class NvmCache {
 
   // a map of fill locks for each shard
   struct FillLockStruct {
-    alignas(folly::hardware_destructive_interference_size) TimedMutex fillLock_;
+    alignas(folly::hardware_destructive_interference_size) folly::fibers::
+        TimedRWMutexWritePriority<folly::fibers::GenericBaton> fillLock_;
   };
   std::vector<FillLockStruct> fillLock_;
 
@@ -595,7 +593,7 @@ template <typename C>
 typename NvmCache<C>::DeleteTombStoneGuard NvmCache<C>::createDeleteTombStone(
     HashedKey hk) {
   // lower bits for shard and higher bits for key.
-  const auto shard = hk.keyHash() % numShards_;
+  const auto shard = getShardForKey(hk);
   auto guard = tombstones_[shard].add(hk.key());
 
   // need to synchronize tombstone creations with fill lock to serialize
@@ -615,9 +613,7 @@ typename NvmCache<C>::DeleteTombStoneGuard NvmCache<C>::createDeleteTombStone(
 
 template <typename C>
 bool NvmCache<C>::hasTombStone(HashedKey hk) {
-  // lower bits for shard and higher bits for key.
-  const auto shard = hk.keyHash() % numShards_;
-  return tombstones_[shard].isPresent(hk.key());
+  return tombstones_[getShardForKey(hk)].isPresent(hk.key());
 }
 
 template <typename C>
@@ -635,25 +631,25 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::find(HashedKey hk) {
 
   stats().numNvmGets.inc();
 
-  GetCtx* ctx{nullptr};
-  WriteHandle hdl{nullptr};
-  {
-    auto lock = getFillLockForShard(shard);
+  auto& fillMap = getFillMapForShard(shard);
+
+  auto checkShared =
+      [this, &hk, &shard, &fillMap](
+          typename FillMap::iterator& itOut) -> std::optional<WriteHandle> {
     // do not use the Cache::find() since that will call back into us.
-    hdl = CacheAPIWrapperForNvm<C>::findInternal(cache_, hk.key());
-    if (UNLIKELY(hdl != nullptr)) {
-      if (hdl->isExpired()) {
-        hdl.reset();
-        hdl.markExpired();
+    auto hdlShared = CacheAPIWrapperForNvm<C>::findInternal(cache_, hk.key());
+    if (UNLIKELY(hdlShared != nullptr)) {
+      if (hdlShared->isExpired()) {
+        hdlShared.reset();
+        hdlShared.markExpired();
         stats().numNvmGetMissExpired.inc();
         stats().numNvmGetMissFast.inc();
         stats().numNvmGetMiss.inc();
       }
-      return hdl;
+      return hdlShared;
     }
 
-    auto& fillMap = getFillMapForShard(shard);
-    auto it = fillMap.find(hk.key());
+    itOut = fillMap.find(hk.key());
     // we use async apis for nvmcache operations into navy. async apis for
     // lookups incur additional overheads and thread hops. However, navy can
     // quickly answer negative lookups through a synchronous api. So we try to
@@ -674,11 +670,34 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::find(HashedKey hk) {
     // For concurrent put, if it is already enqueued, its put context already
     // exists. If it is not enqueued yet (in-flight) the above invalidateToken
     // will prevent the put from being enqueued.
-    if (it == fillMap.end() && !putContexts_[shard].hasContexts() &&
+    if (itOut == fillMap.end() && !putContexts_[shard].hasContexts() &&
         !navyCache_->couldExist(hk)) {
       stats().numNvmGetMiss.inc();
       stats().numNvmGetMissFast.inc();
       return WriteHandle{};
+    }
+    return std::nullopt;
+  };
+
+  WriteHandle hdl{nullptr};
+  typename FillMap::iterator it{};
+  GetCtx* ctx{nullptr};
+
+  {
+    // Hot miss path: shared lock, immutable access only
+    auto lock = getSharedFillLockForShard(shard);
+    if (auto hdlShared = checkShared(it)) {
+      return *std::move(hdlShared);
+    }
+    // fallthrough
+  }
+  {
+    // Slow path: exclusive lock
+    auto lock = getFillLockForShard(shard);
+
+    // Recheck miss path under exclusive lock
+    if (auto hdlShared = checkShared(it)) {
+      return *std::move(hdlShared);
     }
 
     hdl = CacheAPIWrapperForNvm<C>::createNvmCacheFillHandle(cache_);
@@ -721,7 +740,7 @@ bool NvmCache<C>::couldExistFast(HashedKey hk) {
     return false;
   }
 
-  auto shard = getShardForKey(hk);
+  const auto shard = getShardForKey(hk);
   // invalidateToken any inflight puts for the same key since we are filling
   // from nvmcache.
   inflightPuts_[shard].invalidateToken(hk.key());
@@ -1153,7 +1172,7 @@ template <typename F>
 typename folly::Expected<typename NvmCache<C>::PutToken,
                          InFlightPuts::PutTokenError>
 NvmCache<C>::createPutToken(folly::StringPiece key, F&& fn) {
-  return inflightPuts_[getShardForKey(key)].tryAcquireToken(
+  return inflightPuts_[getShardForKey(HashedKey{key})].tryAcquireToken(
       key, std::forward<F>(fn));
 }
 
@@ -1205,7 +1224,7 @@ void NvmCache<C>::onGetComplete(GetCtx& ctx,
 
   XDCHECK(it->isNvmClean());
 
-  auto lock = getFillLock(hk);
+  auto lock = getFillLockForShard(getShardForKey(hk));
   if (hasTombStone(hk) || !ctx.isValid()) {
     // a racing remove or evict while we were filling
     stats().numNvmGetMiss.inc();

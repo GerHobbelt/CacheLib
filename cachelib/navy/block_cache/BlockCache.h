@@ -16,15 +16,12 @@
 
 #pragma once
 
-#include <atomic>
-#include <chrono>
 #include <memory>
-#include <stdexcept>
 #include <vector>
 
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
 #include "cachelib/common/AtomicCounter.h"
-#include "cachelib/common/CompilerUtils.h"
+#include "cachelib/common/EventInterface.h"
 #include "cachelib/navy/block_cache/Allocator.h"
 #include "cachelib/navy/block_cache/EvictionPolicy.h"
 #include "cachelib/navy/block_cache/HitsReinsertionPolicy.h"
@@ -32,9 +29,7 @@
 #include "cachelib/navy/block_cache/PercentageReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/RegionManager.h"
 #include "cachelib/navy/common/Device.h"
-#include "cachelib/navy/common/SizeDistribution.h"
 #include "cachelib/navy/engine/Engine.h"
-#include "cachelib/navy/serialization/Serialization.h"
 
 namespace facebook {
 namespace cachelib {
@@ -75,6 +70,8 @@ class BlockCache final : public Engine {
     uint32_t numInMemBuffers{1};
     // whether ItemDestructor is enabled
     bool itemDestructorEnabled{false};
+
+    std::optional<std::reference_wrapper<EventTracker>> eventTracker;
 
     // Maximum number of retry times for in-mem buffer flushing.
     // When exceeding the limit, we will not reschedule any flushing job but
@@ -330,21 +327,19 @@ class BlockCache final : public Engine {
     return regionManager_.toRelative(decodeAbsAddress(code).sub(1)).add(1);
   }
 
-  enum class ReinsertionRes {
-    // Item was reinserted back into the cache
-    kReinserted,
-    // Item was removed by user earlier
-    kRemoved,
-    // Item wasn't eligible for re-insertion and was evicted
-    kEvicted,
-  };
-  ReinsertionRes reinsertOrRemoveItem(HashedKey hk,
-                                      BufferView value,
-                                      uint32_t entrySize,
-                                      RelAddress currAddr);
+  void updateEventTracker(folly::StringPiece key,
+                          AllocatorApiEvent event,
+                          AllocatorApiResult result,
+                          uint32_t size);
+
+  AllocatorApiResult reinsertOrRemoveItem(HashedKey hk,
+                                          BufferView value,
+                                          uint32_t entrySize,
+                                          RelAddress currAddr);
 
   // Removes an entry key from the index.
-  // @return true if the item is successfully removed; false if the item cannot
+  // @return true if the item is successfully removed; false if the item
+  // cannot
   //         be found or was removed earlier.
   bool removeItem(HashedKey hk, RelAddress currAddr);
 
@@ -376,8 +371,8 @@ class BlockCache final : public Engine {
   const bool preciseRemove_{false};
 
   // Index stores offset of the slot *end*. This enables efficient paradigm
-  // "buffer pointer is value pointer", which means value has to be at offset 0
-  // of the slot and header (EntryDescriptor) at the end.
+  // "buffer pointer is value pointer", which means value has to be at offset
+  // 0 of the slot and header (EntryDescriptor) at the end.
   //
   // ----------------------------------------------------
   // |     Value                    |  EntryDescriptor  |
@@ -391,6 +386,7 @@ class BlockCache final : public Engine {
   // It is vital that the reinsertion policy is initialized after index_.
   // Make sure that this class member is defined after index_.
   std::shared_ptr<BlockCacheReinsertionPolicy> reinsertionPolicy_;
+  std::optional<std::reference_wrapper<EventTracker>> eventTracker_;
 
   // thread local counters in synchronized/critical path
   mutable TLCounter lookupCount_;

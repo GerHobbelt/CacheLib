@@ -2539,6 +2539,9 @@ CacheAllocator<CacheTrait>::restoreCCacheManager() {
 
 template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::initCommon(bool dramCacheAttached) {
+  // Initialize aggregate pool stats from config
+  aggregatePoolStats_ = config_.isAggregatePoolStatsEnabled();
+
   if (config_.nvmConfig.has_value()) {
     if (config_.nvmCacheAP) {
       nvmAdmissionPolicy_ = config_.nvmCacheAP;
@@ -2581,6 +2584,11 @@ void CacheAllocator<CacheTrait>::initNvmCache(bool dramCacheAttached) {
                         nvmCacheState_.shouldStartFresh() || shouldDrop;
   if (truncate) {
     nvmCacheState_.markTruncated();
+  }
+
+  auto eventTracker = getEventTracker();
+  if (eventTracker) {
+    config_.nvmConfig->navyConfig.blockCache().setEventTracker(*eventTracker);
   }
 
   nvmCache_ = std::make_unique<NvmCacheT>(*this, *config_.nvmConfig, truncate,
@@ -3820,8 +3828,20 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
 
   unlinkItemForEviction(*candidate);
 
+  // track DRAM eviction and its result
+  auto eventTracker = getEventTracker();
   if (token.isValid() && shouldWriteToNvmCacheExclusive(*candidate)) {
+    if (eventTracker) {
+      eventTracker->record(AllocatorApiEvent::DRAM_EVICT, candidate->getKey(),
+                           AllocatorApiResult::NVM_ADMITTED,
+                           candidate->getSize());
+    }
     nvmCache_->put(*candidate, std::move(token));
+  } else {
+    if (eventTracker) {
+      eventTracker->record(AllocatorApiEvent::DRAM_EVICT, candidate->getKey(),
+                           AllocatorApiResult::EVICTED, candidate->getSize());
+    }
   }
   return {candidate, toRecycle};
 }
@@ -3848,12 +3868,6 @@ CacheAllocator<CacheTrait>::findEviction(PoolId pid, ClassId cid) {
       (*stats_.chainedItemEvictions)[pid][cid].inc();
     } else {
       (*stats_.regularItemEvictions)[pid][cid].inc();
-    }
-
-    if (auto eventTracker = getEventTracker()) {
-      eventTracker->record(AllocatorApiEvent::DRAM_EVICT, candidate->getKey(),
-                           AllocatorApiResult::EVICTED, candidate->getSize(),
-                           candidate->getConfiguredTTL().count());
     }
 
     // check if by releasing the item we intend to, we actually
@@ -4203,16 +4217,7 @@ CacheAllocator<CacheTrait>::findInternalWithExpiration(
   if (UNLIKELY(!handle)) {
     if (needToBumpStats) {
       stats_.numCacheGetMiss.inc();
-    }
-    if (eventTracker) {
-      // If caller issued a regular find and we have nvm-cache enabled,
-      // it is expected a nvm-cache lookup will follow. We don't know
-      // for sure if the lookup will be a hit or miss, so we only record
-      // a NOT_FOUND_IN_MEMORY result for now.
-      if (event == AllocatorApiEvent::FIND && nvmCache_ != nullptr) {
-        eventTracker->record(event, key,
-                             AllocatorApiResult::NOT_FOUND_IN_MEMORY);
-      } else {
+      if (eventTracker) {
         eventTracker->record(event, key, AllocatorApiResult::NOT_FOUND);
       }
     }
@@ -4224,16 +4229,16 @@ CacheAllocator<CacheTrait>::findInternalWithExpiration(
     if (needToBumpStats) {
       stats_.numCacheGetMiss.inc();
       stats_.numCacheGetExpiries.inc();
-    }
-    if (eventTracker) {
-      eventTracker->record(event, key, AllocatorApiResult::EXPIRED);
+      if (eventTracker) {
+        eventTracker->record(event, key, AllocatorApiResult::EXPIRED);
+      }
     }
     WriteHandle ret;
     ret.markExpired();
     return ret;
   }
 
-  if (eventTracker) {
+  if ((eventTracker) && (needToBumpStats)) {
     eventTracker->record(event, key, AllocatorApiResult::FOUND,
                          folly::Optional<uint32_t>(handle->getSize()),
                          handle->getConfiguredTTL().count());

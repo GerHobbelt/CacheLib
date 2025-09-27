@@ -423,6 +423,41 @@ TYPED_TEST(BaseAllocatorTest, ManualRebalanceStrategy) {
   this->testManualRebalanceStrategy();
 }
 
+// Test that when aggregate pool stats is disabled, individual pool stats are
+// reported separately
+TYPED_TEST(BaseAllocatorTest, NonAggregatePoolStats) {
+  this->testNonAggregatePoolStats();
+}
+
+// Test that aggregated pool stats values are correctly calculated as the sum of
+// individual pool stats
+TYPED_TEST(BaseAllocatorTest, AggregatePoolStatsValues) {
+  this->testAggregatePoolStatsValues();
+}
+
+// Test that pool stats are correctly aggregated when pools have different
+// allocation classes
+TYPED_TEST(BaseAllocatorTest, AggregatePoolStatsDiffAC) {
+  this->testAggregatePoolStatsDiffAC();
+}
+
+// Test that eviction age related stats are aggregated correctly
+TYPED_TEST(BaseAllocatorTest, EvictionAgeAggregation) {
+  this->testEvictionAgeAggregation();
+}
+
+// Test that pool aggregation fails gracefully when there are too many distinct
+// allocation classes and falls back to individual pool stats
+TYPED_TEST(BaseAllocatorTest, PoolAggregationWithMaxClasses) {
+  this->testPoolAggregationWithMaxClasses();
+}
+
+// Test that pool aggregation falls back to individual pool stats when only a
+// single pool is present
+TYPED_TEST(BaseAllocatorTest, PoolAggregationWithOnePool) {
+  this->testAggregatePoolStatsSinglePool();
+}
+
 namespace { // the tests that cannot be done by TYPED_TEST.
 
 using LruAllocatorTest = BaseAllocatorTest<LruAllocator>;
