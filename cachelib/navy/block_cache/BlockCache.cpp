@@ -180,8 +180,8 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
   XDCHECK_NE(readBufferSize_, 0u);
 
   legacyEventTracker_ = config.legacyEventTracker;
-  eventTracker_ = config.eventTracker;
 }
+
 std::shared_ptr<BlockCacheReinsertionPolicy> BlockCache::makeReinsertionPolicy(
     const BlockCacheReinsertionConfig& reinsertionConfig) {
   auto hitsThreshold = reinsertionConfig.getHitsThreshold();
@@ -584,6 +584,7 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
         hk, value, entrySize, RelAddress{rid, offset}, desc);
     switch (reinsertionRes) {
     case AllocatorApiResult::EVICTED:
+    case AllocatorApiResult::EXPIRED:
       evictionCount++;
       usedSizeBytes_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
       break;
@@ -593,7 +594,8 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
     default:
       break;
     }
-    if (destructorCb_ && reinsertionRes == AllocatorApiResult::EVICTED) {
+    if (destructorCb_ && (reinsertionRes == AllocatorApiResult::EVICTED ||
+                          reinsertionRes == AllocatorApiResult::EXPIRED)) {
       destructorCb_(hk, value, DestructorEvent::Recycled);
     } else {
       recordEvent(hk.key(), AllocatorApiEvent::NVM_EVICT, reinsertionRes,
@@ -681,19 +683,53 @@ std::optional<uint64_t> BlockCache::onKeyHashRetrievalFromLocation(
     return std::nullopt;
   }
 
-  // We only need to read EntryDesc
-  auto readSize = sizeof(EntryDesc);
+  EntryDesc entryDesc{};
+  uint8_t* entryEnd{nullptr};
+  {
+    SCOPE_EXIT { regionManager_.close(std::move(desc)); };
+    // We only need to read EntryDesc + key. (Key is just for integrity check).
+    // Since we don't know the key size before reading EntryDesc, let's just
+    // read enough buffer to cover most keys. If it's not enough, we can read
+    // more for the key, but that'll be rare cases.
+    auto readSize = std::min(512u, addrEnd.offset());
 
-  auto buffer =
-      regionManager_.read(desc, addrEnd.sub((uint32_t)readSize), readSize);
-  regionManager_.close(std::move(desc));
+    auto buffer = regionManager_.read(desc, addrEnd.sub(readSize), readSize);
+    if (buffer.isNull()) {
+      return std::nullopt;
+    }
 
-  if (buffer.isNull()) {
-    return std::nullopt;
+    entryEnd = buffer.data() + buffer.size();
+    entryDesc = *reinterpret_cast<EntryDesc*>(entryEnd - sizeof(EntryDesc));
+    // check if we have enough buffer read to cover the key
+    if (buffer.size() < sizeof(EntryDesc) + entryDesc.keySize) {
+      // re-read to cover the key. This should be just for the larger keys
+      readSize = sizeof(EntryDesc) + entryDesc.keySize;
+      if (readSize > addrEnd.offset()) {
+        // something's wrong with the key size. It's not within the region
+        // boundary
+        XLOGF(
+            ERR,
+            "Key size {} in item header is crossing the region boundary in "
+            "onKeyHashRetrievalFromLocation(). Region {} is likely corrupted. "
+            "Offset-end: {}, Physical-offset-end: {}, Header size: {}, Header "
+            "(hex): {}",
+            entryDesc.keySize, addrEnd.rid().index(), addrEnd.offset(),
+            regionManager_.physicalOffset(addrEnd), sizeof(EntryDesc),
+            folly::hexlify(
+                folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
+        return std::nullopt;
+      }
+      buffer = regionManager_.read(desc, addrEnd.sub(readSize), readSize);
+      if (buffer.isNull()) {
+        return std::nullopt;
+      }
+
+      // modify the address for these variables accordingly
+      entryEnd = buffer.data() + buffer.size();
+      entryDesc = *reinterpret_cast<EntryDesc*>(entryEnd - sizeof(EntryDesc));
+    }
   }
 
-  auto entryEnd = buffer.data() + buffer.size();
-  auto entryDesc = *reinterpret_cast<EntryDesc*>(entryEnd - sizeof(EntryDesc));
   if (entryDesc.csSelf != entryDesc.computeChecksum()) {
     XLOGF(ERR,
           "Item header checksum mismatch in onKeyHashRetrievalFromLocation(). "
@@ -754,8 +790,9 @@ void BlockCache::recordEvent(folly::StringPiece key,
                              AllocatorApiResult result,
                              uint32_t size,
                              const NvmItem* nvmItem) {
-  if (eventTracker_) {
-    if (!eventTracker_->sampleKey(key)) {
+  auto eventTracker = getEventTracker();
+  if (eventTracker) {
+    if (!eventTracker->sampleKey(key)) {
       return;
     }
     EventInfo eventInfo;
@@ -795,7 +832,7 @@ void BlockCache::recordEvent(folly::StringPiece key,
       }
     }
 
-    eventTracker_->record(eventInfo);
+    eventTracker->record(eventInfo);
   } else if (legacyEventTracker_.has_value()) {
     legacyEventTracker_->get().record(event, key, result, size);
   }
