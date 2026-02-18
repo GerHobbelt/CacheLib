@@ -638,6 +638,79 @@ class MemoryAllocator {
       uint32_t minSize = 72,
       bool reduceFragmentation = false);
 
+  // Generates an optimal set of allocation sizes for a given range of item
+  // sizes. This function creates allocation classes that minimize slab
+  // fragmentation.
+  //
+  // For example: if minItemSize=33904 and maxItemSize=103496 and slab
+  // size=4MB.
+  // 4MB / 33904 ~ 123.71
+  // 4MB / 103496 ~ 40.52
+  // This function will create 83 allocation classes: [aligned(4MB / 40),
+  // aligned(4MB / 41), ..., aligned(4MB / 123)].
+  //
+  //
+  // @param minItemSize  The minimum expected item size in bytes
+  // @param maxItemSize  The maximum expected item size in bytes
+  //
+  // @return  std::set of allocation sizes that optimally cover the item size
+  //          range. Each allocation size is aligned to kAlignment (8 bytes).
+  //
+  // @throw std::invalid_argument if minItemSize > maxItemSize
+  // @throw std::invalid_argument if maxItemSize > Slab::kSize
+  // @throw std::invalid_argument if the optimal number of allocation classes
+  //                              exceeds kMaxClasses
+  static std::set<uint32_t> generateOptimalAllocSizesForItemRange(
+      uint32_t minItemSize, uint32_t maxItemSize);
+  // Checks if a given allocation size is valid for cachelib. A valid
+  // allocation size must satisfy the following requirements:
+  // 1. >= Slab::kMinAllocSize (64 bytes)
+  // 2. <= Slab::kSize (4MB)
+  // 3. Properly aligned to kAlignment (8 bytes)
+  //
+  // @param size  the allocation size to validate
+  //
+  // @return true if the size is valid, false otherwise
+  static bool isValidAllocSize(uint32_t size) {
+    if (size < Slab::kMinAllocSize) {
+      return false;
+    } else if (size > Slab::kSize) {
+      return false;
+    } else if (size % kAlignment != 0) {
+      return false;
+    }
+    return true;
+  }
+
+  // Maximizes the allocation size while maintaining the number of allocations
+  // per slab and alignment. Given a size, this function calculates the maximum
+  // allocation size that maintains the same number of allocations per slab.
+  //
+  // For example: If slabs are 4MB and the input size is 900KB, this allows
+  // 4096KB / 900KB = 4 allocations per slab. This leaves 496KB of space
+  // unusable in each slab. This function returns the maximum allocation size
+  // that still allows 4 allocations per slab but reduces external
+  // fragmentation. For this example, it would return 1MB.
+  //
+  // @param size      the initial allocation size
+  // @param slabSize  the size of a slab
+  // @param alignment the alignment requirement for allocation sizes
+  //
+  // @return the maximum aligned allocation size that maintains the same number
+  // of allocations per slab
+  static uint32_t maximizeAllocSize(uint32_t size,
+                                    uint32_t slabSize,
+                                    uint32_t alignment) {
+    const uint32_t perSlab = slabSize / size;
+    XDCHECK_GT(perSlab, 0ULL);
+    const uint32_t maxAllocSize = slabSize / perSlab;
+    // Align down to maintain same number of allocations per slab
+    const uint32_t alignedSize = maxAllocSize - maxAllocSize % alignment;
+    XDCHECK_EQ(alignedSize % alignment, 0ULL);
+    XDCHECK_EQ(slabSize / alignedSize, perSlab);
+    return alignedSize;
+  }
+
   // calculate the number of slabs to be advised/reclaimed in each pool
   //
   // @param poolIds    list of pools to process

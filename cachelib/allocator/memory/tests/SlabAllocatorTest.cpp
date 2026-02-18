@@ -24,6 +24,7 @@
 #include <random>
 #include <vector>
 
+#include "cachelib/allocator/Util.h"
 #include "cachelib/allocator/memory/SlabAllocator.h"
 #include "cachelib/allocator/memory/tests/TestBase.h"
 #include "cachelib/common/Serialization.h"
@@ -767,6 +768,18 @@ TEST_F(SlabAllocatorTest, TestAlignedSize) {
   }
 }
 
+TEST_F(SlabAllocatorTest, TestAlignedSizeDown) {
+  for (uint32_t i = 57; i <= 63; ++i) {
+    EXPECT_EQ(56, util::getAlignedSizeDown(i, 8));
+  }
+  for (uint32_t i = 65; i <= 71; ++i) {
+    EXPECT_EQ(64, util::getAlignedSizeDown(i, 8));
+  }
+  EXPECT_EQ(64, util::getAlignedSizeDown(64, 8));
+  EXPECT_EQ(0, util::getAlignedSizeDown(0, 8));
+  EXPECT_EQ(0, util::getAlignedSizeDown(7, 8));
+}
+
 TEST_F(SlabAllocatorTest, TestGenerateAllocSizesWithBadFactor) {
   uint32_t minSize = 64;
   uint32_t maxSize = 104;
@@ -779,4 +792,120 @@ TEST_F(SlabAllocatorTest, TestGenerateAllocSizesWithBadFactor) {
   ASSERT_THROW(
       MemoryAllocator::generateAllocSizes(0.90, maxSize, minSize, true),
       std::invalid_argument);
+}
+
+TEST_F(SlabAllocatorTest, TestGenerateAllocSizesPowerOf2) {
+  {
+    auto allocSizes = util::generateAllocSizesPowerOf2(6, 10);
+    std::set<uint32_t> expected = {64, 128, 256, 512, 1024};
+    EXPECT_EQ(expected, allocSizes);
+  }
+
+  {
+    auto allocSizes = util::generateAllocSizesPowerOf2(8, 12);
+    std::set<uint32_t> expected = {256, 512, 1024, 2048, 4096};
+    EXPECT_EQ(expected, allocSizes);
+  }
+
+  {
+    auto allocSizes = util::generateAllocSizesPowerOf2(6, 6);
+    std::set<uint32_t> expected = {64};
+    EXPECT_EQ(expected, allocSizes);
+  }
+
+  {
+    auto allocSizes = util::generateAllocSizesPowerOf2(Slab::kMinAllocPower,
+                                                       Slab::kNumSlabBits);
+    EXPECT_EQ(Slab::kMinAllocSize, *allocSizes.begin());
+    EXPECT_EQ(Slab::kSize, *allocSizes.rbegin());
+    EXPECT_EQ(17u, allocSizes.size());
+  }
+}
+
+TEST_F(SlabAllocatorTest, TestGenerateAllocSizesPowerOf2WithBadParams) {
+  ASSERT_THROW(util::generateAllocSizesPowerOf2(10, Slab::kMinAllocPower),
+               std::invalid_argument);
+
+  ASSERT_THROW(util::generateAllocSizesPowerOf2(Slab::kMinAllocPower - 1, 10),
+               std::invalid_argument);
+
+  ASSERT_THROW(util::generateAllocSizesPowerOf2(Slab::kMinAllocPower,
+                                                Slab::kNumSlabBits + 1),
+               std::invalid_argument);
+}
+
+TEST_F(SlabAllocatorTest, TestGenerateAllocSizesForItemRange) {
+  auto expectAllAllocSizesValid = [](const std::set<uint32_t>& allocSizes) {
+    for (auto allocSize : allocSizes) {
+      EXPECT_TRUE(MemoryAllocator::isValidAllocSize(allocSize));
+    }
+  };
+
+  {
+    auto allocSizes = MemoryAllocator::generateOptimalAllocSizesForItemRange(
+        Slab::kSize / 4, Slab::kSize);
+    EXPECT_EQ(allocSizes.size(), 4u);
+    EXPECT_NE(allocSizes.find(Slab::kSize), allocSizes.end());
+    EXPECT_NE(allocSizes.find(Slab::kSize / 4), allocSizes.end());
+    EXPECT_NE(allocSizes.find(Slab::kSize / 2), allocSizes.end());
+    EXPECT_NE(allocSizes.find(1398096), allocSizes.end());
+    expectAllAllocSizesValid(allocSizes);
+  }
+
+  {
+    auto allocSizes =
+        MemoryAllocator::generateOptimalAllocSizesForItemRange(500, 500);
+    EXPECT_EQ(allocSizes.size(), 1u);
+    EXPECT_EQ(*allocSizes.begin(), 504);
+    expectAllAllocSizesValid(allocSizes);
+  }
+
+  {
+    auto allocSizes = MemoryAllocator::generateOptimalAllocSizesForItemRange(
+        Slab::kSize, Slab::kSize);
+    EXPECT_EQ(allocSizes.size(), 1u);
+    EXPECT_EQ(*allocSizes.begin(), Slab::kSize);
+    expectAllAllocSizesValid(allocSizes);
+  }
+
+  {
+    auto allocSizes =
+        MemoryAllocator::generateOptimalAllocSizesForItemRange(33904, 103496);
+    EXPECT_FALSE(allocSizes.empty());
+    expectAllAllocSizesValid(allocSizes);
+  }
+
+  {
+    auto allocSizes =
+        MemoryAllocator::generateOptimalAllocSizesForItemRange(32, 40);
+    EXPECT_EQ(allocSizes.size(), 1u);
+    EXPECT_EQ(*allocSizes.begin(), Slab::kMinAllocSize);
+    expectAllAllocSizesValid(allocSizes);
+  }
+
+  {
+    auto allocSizes =
+        MemoryAllocator::generateOptimalAllocSizesForItemRange(64, 128);
+    EXPECT_EQ(allocSizes.size(), 9u);
+    for (int i = 64; i <= 128; i += 8) {
+      EXPECT_NE(allocSizes.find(i), allocSizes.end());
+    }
+    expectAllAllocSizesValid(allocSizes);
+  }
+}
+
+TEST_F(SlabAllocatorTest, TestGenerateAllocSizesForItemRangeWithBadParams) {
+  // min size larger than max size
+  ASSERT_THROW(
+      MemoryAllocator::generateOptimalAllocSizesForItemRange(1000, 100),
+      std::invalid_argument);
+
+  // max size larger than slab size
+  ASSERT_THROW(MemoryAllocator::generateOptimalAllocSizesForItemRange(
+                   100, Slab::kSize + 1),
+               std::invalid_argument);
+
+  // requires too many allocation classes
+  ASSERT_THROW(MemoryAllocator::generateOptimalAllocSizesForItemRange(64, 2048),
+               std::runtime_error);
 }

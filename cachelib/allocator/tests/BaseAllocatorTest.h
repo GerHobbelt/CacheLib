@@ -1554,7 +1554,9 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       ASSERT_EQ(AllocatorT::ShutDownStatus::kSuccess, alloc.shutDown());
     }
     testShmIsNotRemoved(config);
-    { ASSERT_NO_THROW(AllocatorT alloc(AllocatorT::SharedMemAttach, config)); }
+    {
+      ASSERT_NO_THROW(AllocatorT alloc(AllocatorT::SharedMemAttach, config));
+    }
   }
 
   void testSerialization() {
@@ -3298,6 +3300,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
   // but they are still held by the user.
   void testRebalancingWithItemsAlreadyRemoved() {
     typename AllocatorT::Config config{};
+    config.setSlabRebalanceTimeout(std::chrono::milliseconds(0));
     config.setCacheSize(10 * Slab::kSize);
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
@@ -3355,6 +3358,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     typename AllocatorT::Config config;
     config.enableCachePersistence(this->cacheDir_);
     config.setCacheSize(size);
+    config.setSlabRebalanceTimeout(std::chrono::milliseconds(0));
     {
       std::vector<typename AllocatorT::ReadHandle> handles;
       AllocatorT alloc(AllocatorT::SharedMemNew, config);
@@ -4141,6 +4145,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     // start with no reaper
     config.reaperInterval = std::chrono::seconds(0);
     config.setCacheSize(numSlabs * Slab::kSize);
+    config.setSlabRebalanceTimeout(std::chrono::milliseconds(0));
 
     AllocatorT allocator(config);
     const size_t numBytes = allocator.getCacheMemoryStats().ramCacheSize;
@@ -6197,7 +6202,9 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
     auto poolId = alloc.addPool("default", numBytes);
-    { auto handle = alloc.allocate(poolId, "test", 100); }
+    {
+      auto handle = alloc.allocate(poolId, "test", 100);
+    }
     EXPECT_EQ(false, isRemoveCbTriggered);
     {
       auto handle = alloc.allocate(poolId, "test", 100);
@@ -6243,6 +6250,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     config.setCacheSize(3 * Slab::kSize);
     config.setSlabReleaseStuckThreashold(
         std::chrono::seconds(releaseStuckThreshold));
+    config.setSlabRebalanceTimeout(std::chrono::milliseconds(0));
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
     auto poolId = alloc.addPool("foobar", numBytes);
@@ -6297,6 +6305,110 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     handle2.reset();
     r2.wait();
     ASSERT_EQ(0, alloc.getSlabReleaseStats().numSlabReleaseStuck);
+  }
+
+  void testSlabReleaseTimeoutHelper(unsigned int slabRebalanceTimeoutSecs,
+                                    bool shouldTimeout) {
+    typename AllocatorT::Config config{};
+    config.setCacheSize(3 * Slab::kSize);
+    config.setSlabRebalanceTimeout(
+        std::chrono::milliseconds(slabRebalanceTimeoutSecs * 1000));
+    AllocatorT alloc(config);
+    const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
+    auto poolId = alloc.addPool("foobar", numBytes);
+
+    // 3/4 * kSize to make sure items are allocated in different slabs
+    std::vector<uint32_t> sizes = {Slab::kSize * 3 / 4};
+
+    // Allocate two items to be used for tests
+    auto handle1 = util::allocateAccessible(alloc, poolId, "key1", sizes[0]);
+    ASSERT_NE(nullptr, handle1);
+
+    auto handle2 = util::allocateAccessible(alloc, poolId, "key2", sizes[0]);
+    ASSERT_NE(nullptr, handle2);
+
+    const uint8_t classId = alloc.getAllocInfo(handle1->getMemory()).classId;
+    ASSERT_EQ(classId, alloc.getAllocInfo(handle2->getMemory()).classId);
+
+    // Assert that numAbortedSlabReleases is not set initially
+    ASSERT_EQ(0, alloc.getSlabReleaseStats().numAbortedSlabReleases);
+    ASSERT_EQ(0, alloc.getGlobalCacheStats().numAbortedSlabReleases);
+
+    // Get initial count for verification of successful slab releases
+    uint64_t initialRebalanceCount =
+        alloc.getSlabReleaseStats().numSlabReleaseForRebalance;
+
+    // Helper lambda to start a slab release operation with appropriate
+    // assertions
+    auto startSlabRelease = [&](const void* hint) {
+      return std::async(std::launch::async, [&, hint] {
+        if (shouldTimeout) {
+          ASSERT_THROW(alloc.releaseSlab(poolId, classId,
+                                         SlabReleaseMode::kRebalance, hint),
+                       exception::SlabReleaseAborted);
+        } else {
+          ASSERT_NO_THROW(alloc.releaseSlab(poolId, classId,
+                                            SlabReleaseMode::kRebalance, hint));
+        }
+      });
+    };
+
+    // Determine sleep duration based on timeout setting
+    // Need to sleep longer than timeout to trigger abort, or just 1 sec if no
+    // timeout
+    unsigned int sleepDuration =
+        shouldTimeout ? (2 + slabRebalanceTimeoutSecs) : 1;
+
+    // Start first slab release operation (will be blocked by handle1)
+    auto r1 = startSlabRelease(handle1->getMemory());
+    /* sleep override */ sleep(sleepDuration);
+
+    // Check expected abort count after first sleep
+    unsigned int expectedAborts = shouldTimeout ? 1 : 0;
+    ASSERT_EQ(expectedAborts,
+              alloc.getSlabReleaseStats().numAbortedSlabReleases);
+    ASSERT_EQ(expectedAborts,
+              alloc.getGlobalCacheStats().numAbortedSlabReleases);
+
+    // Start second slab release operation (will be blocked by handle2)
+    auto r2 = startSlabRelease(handle2->getMemory());
+
+    // Sleep again and check abort count
+    /* sleep override */ sleep(sleepDuration);
+    expectedAborts = shouldTimeout ? 2 : 0;
+    ASSERT_EQ(expectedAborts,
+              alloc.getSlabReleaseStats().numAbortedSlabReleases);
+    ASSERT_EQ(expectedAborts,
+              alloc.getGlobalCacheStats().numAbortedSlabReleases);
+
+    // Release handles to allow operations to complete
+    handle1.reset();
+    r1.wait();
+
+    handle2.reset();
+    r2.wait();
+
+    // Final verification: abort count should remain the same
+    ASSERT_EQ(expectedAborts,
+              alloc.getSlabReleaseStats().numAbortedSlabReleases);
+    ASSERT_EQ(expectedAborts,
+              alloc.getGlobalCacheStats().numAbortedSlabReleases);
+
+    // When not timing out, verify slab releases actually completed successfully
+    if (!shouldTimeout) {
+      ASSERT_EQ(initialRebalanceCount + 2,
+                alloc.getSlabReleaseStats().numSlabReleaseForRebalance);
+    }
+  }
+
+  void testSlabReleaseTimeout() {
+    // 5 seconds timeout, should abort
+    testSlabReleaseTimeoutHelper(5, true);
+  }
+
+  void testSlabReleaseTimeoutZero() {
+    // 0 = no timeout, should not abort
+    testSlabReleaseTimeoutHelper(0, false);
   }
 
   void testRateMap() {

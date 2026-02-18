@@ -1181,6 +1181,11 @@ class CacheAllocator : public CacheBase {
   // get stats related to all kinds of slab release events.
   SlabReleaseStats getSlabReleaseStats() const noexcept override final;
 
+  // Increment the number of aborted slab releases stat
+  void incrementAbortedSlabReleases() override final {
+    stats_.numAbortedSlabReleases.inc();
+  }
+
   // return the distribution of the keys in the cache. This is expensive to
   // compute at times even with caching. So use with caution.
   // TODO think of a way to abstract this since it only makes sense for
@@ -3208,7 +3213,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
   if (it.isChainedItem()) {
     if (toRecycle) {
       throw std::runtime_error(
-          folly::sformat("Can not recycle a chained item {}, toRecyle",
+          folly::sformat("Can not recycle a chained item {}, toRecycle {}",
                          it.toString(), toRecycle->toString()));
     }
 
@@ -4963,10 +4968,10 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
 
     allocator_->completeSlabRelease(releaseContext);
   } catch (const exception::SlabReleaseAborted& e) {
-    stats_.numAbortedSlabReleases.inc();
+    incrementAbortedSlabReleases();
     throw exception::SlabReleaseAborted(folly::sformat(
         "Slab release aborted while releasing "
-        "a slab in pool {} victim {} receiver {}. Original ex msg: ",
+        "a slab in pool {} victim {} receiver {}. Original ex msg: {}",
         pid, static_cast<int>(victim), static_cast<int>(receiver), e.what()));
   }
 }
@@ -4987,7 +4992,8 @@ SlabReleaseStats CacheAllocator<CacheTrait>::getSlabReleaseStats()
                           stats_.numMoveSuccesses.get(),
                           stats_.numEvictionAttempts.get(),
                           stats_.numEvictionSuccesses.get(),
-                          stats_.numSlabReleaseStuck.get()};
+                          stats_.numSlabReleaseStuck.get(),
+                          stats_.numAbortedSlabReleases.get()};
 }
 
 template <typename CacheTrait>
@@ -5288,7 +5294,7 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     });
   };
 
-  auto startTime = util::getCurrentTimeSec();
+  auto startTime = util::getCurrentTimeMs();
   while (true) {
     allocator_->processAllocForRelease(ctx, alloc, fn);
 
@@ -5312,12 +5318,27 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
                          static_cast<Item*>(alloc)->toString(), ctx.getPoolId(),
                          ctx.getClassId()));
     }
+
+    if (config_.slabRebalanceTimeout.count() > 0) {
+      auto elapsedTime = util::getCurrentTimeMs() - startTime;
+      if (elapsedTime >
+          static_cast<uint64_t>(config_.slabRebalanceTimeout.count())) {
+        allocator_->abortSlabRelease(ctx);
+        throw exception::SlabReleaseAborted(
+            folly::sformat("Slab Release aborted after {} ms while still"
+                           " trying to mark as moving for Item: {}. Pool: {},"
+                           " Class: {}.",
+                           elapsedTime, static_cast<Item*>(alloc)->toString(),
+                           ctx.getPoolId(), ctx.getClassId()));
+      }
+    }
+
     stats_.numMoveAttempts.inc();
     throttleWith(throttler, [&] {
       XLOGF(WARN,
             "Spent {} seconds, slab release still trying to mark as moving for "
             "Item: {}. Pool: {}, Class: {}.",
-            util::getCurrentTimeSec() - startTime,
+            (util::getCurrentTimeMs() - startTime) / 1000,
             static_cast<Item*>(alloc)->toString(), ctx.getPoolId(),
             ctx.getClassId());
     });
