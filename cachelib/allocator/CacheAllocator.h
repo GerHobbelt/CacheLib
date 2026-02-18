@@ -1159,6 +1159,11 @@ class CacheAllocator : public CacheBase {
     stats_.numAbortedSlabReleases.inc();
   }
 
+  // Check if shutdown is in progress
+  bool isShutdownInProgress() const override final {
+    return shutDownInProgress_.load();
+  }
+
   // return the distribution of the keys in the cache. This is expensive to
   // compute at times even with caching. So use with caution.
   // TODO think of a way to abstract this since it only makes sense for
@@ -5008,17 +5013,22 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
                                              const void* hint) {
   stats_.numActiveSlabReleases.inc();
   SCOPE_EXIT { stats_.numActiveSlabReleases.dec(); };
-  switch (mode) {
-  case SlabReleaseMode::kRebalance:
-    stats_.numReleasedForRebalance.inc();
-    break;
-  case SlabReleaseMode::kResize:
-    stats_.numReleasedForResize.inc();
-    break;
-  case SlabReleaseMode::kAdvise:
-    stats_.numReleasedForAdvise.inc();
-    break;
-  }
+
+  auto incReleaseStats = [this, mode]() {
+    switch (mode) {
+    case SlabReleaseMode::kRebalance:
+      stats_.numReleasedForRebalance.inc();
+      break;
+    case SlabReleaseMode::kResize:
+      stats_.numReleasedForResize.inc();
+      break;
+    case SlabReleaseMode::kAdvise:
+      stats_.numReleasedForAdvise.inc();
+      break;
+    default:
+      break;
+    }
+  };
 
   try {
     auto releaseContext = allocator_->startSlabRelease(
@@ -5027,6 +5037,7 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
 
     // No work needed if the slab is already released
     if (releaseContext.isReleased()) {
+      incReleaseStats();
       return;
     }
 
@@ -5039,6 +5050,7 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
     }
 
     allocator_->completeSlabRelease(releaseContext);
+    incReleaseStats();
   } catch (const exception::SlabReleaseAborted& e) {
     incrementAbortedSlabReleases();
     throw exception::SlabReleaseAborted(folly::sformat(
@@ -5382,7 +5394,7 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     // when checking with the AllocationClass
     itemFreed = true;
 
-    if (shutDownInProgress_) {
+    if (isShutdownInProgress()) {
       allocator_->abortSlabRelease(ctx);
       throw exception::SlabReleaseAborted(
           folly::sformat("Slab Release aborted while still trying to mark"

@@ -175,6 +175,10 @@ class BigHashProtoImpl final : public BigHashProto {
     hashTableBitSize_ = hashTableBitSize;
   }
 
+  void setNumMutexesPower(uint8_t numMutexesPower) override {
+    config_.numMutexesPower = numMutexesPower;
+  }
+
   void setDevice(Device* device) { config_.device = device; }
 
   void setDestructorCb(DestructorCallback cb) {
@@ -204,12 +208,6 @@ class EnginePairProtoImpl final : public EnginePairProto {
  public:
   EnginePairProtoImpl() = default;
   ~EnginePairProtoImpl() override = default;
-  EnginePairProtoImpl(EnginePairProtoImpl&& proto) noexcept {
-    bigHashProto_ = std::move(proto.bigHashProto_);
-    blockCacheProto_ = std::move(proto.blockCacheProto_);
-    smallItemMaxSize_ = proto.smallItemMaxSize_;
-    name_ = std::move(proto.name_);
-  }
 
   void setBigHash(std::unique_ptr<BigHashProto> proto,
                   uint32_t smallItemMaxSize) override {

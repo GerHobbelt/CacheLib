@@ -202,11 +202,20 @@ void MemoryMonitor::checkPoolsAndAdviseReclaim() {
 
         } catch (const exception::SlabReleaseAborted& e) {
           cache_.incrementAbortedSlabReleases();
+          // Check if this is due to shutdown or timeout
+          if (cache_.isShutdownInProgress()) {
+            XLOGF(WARN,
+                  "Shutdown in progress, aborting slab advise from pool {} for"
+                  " allocation class {}. Error: {}",
+                  static_cast<int>(poolId), static_cast<int>(classId),
+                  e.what());
+            return;
+          }
+          // It's a timeout, log and continue with next slab
           XLOGF(WARN,
-                "Aborted trying to advise away a slab from pool {} for"
-                " allocation class {}. Error: {}",
+                "Timeout while advising slab from pool {} for allocation class"
+                " {}. Continuing with remaining slabs. Error: {}",
                 static_cast<int>(poolId), static_cast<int>(classId), e.what());
-          return;
         } catch (const std::exception& e) {
           XLOGF(
               CRITICAL,
@@ -215,7 +224,6 @@ void MemoryMonitor::checkPoolsAndAdviseReclaim() {
               static_cast<int>(poolId), static_cast<int>(classId), e.what());
         }
       }
-      slabsAdvised_ += slabsAdvised;
       XLOGF(DBG, "Advised away {} slabs from Pool ID: {}, to free {} bytes",
             slabsAdvised, static_cast<int>(poolId), slabsAdvised * Slab::kSize);
     }
@@ -231,7 +239,6 @@ void MemoryMonitor::checkPoolsAndAdviseReclaim() {
           "Reclaimed {} of {} slabs for Pool ID: {}, to grow cache by {} bytes",
           slabsReclaimed, slabsToReclaim, static_cast<int>(poolId),
           slabsReclaimed * Slab::kSize);
-      slabsReclaimed_ += slabsReclaimed;
     }
   }
 }
@@ -306,7 +313,7 @@ void MemoryMonitor::reclaimSlabs() {
   }
   XLOGF(DBG, "Reclaiming {} slabs to increase cache size by {} bytes",
         slabsToReclaim, slabsToReclaim * Slab::kSize);
-  updateNumSlabsToAdvise(-slabsToReclaim);
+  updateNumSlabsToAdvise(-static_cast<int32_t>(slabsToReclaim));
 }
 
 RateLimiter::RateLimiter(bool detectIncrease)
