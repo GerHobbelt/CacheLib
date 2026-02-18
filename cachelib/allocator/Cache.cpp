@@ -475,6 +475,10 @@ void CacheBase::updateGlobalCacheStats(const std::string& statPrefix) const {
                    statPrefix + "nvm.insert.latency_us");
     visitEstimates(uploadStatsNanoToMicro, stats.nvmRemoveLatencyNs,
                    statPrefix + "nvm.remove.latency_us");
+    visitEstimates(uploadStatsNanoToMicro, stats.nvmMakeBlobCbLatencyNs,
+                   statPrefix + "nvm.make_blob_cb.latency_us");
+    visitEstimates(uploadStatsNanoToMicro, stats.nvmMakeObjCbLatencyNs,
+                   statPrefix + "nvm.make_obj_cb.latency_us");
     visitEstimates(uploadStats, stats.nvmPutSize,
                    statPrefix + "nvm.incoming_item_size_bytes");
 
@@ -629,6 +633,29 @@ void CacheBase::setEventTracker(EventTracker::Config&& config) {
 
 std::shared_ptr<EventTracker> CacheBase::getEventTracker() const {
   return eventTracker_.load();
+}
+
+void CacheBase::setEventTrackerSamplingRate(uint32_t samplingRate) {
+  if (auto eventTracker = getEventTracker()) {
+    XLOG(INFO) << "Attempting to set sampling rate to " << samplingRate
+               << " for event tracker.";
+    eventTracker->setSamplingRate(samplingRate);
+    XLOG(INFO) << "EventTracker sampling rate is "
+               << eventTracker->getSamplingRate();
+  } else {
+    XLOG(INFO) << "Event tracker is not enabled. "
+                  "Setting EventTracker sampling rate to "
+               << samplingRate << " will have no effect.";
+  }
+}
+
+void CacheBase::disableEventTracker() {
+  if (auto eventTracker = getEventTracker()) {
+    XLOG(INFO) << "Disabling event tracker. Setting eventTracker_ to nullptr.";
+    eventTracker_.store(nullptr);
+  } else {
+    XLOG(INFO) << "Event tracker is already disabled.";
+  }
 }
 
 } // namespace facebook::cachelib

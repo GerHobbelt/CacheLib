@@ -4006,7 +4006,6 @@ bool CacheAllocator<CacheTrait>::shouldWriteToNvmCache(const Item& item) {
   }
   return true;
 }
-
 template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::shouldWriteToNvmCacheExclusive(
     const Item& item) {
@@ -4014,12 +4013,14 @@ bool CacheAllocator<CacheTrait>::shouldWriteToNvmCacheExclusive(
 
   if (nvmAdmissionPolicy_) {
     AllocatorApiResult admissionResult = AllocatorApiResult::ACCEPTED;
-    if (!nvmAdmissionPolicy_->accept(item, chainedItemRange)) {
+    const bool accepted = nvmAdmissionPolicy_->accept(item, chainedItemRange);
+    if (!accepted) {
       admissionResult = AllocatorApiResult::REJECTED;
       stats_.numNvmRejectsByAP.inc();
-      return false;
     }
-    recordEvent(AllocatorApiEvent::NVM_ADMIT, item.getKey(), admissionResult);
+    recordEvent(AllocatorApiEvent::NVM_ADMIT, item.getKey(), admissionResult,
+                &item);
+    return accepted;
   }
 
   return true;
@@ -4299,7 +4300,7 @@ CacheAllocator<CacheTrait>::findInternalWithExpiration(
   XDCHECK(event == AllocatorApiEvent::FIND ||
           event == AllocatorApiEvent::FIND_FAST ||
           event == AllocatorApiEvent::PEEK)
-      << toString(event);
+      << magic_enum::enum_name(event);
 
   auto handle = findInternal(key);
   if (UNLIKELY(!handle)) {
@@ -4470,14 +4471,16 @@ CacheAllocator<CacheTrait>::getSampleItem() {
   }
 
   // Sampling from DRAM cache
-  auto item = reinterpret_cast<const Item*>(allocator_->getRandomAlloc());
+  auto [allocSize, rawItem] = allocator_->getRandomAlloc();
+  auto item = reinterpret_cast<const Item*>(rawItem);
   if (!item || UNLIKELY(item->isExpired())) {
     return SampleItem{false /* fromNvm */};
   }
 
   // Check that item returned is the same that was sampled
 
-  auto sharedHdl = std::make_shared<ReadHandle>(findInternal(item->getKey()));
+  auto sharedHdl =
+      std::make_shared<ReadHandle>(findInternal(item->getKeySized(allocSize)));
   if (sharedHdl->get() != item) {
     return SampleItem{false /* fromNvm */};
   }

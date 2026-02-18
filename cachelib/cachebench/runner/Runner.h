@@ -20,7 +20,6 @@
 
 #include <string>
 
-#include "cachelib/cachebench/runner/ProgressTracker.h"
 #include "cachelib/cachebench/runner/Stressor.h"
 #include "cachelib/cachebench/util/Config.h"
 
@@ -32,10 +31,11 @@ namespace cachebench {
 // instance.
 class Runner {
  public:
+  // @param instanceId            the id of the runner/stressor instance
   // @param config                the configuration for the cachebench run. This
   //                              contains both the stressor configuration and
   //                              the cache configuration.
-  Runner(const CacheBenchConfig& config);
+  Runner(size_t instanceId, const CacheBenchConfig& config);
 
   // @param progressInterval    the interval at which periodic progress of the
   //                            benchmark run is reported/tracked.
@@ -58,11 +58,25 @@ class Runner {
     }
   }
 
+  // Get run stats. Must only be called after run() has returned.
+  const Stats& getCacheStats() const { return cacheStats_; }
+  const ThroughputStats& getThroughputStats() const { return opsStats_; }
+  uint64_t getTestDurationNs() const { return durationNs_; }
+
  private:
+  // id of the stressor instance
+  size_t instanceId_;
   // instance of the stressor.
   std::unique_ptr<Stressor> stressor_;
 
   bool aborted_{false};
+
+  // Stats captured after run() completes
+  Stats cacheStats_;
+  ThroughputStats opsStats_;
+  uint64_t durationNs_{0};
+
+  bool render(std::ostream& os);
 };
 } // namespace cachebench
 } // namespace cachelib
