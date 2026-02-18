@@ -18,6 +18,8 @@
 
 #include <folly/fibers/ForEach.h>
 
+#include "cachelib/common/Profiled.h"
+
 namespace facebook {
 namespace cachelib {
 namespace navy {
@@ -107,7 +109,7 @@ void NavyRequestScheduler::enqueueWithKey(Job job,
   // Allow one request can be outstanding per shard by spooling requests
   // if there is another request already running
   const auto shard = req->getKey() % numShards_;
-  std::lock_guard<TimedMutex> l(mutexes_[shard]);
+  std::lock_guard l(mutexes_[shard]);
   if (shouldSpool_[shard]) {
     pendingReqs_[shard].emplace_back(std::move(req));
     numSpooled_.inc();
@@ -122,7 +124,7 @@ void NavyRequestScheduler::enqueueWithKey(Job job,
 // Notify completion of the request
 void NavyRequestScheduler::notifyCompletion(uint64_t key) {
   const auto shard = key % numShards_;
-  std::lock_guard<TimedMutex> l(mutexes_[shard]);
+  std::lock_guard l(mutexes_[shard]);
   if (pendingReqs_[shard].empty()) {
     shouldSpool_[shard] = false;
     return;
@@ -214,7 +216,9 @@ void NavyRequestScheduler::checkHealth(
 
     funcs.emplace_back([i, &healthy, &dispatchers]() {
       auto& dispatcher = dispatchers[i];
-      auto baton = std::make_shared<folly::fibers::Baton>();
+      auto baton =
+          std::make_shared<trace::Profiled<folly::fibers::Baton,
+                                           "cachelib:navy:check_health">>();
       // Check the loop time of the eventbase by pushing a dummy task
       dispatcher->addTaskRemote([bat = baton]() { bat->post(); });
 

@@ -301,7 +301,7 @@ std::unordered_map<MutexType, std::pair<Stats, std::string>, EnumHash> stats = {
 };
 
 BENCHMARK(SharedMutexBuckets) {
-  runBench<facebook::cachelib::SharedMutexBuckets>(
+  runBench<facebook::cachelib::RWBucketLocks<folly::SharedMutex>>(
       stats[MutexType::kSharedMutexBuckets].first);
 }
 
@@ -317,7 +317,7 @@ int main(int argc, char** argv) {
   gLoadInfo = {FLAGS_reads, FLAGS_writes};
 
   if (FLAGS_num_threads == 0) {
-    FLAGS_num_threads = folly::hardware_concurrency();
+    FLAGS_num_threads = folly::available_concurrency();
     if (FLAGS_num_threads == 0) {
       FLAGS_num_threads = 32;
     }

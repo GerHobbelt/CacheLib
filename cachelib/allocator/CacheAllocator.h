@@ -2360,7 +2360,8 @@ class CacheAllocator : public CacheBase {
   friend ChainedAllocs;
   friend WritableChainedAllocs;
   // ensure any modification to a chain of chained items are synchronized
-  using ChainedItemLock = facebook::cachelib::SharedMutexBuckets;
+  using ChainedItemLock = RWBucketLocks<
+      trace::Profiled<folly::SharedMutex, "cachelib:chained_item">>;
   ChainedItemLock chainedItemLocks_;
 
   // nvmCache
@@ -2675,7 +2676,7 @@ void CacheAllocator<CacheTrait>::initNvmCache(bool dramCacheAttached) {
   auto eventTracker = getEventTracker();
   if (eventTracker) {
     XLOG(INFO) << "Set event tracker in block cache.";
-    config_.nvmConfig->navyConfig.blockCache().setEventTracker(*eventTracker);
+    config_.nvmConfig->navyConfig.blockCache().setEventTracker(eventTracker);
   } else if (legacyEventTracker) {
     XLOG(INFO) << "Set legacy event tracker in block cache.";
     config_.nvmConfig->navyConfig.blockCache().setLegacyEventTracker(
@@ -3590,8 +3591,9 @@ CacheAllocator<CacheTrait>::insertOrReplace(const WriteHandle& handle) {
   insertInMMContainer(*(handle.getInternal()));
   WriteHandle replaced;
   try {
-    auto lock = nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
-                          : std::unique_lock<TimedMutex>();
+    auto lock =
+        nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
+                  : std::unique_lock<typename NvmCacheT::ItemDestructorMutex>();
 
     replaced = accessContainer_->insertOrReplace(*(handle.getInternal()));
 
@@ -3610,7 +3612,10 @@ CacheAllocator<CacheTrait>::insertOrReplace(const WriteHandle& handle) {
 
   // Remove from LRU as well if we do have a handle of old item
   if (replaced) {
+    stats_.numInsertOrReplaceReplaced.inc();
     removeFromMMContainer(*replaced);
+  } else {
+    stats_.numInsertOrReplaceInserted.inc();
   }
 
   if (UNLIKELY(nvmCache_ != nullptr)) {
@@ -4002,10 +4007,14 @@ bool CacheAllocator<CacheTrait>::shouldWriteToNvmCacheExclusive(
     const Item& item) {
   auto chainedItemRange = viewAsChainedAllocsRange(item);
 
-  if (nvmAdmissionPolicy_ &&
-      !nvmAdmissionPolicy_->accept(item, chainedItemRange)) {
-    stats_.numNvmRejectsByAP.inc();
-    return false;
+  if (nvmAdmissionPolicy_) {
+    AllocatorApiResult admissionResult = AllocatorApiResult::ACCEPTED;
+    if (!nvmAdmissionPolicy_->accept(item, chainedItemRange)) {
+      admissionResult = AllocatorApiResult::REJECTED;
+      stats_.numNvmRejectsByAP.inc();
+      return false;
+    }
+    recordEvent(AllocatorApiEvent::NVM_ADMIT, item.getKey(), admissionResult);
   }
 
   return true;
@@ -4151,8 +4160,9 @@ CacheAllocator<CacheTrait>::removeImpl(HashedKey hk,
                                        bool recordApiEvent) {
   bool success = false;
   {
-    auto lock = nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
-                          : std::unique_lock<TimedMutex>();
+    auto lock =
+        nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
+                  : std::unique_lock<typename NvmCacheT::ItemDestructorMutex>();
 
     success = accessContainer_->remove(item);
 

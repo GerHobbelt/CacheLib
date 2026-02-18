@@ -25,9 +25,7 @@
 #include "cachelib/common/EventInterface.h"
 #include "cachelib/navy/block_cache/Allocator.h"
 #include "cachelib/navy/block_cache/EvictionPolicy.h"
-#include "cachelib/navy/block_cache/HitsReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/Index.h"
-#include "cachelib/navy/block_cache/PercentageReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/RegionManager.h"
 #include "cachelib/navy/common/Device.h"
 #include "cachelib/navy/engine/Engine.h"
@@ -74,7 +72,7 @@ class BlockCache final : public Engine {
     std::optional<std::reference_wrapper<LegacyEventTracker>>
         legacyEventTracker;
 
-    std::optional<std::reference_wrapper<EventTracker>> eventTracker;
+    std::shared_ptr<EventTracker> eventTracker;
 
     // Maximum number of retry times for in-mem buffer flushing.
     // When exceeding the limit, we will not reschedule any flushing job but
@@ -269,11 +267,11 @@ class BlockCache final : public Engine {
   // the performance point of view, but makes sense to track them for perf:
   // especially portion on CPU time spent in std::memcpy.
   // @param addr        Address to write this entry into
-  // @param slotSize    Number of bytes this entry will take up on the device
+  // @param size        Number of bytes this entry will take up on the device
   // @param hk          Key of the entry
   // @param value       Payload of the entry
   Status writeEntry(RelAddress addr,
-                    uint32_t slotSize,
+                    uint32_t size,
                     HashedKey hk,
                     BufferView value);
   // @param readDesc      Descriptor for reading. This must be valid
@@ -398,7 +396,7 @@ class BlockCache final : public Engine {
   // Make sure that this class member is defined after index_.
   std::shared_ptr<BlockCacheReinsertionPolicy> reinsertionPolicy_;
   std::optional<std::reference_wrapper<LegacyEventTracker>> legacyEventTracker_;
-  std::optional<std::reference_wrapper<EventTracker>> eventTracker_;
+  std::shared_ptr<EventTracker> eventTracker_;
 
   // thread local counters in synchronized/critical path
   mutable TLCounter lookupCount_;

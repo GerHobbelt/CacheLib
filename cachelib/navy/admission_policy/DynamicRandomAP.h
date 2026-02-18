@@ -24,6 +24,7 @@
 
 #include "cachelib/common/AtomicCounter.h"
 #include "cachelib/common/PercentileStats.h"
+#include "cachelib/common/Profiled.h"
 #include "cachelib/navy/admission_policy/AdmissionPolicy.h"
 #include "gtest/gtest_prod.h"
 
@@ -115,6 +116,8 @@ class DynamicRandomAP final : public AdmissionPolicy {
   explicit DynamicRandomAP(Config&& config);
   DynamicRandomAP(const DynamicRandomAP&) = delete;
   DynamicRandomAP& operator=(const DynamicRandomAP&) = delete;
+  DynamicRandomAP(DynamicRandomAP&&) = delete;
+  DynamicRandomAP& operator=(DynamicRandomAP&&) = delete;
   ~DynamicRandomAP() override = default;
 
   // Whether to accept the given hashed key.
@@ -201,7 +204,8 @@ class DynamicRandomAP final : public AdmissionPolicy {
   const size_t deterministicKeyHashSuffixLength_{0};
 
   std::chrono::seconds startupTime_{0};
-  mutable SharedMutex mutex_;
+  mutable trace::Profiled<SharedMutex, "cachelib:navy:dynamic_random_ap">
+      mutex_;
   ThrottleParams params_;
   WriteStats writeStats_;
 

@@ -26,6 +26,8 @@
 #include "cachelib/common/Time.h"
 #include "cachelib/common/inject_pause.h"
 #include "cachelib/navy/block_cache/FixedSizeIndex.h"
+#include "cachelib/navy/block_cache/HitsReinsertionPolicy.h"
+#include "cachelib/navy/block_cache/PercentageReinsertionPolicy.h"
 #include "cachelib/navy/block_cache/SparseMapIndex.h"
 #include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/common/Types.h"
@@ -211,8 +213,8 @@ Status BlockCache::insert(HashedKey hk, BufferView value) {
   }
 
   // All newly inserted items are assigned with the lowest priority
-  auto [desc, slotSize, addr] = allocator_.allocate(
-      size, kDefaultItemPriority, true /* canWait */, hk.keyHash());
+  auto [desc, addr] = allocator_.allocate(size, kDefaultItemPriority,
+                                          true /* canWait */, hk.keyHash());
 
   switch (desc.status()) {
   case OpenStatus::Error:
@@ -229,11 +231,11 @@ Status BlockCache::insert(HashedKey hk, BufferView value) {
 
   // After allocation a region is opened for writing. Until we close it, the
   // region would not be reclaimed and index never gets an invalid entry.
-  const auto status = writeEntry(addr, slotSize, hk, value);
-  auto newObjSizeHint = encodeSizeHint(slotSize);
+  const auto status = writeEntry(addr, size, hk, value);
+  auto newObjSizeHint = encodeSizeHint(size);
   if (status == Status::Ok) {
     const auto lr = index_->insert(
-        hk.keyHash(), encodeRelAddress(addr.add(slotSize)), newObjSizeHint);
+        hk.keyHash(), encodeRelAddress(addr.add(size)), newObjSizeHint);
     // We replaced an existing key in the index
     uint64_t newObjSize = decodeSizeHint(newObjSizeHint);
     uint64_t oldObjSize = 0;
@@ -505,8 +507,8 @@ Status BlockCache::remove(HashedKey hk) {
  * and that is what we need to find the next item to evict/remove/reinsert.
  *
  * Note: The time between item removal and callback invocation is not
- * guaranteed. If an item is replaced, callbacks for both the old and new values
- * may be invoked in any order.
+ * guaranteed. If an item is replaced, callback is skipped and called when the
+ * new item is evicted.
  *
  * @param rid    The RegionId of the region being evicted.
  * @param buffer A BufferView containing the data of the region to be reclaimed.
@@ -662,8 +664,8 @@ void BlockCache::recordEvent(folly::StringPiece key,
                              AllocatorApiResult result,
                              uint32_t size,
                              const NvmItem* nvmItem) {
-  if (eventTracker_.has_value()) {
-    if (!eventTracker_->get().sampleKey(key)) {
+  if (eventTracker_) {
+    if (!eventTracker_->sampleKey(key)) {
       return;
     }
     EventInfo eventInfo;
@@ -703,18 +705,39 @@ void BlockCache::recordEvent(folly::StringPiece key,
       }
     }
 
-    eventTracker_->get().record(eventInfo);
+    eventTracker_->record(eventInfo);
   } else if (legacyEventTracker_.has_value()) {
     legacyEventTracker_->get().record(event, key, result, size);
   }
 }
 
+/**
+ * Reinsert or remove an item during region reclaim.
+ *
+ * This function evaluates an item found in a reclaiming region and decides
+ * whether to:
+ *  1. do nothing if item has been overwritten/replaced, or key not in index.
+ *  2. remove the item from index on reinsertion error, expiry or cheksum error.
+ *  3. reinsert the item if the reinsertion policy decides to.
+ *  4. evict the item.
+ *
+ * @param hk         HashedKey for the item.
+ * @param value      The item's value buffer view within the region.
+ * @param entrySize  The serialized size of the item (aligned).
+ * @param currAddr   The current relative end address of the item in the region.
+ * @param entryDesc  The entry descriptor for the item.
+ *
+ * @return           AllocatorApiResult indicating the action taken:
+ *                   REINSERTED, EVICTED, EXPIRED, REMOVED, FAILED,
+ *                   INVALIDATED, NOT_FOUND, or CORRUPTED.
+ */
 AllocatorApiResult BlockCache::reinsertOrRemoveItem(
     HashedKey hk,
     BufferView value,
     uint32_t entrySize,
     RelAddress currAddr,
     const EntryDesc& entryDesc) {
+  // Remove the key from index and return the correct result.
   auto removeItem = [this, hk, currAddr](bool expired) {
     if (index_->removeIfMatch(hk.keyHash(), encodeRelAddress(currAddr))) {
       if (expired) {
@@ -729,20 +752,32 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
   const auto lr = index_->peek(hk.keyHash());
   if (!lr.found() || decodeRelAddress(lr.address()) != currAddr) {
     evictionLookupMissCounter_.inc();
+    // Either item is not in index (NOT_FOUND) or the time has been
+    // replaced by a newer item hence the current item is invalidated
+    // (INVALDIATED).
+    auto eventRes = !lr.found() ? AllocatorApiResult::NOT_FOUND
+                                : AllocatorApiResult::INVALIDATED;
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT, eventRes, entrySize);
     return AllocatorApiResult::REMOVED;
   }
 
   try {
     if (checkExpired_ && checkExpired_(value)) {
+      recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                  AllocatorApiResult::EXPIRED, entrySize);
       return removeItem(true);
     }
 
     if (!reinsertionPolicy_ ||
         !reinsertionPolicy_->shouldReinsert(hk.key(), toStringPiece(value))) {
+      recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                  AllocatorApiResult::REJECTED, entrySize);
       return removeItem(false);
     }
   } catch (const std::exception& e) {
     XLOGF(ERR, "Exception in reinsertOrRemoveItem: {}", e.what());
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                AllocatorApiResult::CORRUPTED, entrySize);
     return AllocatorApiResult::CORRUPTED;
   }
 
@@ -761,6 +796,8 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
           folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
     reclaimValueChecksumErrorCount_.inc();
     removeItem(false);
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                AllocatorApiResult::CORRUPTED, entrySize);
     return AllocatorApiResult::CORRUPTED;
   }
 
@@ -774,7 +811,7 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
           : std::min<uint16_t>(lr.currentHits(), numPriorities_ - 1);
 
   uint32_t size = serializedSize(hk.key().size(), value.size());
-  auto [desc, slotSize, addr] =
+  auto [desc, addr] =
       allocator_.allocate(size, priority, false /* canWait */, hk.keyHash());
 
   switch (desc.status()) {
@@ -784,10 +821,14 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
     allocErrorCount_.inc();
     reinsertionErrorCount_.inc();
     removeItem(false);
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                AllocatorApiResult::FAILED, entrySize);
     return AllocatorApiResult::FAILED;
   case OpenStatus::Retry:
     reinsertionErrorCount_.inc();
     removeItem(false);
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                AllocatorApiResult::FAILED, entrySize);
     return AllocatorApiResult::FAILED;
   }
   auto closeRegionGuard =
@@ -797,35 +838,40 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(
 
   // After allocation a region is opened for writing. Until we close it, the
   // region would not be reclaimed and index never gets an invalid entry.
-  const auto status = writeEntry(addr, slotSize, hk, value);
+  const auto status = writeEntry(addr, size, hk, value);
   if (status != Status::Ok) {
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                AllocatorApiResult::FAILED, entrySize);
     reinsertionErrorCount_.inc();
     return removeItem(false);
   }
 
-  const auto replaced =
-      index_->replaceIfMatch(hk.keyHash(),
-                             encodeRelAddress(addr.add(slotSize)),
-                             encodeRelAddress(currAddr));
+  const auto replaced = index_->replaceIfMatch(hk.keyHash(),
+                                               encodeRelAddress(addr.add(size)),
+                                               encodeRelAddress(currAddr));
   if (!replaced) {
+    recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+                AllocatorApiResult::INVALIDATED, entrySize);
     // happens if you can't find the key in the map
     reinsertionErrorCount_.inc();
     removeItem(false);
     return AllocatorApiResult::FAILED;
   }
+  recordEvent(hk.key(), AllocatorApiEvent::NVM_REINSERT,
+              AllocatorApiResult::ACCEPTED, entrySize);
   reinsertionCount_.inc();
   reinsertionBytes_.add(entrySize);
   return AllocatorApiResult::REINSERTED;
 }
 
 Status BlockCache::writeEntry(RelAddress addr,
-                              uint32_t slotSize,
+                              uint32_t size,
                               HashedKey hk,
                               BufferView value) {
-  XDCHECK_LE(addr.offset() + slotSize, regionManager_.regionSize());
-  XDCHECK_EQ(slotSize % allocAlignSize_, 0ULL)
-      << folly::sformat(" alignSize={}, size={}", allocAlignSize_, slotSize);
-  auto buffer = Buffer(slotSize);
+  XDCHECK_LE(addr.offset() + size, regionManager_.regionSize());
+  XDCHECK_EQ(size % allocAlignSize_, 0ULL)
+      << folly::sformat(" alignSize={}, size={}", allocAlignSize_, size);
+  auto buffer = Buffer(size);
 
   // Copy descriptor and the key to the end
   size_t descOffset = buffer.size() - sizeof(EntryDesc);
@@ -898,7 +944,7 @@ Status BlockCache::readEntry(const RegionDescriptor& readDesc,
     return Status::NotFound;
   }
 
-  // Update slot size to actual, defined by key and value size
+  // Update the size to actual, defined by key and value size
   uint32_t size = serializedSize(desc.keySize, desc.valueSize);
   if (buffer.size() > size) {
     // Read more than actual size. Trim the invalid data in the beginning
