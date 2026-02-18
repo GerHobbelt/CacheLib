@@ -25,28 +25,43 @@ namespace cachelib {
 namespace navy {
 
 void FixedSizeIndex::initialize() {
+  // TODO: All these XDCHECK should throw exception instead.
+  // For now, it's internally passed down so should be fine.
+  if (handleOverflow_ && retrieveKeyCb_ == nullptr) {
+    throw std::invalid_argument(
+        "retrieveKey callback must be set with handleOverflow enabled");
+  }
   XDCHECK(numChunks_ != 0 && numBucketsPerChunkPower_ != 0 &&
-          numBucketsPerMutex_ != 0);
+          numBucketsPerShard_ != 0);
 
   XDCHECK(numBucketsPerChunkPower_ <= 63);
   bucketsPerChunk_ = (1ull << numBucketsPerChunkPower_);
   totalBuckets_ = numChunks_ * bucketsPerChunk_;
 
-  XDCHECK(numBucketsPerMutex_ <= totalBuckets_);
-  totalMutexes_ = (totalBuckets_ - 1) / numBucketsPerMutex_ + 1;
+  XDCHECK(numBucketsPerShard_ <= totalBuckets_);
+  totalShards_ = (totalBuckets_ - 1) / numBucketsPerShard_ + 1;
 
-  mutex_ = std::make_unique<SharedMutexType[]>(totalMutexes_);
+  mutex_ = std::make_unique<SharedMutexType[]>(totalShards_);
+  if (handleOverflow_) {
+    XDCHECK(retrieveKeyCb_ != nullptr);
+    // This in-memory combined entries is a temporary implementation until we
+    // keep it on flash
+    combinedEntries_ = std::make_unique<
+        folly::F14FastMap<uint64_t, std::unique_ptr<CombinedEntryBlock>>[]>(
+        totalShards_);
+  }
+
   bucketDistInfo_.initialize(totalBuckets_);
 }
 
 size_t FixedSizeIndex::getRequiredPreallocSize() const {
   // Need to preallocate buffer for those info which needs to be persistent
   // 1. Main hash table with PackedItemRecord entries
-  // 2. Table entry count information per each mutex boundary
-  // (validBucketsPerMutex_)
+  // 2. Table entry count information per each shard boundary
+  // (validBucketsPerShard_)
   // 3. BucketDistInfo
   return sizeof(PackedItemRecord) * totalBuckets_ + // for ht_
-         sizeof(size_t) * totalMutexes_ +           // for validBucketsPerMutex_
+         sizeof(size_t) * totalShards_ +            // for validBucketsPerShard_
          bucketDistInfo_.getBucketDistInfoBufSize(); // for bucketDistInfo_
 }
 
@@ -198,12 +213,12 @@ void FixedSizeIndex::reset() {
   initWithBaseAddr(reinterpret_cast<uint8_t*>(baseAddr));
 
   uint64_t bucketId = 0;
-  for (uint32_t i = 0; i < totalMutexes_; i++) {
+  for (uint32_t i = 0; i < totalShards_; i++) {
     auto lock = std::lock_guard{mutex_[i]};
-    for (uint64_t j = 0; j < numBucketsPerMutex_; ++j) {
+    for (uint64_t j = 0; j < numBucketsPerShard_; ++j) {
       ht_[bucketId++] = PackedItemRecord{};
     }
-    validBucketsPerMutex_[i] = 0;
+    validBucketsPerShard_[i] = 0;
   }
 
   if (shmManager_) {
@@ -212,7 +227,7 @@ void FixedSizeIndex::reset() {
     *cfg.version() = kFixedSizeIndexVersion;
     *cfg.numChunks() = static_cast<int32_t>(numChunks_);
     *cfg.numBucketsPerChunkPower() = numBucketsPerChunkPower_;
-    *cfg.numBucketsPerMutex() = static_cast<int64_t>(numBucketsPerMutex_);
+    *cfg.numBucketsPerShard() = static_cast<int64_t>(numBucketsPerShard_);
 
     auto ioBuf = Serializer::serializeToIOBuf(cfg);
 
@@ -237,9 +252,9 @@ void FixedSizeIndex::reset() {
 
 size_t FixedSizeIndex::computeSize() const {
   size_t size = 0;
-  for (uint32_t i = 0; i < totalMutexes_; i++) {
+  for (uint32_t i = 0; i < totalShards_; i++) {
     auto lock = std::shared_lock{mutex_[i]};
-    size += validBucketsPerMutex_[i];
+    size += validBucketsPerShard_[i];
   }
 
   return size;
@@ -250,8 +265,8 @@ Index::MemFootprintRange FixedSizeIndex::computeMemFootprintRange() const {
 
   size_t memUsage = 0;
   memUsage += totalBuckets_ * sizeof(PackedItemRecord);
-  memUsage += totalMutexes_ * sizeof(SharedMutex);
-  memUsage += totalMutexes_ * sizeof(size_t);
+  memUsage += totalShards_ * sizeof(SharedMutex);
+  memUsage += totalShards_ * sizeof(size_t);
 
   // for BucketDistInfo
   memUsage += bucketDistInfo_.getBucketDistInfoBufSize();
@@ -334,18 +349,18 @@ bool FixedSizeIndex::checkStoredConfig(
           static_cast<uint32_t>(*stored.numChunks()) == numChunks_ &&
           static_cast<uint8_t>(*stored.numBucketsPerChunkPower()) ==
               numBucketsPerChunkPower_ &&
-          static_cast<uint64_t>(*stored.numBucketsPerMutex()) ==
-              numBucketsPerMutex_);
+          static_cast<uint64_t>(*stored.numBucketsPerShard()) ==
+              numBucketsPerShard_);
 }
 
 void FixedSizeIndex::initWithBaseAddr(uint8_t* addr) {
   // In Shm, it's stored in this order:
-  // ht_, validBucketsPerMutex_, bucketDistInfo (fillMap_, partialBits_)
+  // ht_, validBucketsPerShard_, bucketDistInfo (fillMap_, partialBits_)
   ht_ = reinterpret_cast<PackedItemRecord*>(addr);
   addr += sizeof(PackedItemRecord) * totalBuckets_;
 
-  validBucketsPerMutex_ = reinterpret_cast<size_t*>(addr);
-  addr += sizeof(size_t) * totalMutexes_;
+  validBucketsPerShard_ = reinterpret_cast<size_t*>(addr);
+  addr += sizeof(size_t) * totalShards_;
 
   bucketDistInfo_.initWithBaseAddr(addr);
 }

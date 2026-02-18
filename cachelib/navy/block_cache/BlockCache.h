@@ -92,6 +92,8 @@ class BlockCache final : public Engine {
     bool preciseRemove{false};
     // Whether region manager's worker threads should flush asynchronously.
     bool regionManagerFlushAsync{false};
+    // Whether to enable the clean region fast path in getCleanRegion().
+    bool cleanRegionFastPath{false};
     // name of this BC instance
     std::string name{};
 
@@ -257,10 +259,9 @@ class BlockCache final : public Engine {
   struct ValidConfigTag {};
   BlockCache(Config&& config, ValidConfigTag);
 
-  static std::unique_ptr<Index> createIndex(
-      const BlockCacheIndexConfig& indexConfig,
-      const NavyPersistParams& persistParams,
-      const std::string& name);
+  std::unique_ptr<Index> createIndex(const BlockCacheIndexConfig& indexConfig,
+                                     const NavyPersistParams& persistParams,
+                                     const std::string& name);
 
   // Entry disk size (with aux data and aligned)
   uint32_t serializedSize(uint32_t keySize, uint32_t valueSize) const;

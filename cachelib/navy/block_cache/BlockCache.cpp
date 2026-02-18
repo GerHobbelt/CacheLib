@@ -127,7 +127,9 @@ std::unique_ptr<Index> BlockCache::createIndex(
                    ? &(persistParams.shmManager.value().get())
                    : nullptr)
             : nullptr,
-        name);
+        name,
+        /* handleOverflow */ false,
+        bindThis(&BlockCache::onKeyHashRetrievalFromLocation, *this));
   } else {
     return std::make_unique<SparseMapIndex>(
         indexConfig.getNumSparseMapBuckets(),
@@ -172,7 +174,8 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
                      static_cast<uint16_t>(config.allocatorsPerPriority.size()),
                      config.inMemBufFlushRetryLimit,
                      config.regionManagerFlushAsync,
-                     true /* allowReadDuringReclaim */},
+                     true /* allowReadDuringReclaim */,
+                     config.cleanRegionFastPath},
       allocator_{regionManager_, config.allocatorsPerPriority},
       reinsertionPolicy_{makeReinsertionPolicy(config.reinsertionConfig)} {
   validate(config);

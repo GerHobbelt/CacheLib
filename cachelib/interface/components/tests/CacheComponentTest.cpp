@@ -84,30 +84,45 @@ class FlashCacheFactory : public CacheFactory {
       : hits_(/* count */ kDeviceSize / kRegionSize, /* value */ 0) {}
 
   std::unique_ptr<CacheComponent> create() override {
-    device_ = navy::createMemoryDevice(kDeviceSize, /* encryptor */ nullptr);
-    auto flashCache = ASSERT_OK(
-        FlashCacheComponent::create("CacheComponentTest", makeConfig()));
+    auto flashCache = ASSERT_OK(FlashCacheComponent::create(
+        "CacheComponentTest", makeConfig(), makeDevice()));
     return std::make_unique<FlashCacheComponent>(std::move(flashCache));
   }
 
- private:
+ protected:
   using BlockCache = navy::BlockCache;
 
-  static constexpr uint64_t kRegionSize{/* 16KB */ 16 * 1024};
-  static constexpr uint64_t kDeviceSize{/* 256KB */ 256 * 1024};
-
-  std::unique_ptr<navy::Device> device_;
-  std::vector<uint32_t> hits_;
-
+  std::unique_ptr<navy::Device> makeDevice() {
+    return navy::createMemoryDevice(kDeviceSize, /* encryptor */ nullptr);
+  }
   BlockCache::Config makeConfig() {
     BlockCache::Config config;
     config.regionSize = kRegionSize;
     config.cacheSize = kDeviceSize;
-    config.device = device_.get();
     config.evictionPolicy =
         std::make_unique<NiceMock<navy::MockPolicy>>(&hits_);
     return config;
   }
+
+ private:
+  static constexpr size_t kRegionSize{/* 16KB */ 16 * 1024};
+  static constexpr size_t kDeviceSize{/* 256KB */ 256 * 1024};
+
+  std::vector<uint32_t> hits_;
+};
+
+class ConsistentFlashCacheFactory : public FlashCacheFactory {
+ public:
+  std::unique_ptr<CacheComponent> create() override {
+    auto consistentFlashCache = ASSERT_OK(ConsistentFlashCacheComponent::create(
+        "CacheComponentTest", makeConfig(), makeDevice(),
+        std::make_unique<MurmurHash2>(), kShardsPower));
+    return std::make_unique<ConsistentFlashCacheComponent>(
+        std::move(consistentFlashCache));
+  }
+
+ private:
+  static constexpr size_t kShardsPower{4};
 };
 
 template <typename FactoryType>
@@ -132,7 +147,8 @@ class CacheComponentTest : public ::testing::Test {
 };
 
 // Define the list of factory types to test
-using FactoryTypes = ::testing::Types<RAMCacheFactory, FlashCacheFactory>;
+using FactoryTypes = ::testing::
+    Types<RAMCacheFactory, FlashCacheFactory, ConsistentFlashCacheFactory>;
 TYPED_TEST_SUITE(CacheComponentTest, FactoryTypes);
 
 // ============================================================================
