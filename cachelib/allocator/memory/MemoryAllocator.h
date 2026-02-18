@@ -27,6 +27,7 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
 #include <folly/Format.h>
+#include <folly/Math.h>
 #pragma GCC diagnostic pop
 
 #include "cachelib/allocator/memory/serialize/gen-cpp2/objects_types.h"
@@ -662,6 +663,32 @@ class MemoryAllocator {
   //                              exceeds kMaxClasses
   static std::set<uint32_t> generateOptimalAllocSizesForItemRange(
       uint32_t minItemSize, uint32_t maxItemSize);
+
+  // Generates a set of allocation sizes with evenly distributed sizes.
+  // This function creates allocation classes by dividing the space between
+  // minItemSize and maxItemSize evenly. The maxItemSize is always included,
+  // and intermediate sizes are evenly distributed based on numClassesToAdd.
+  //
+  // For example: if minItemSize=1000, maxItemSize=5000, and numClassesToAdd=2,
+  // it will create 2 allocation classes: [3000, 5000].
+  // If numClassesToAdd=3, it will create: [2333, 3666, 5000].
+  //
+  // @param minItemSize      The minimum expected item size in bytes
+  // @param maxItemSize      The maximum expected item size in bytes
+  // @param numClassesToAdd  The total number of allocation classes to create.
+  //                         Must be at least 1 (which adds only maxItemSize).
+  //
+  // @return  std::set of allocation sizes that evenly cover the item size
+  //          range. Each allocation size is aligned to kAlignment (8 bytes)
+  //          and maximized using maximizeAllocSize.
+  //
+  // @throw std::invalid_argument if minItemSize > maxItemSize
+  // @throw std::invalid_argument if maxItemSize > Slab::kSize
+  // @throw std::invalid_argument if numClassesToAdd < 1
+  // @throw std::invalid_argument if numClassesToAdd exceeds kMaxClasses
+  static std::set<uint32_t> generateEvenlyDistributedAllocSizes(
+      uint32_t minItemSize, uint32_t maxItemSize, uint32_t numClassesToAdd);
+
   // Checks if a given allocation size is valid for cachelib. A valid
   // allocation size must satisfy the following requirements:
   // 1. >= Slab::kMinAllocSize (64 bytes)
@@ -711,27 +738,24 @@ class MemoryAllocator {
     return alignedSize;
   }
 
+  // calculate total number of slabs that can be advised away across all pools
+  size_t getNumSlabsToAdvise() const noexcept {
+    return memoryPoolManager_.getNumSlabsToAdvise();
+  }
+
   // calculate the number of slabs to be advised/reclaimed in each pool
   //
-  // @param poolIds    list of pools to process
+  // @param numSlabsToAdvise  total number of slabs to advise across all pools
+  // @param poolIds           list of pools to process
   //
   // @return   PoolAdviseReclaimData containing poolId,
   //           the number of slabs to advise or number of slabs to reclaim
   //           and flag indicating if the number is for advising-away or
   //           reclaiming
   PoolAdviseReclaimData calcNumSlabsToAdviseReclaim(
-      const std::set<PoolId>& poolIds) {
-    return memoryPoolManager_.calcNumSlabsToAdviseReclaim(poolIds);
-  }
-
-  // update number of slabs to advise in the cache
-  //
-  // @param numSlabs      the number of slabs to advise are updated
-  //                      (incremented or decremented) to reflect the
-  //                      new total number of slabs to be advised in the
-  //                      cache
-  void updateNumSlabsToAdvise(int32_t numSlabs) {
-    memoryPoolManager_.updateNumSlabsToAdvise(numSlabs);
+      size_t numSlabsToAdvise, const std::set<PoolId>& poolIds) {
+    return memoryPoolManager_.calcNumSlabsToAdviseReclaim(numSlabsToAdvise,
+                                                          poolIds);
   }
 
   // return the minimum allocation size

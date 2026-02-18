@@ -25,6 +25,7 @@
 #include "cachelib/allocator/CacheStats.h"
 #include "cachelib/allocator/ICompactCache.h"
 #include "cachelib/allocator/memory/MemoryAllocator.h"
+#include "cachelib/common/EventTracker.h"
 #include "cachelib/common/Hash.h"
 #include "cachelib/common/Utils.h"
 
@@ -125,8 +126,8 @@ class CacheBase {
 
   // @return a map of <stat name -> stat value> representation for all the event
   // tracker stats. If no event tracker exists, this will be empty
-  virtual std::unordered_map<std::string, uint64_t> getEventTrackerStatsMap()
-      const = 0;
+  virtual std::unordered_map<std::string, uint64_t>
+  getLegacyEventTrackerStatsMap() const = 0;
 
   // @return the Cache metadata
   virtual CacheMetadata getCacheMetadata() const noexcept = 0;
@@ -222,6 +223,9 @@ class CacheBase {
   // Whether to aggregate pool stats to reduce ODS counter inflation
   bool aggregatePoolStats_{false};
 
+  std::shared_ptr<EventTracker> getEventTracker() const;
+  void setEventTracker(EventTracker::Config&& config);
+
  protected:
   // move bytes from one pool to another. The source pool should be at least
   // _bytes_ in size.
@@ -264,11 +268,9 @@ class CacheBase {
                            SlabReleaseMode mode,
                            const void* hint = nullptr) = 0;
 
-  // update the number of slabs to be advised
-  virtual void updateNumSlabsToAdvise(int32_t numSlabsToAdvise) = 0;
-
   // calculate the number of slabs to be advised/reclaimed in each pool
-  virtual PoolAdviseReclaimData calcNumSlabsToAdviseReclaim() = 0;
+  virtual PoolAdviseReclaimData calcNumSlabsToAdviseReclaim(
+      size_t numSlabsToAdvise) = 0;
 
   // Releasing a slab from this allocation class id and pool id. The release
   // could be for a pool resizing or allocation class rebalancing.
@@ -330,7 +332,7 @@ class CacheBase {
                                const ICompactCache& c) const;
 
   // Update stats specific to the event tracker
-  void updateEventTrackerStats(const std::string& statPrefix) const;
+  void updateLegacyEventTrackerStats(const std::string& statPrefix) const;
 
   // Update stats specific to NvmCache
   void updateNvmCacheStats(const std::string& statPrefix) const;
@@ -362,6 +364,8 @@ class CacheBase {
   std::unordered_map<PoolId, std::shared_ptr<RebalanceStrategy>>
       poolResizeStrategies_;
   std::shared_ptr<PoolOptimizeStrategy> poolOptimizeStrategy_;
+
+  folly::Synchronized<std::shared_ptr<EventTracker>> eventTracker_;
 
   // Enable aggregating pool stats
   void enableAggregatePoolStats() { aggregatePoolStats_ = true; }

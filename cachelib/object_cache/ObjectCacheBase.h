@@ -76,9 +76,9 @@ class ObjectCacheBase : public CacheBase {
 
   // @return a map of <stat name -> stat value> representation for all the event
   // tracker stats. If no event tracker exists, this will be empty
-  std::unordered_map<std::string, uint64_t> getEventTrackerStatsMap()
+  std::unordered_map<std::string, uint64_t> getLegacyEventTrackerStatsMap()
       const override {
-    return l1Cache_->getEventTrackerStatsMap();
+    return l1Cache_->getLegacyEventTrackerStatsMap();
   }
 
   // @return the Cache metadata
@@ -177,17 +177,11 @@ class ObjectCacheBase : public CacheBase {
     throw std::runtime_error("Unsupported function in ObjectCacheBase!");
   }
 
-  // update the number of slabs to be advised
-  //
-  // not supported in object cache
-  void updateNumSlabsToAdvise(int32_t) override {
-    throw std::runtime_error("Unsupported function in ObjectCacheBase!");
-  }
-
   // calculate the number of slabs to be advised/reclaimed in each pool
   //
   // not supported in object cache
-  PoolAdviseReclaimData calcNumSlabsToAdviseReclaim() override {
+  PoolAdviseReclaimData calcNumSlabsToAdviseReclaim(
+      size_t /* numSlabsToAdvise */) override {
     throw std::runtime_error("Unsupported function in ObjectCacheBase!");
     return {};
   }

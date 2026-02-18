@@ -41,7 +41,7 @@ class CacheBaseTest : public CacheBase, public SlabAllocatorTestBase {
                                                unsigned int) const override {
     return PoolEvictionAgeStats();
   }
-  std::unordered_map<std::string, uint64_t> getEventTrackerStatsMap()
+  std::unordered_map<std::string, uint64_t> getLegacyEventTrackerStatsMap()
       const override {
     return {};
   }
@@ -71,9 +71,9 @@ class CacheBaseTest : public CacheBase, public SlabAllocatorTestBase {
   }
 
   util::StatsMap getNvmCacheStatsMap() const override { return {}; }
-  void updateNumSlabsToAdvise(int32_t /* unused */) override final {}
 
-  PoolAdviseReclaimData calcNumSlabsToAdviseReclaim() override final {
+  PoolAdviseReclaimData calcNumSlabsToAdviseReclaim(
+      size_t /* unused */) override final {
     return {};
   }
 

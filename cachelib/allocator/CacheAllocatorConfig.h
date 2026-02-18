@@ -59,7 +59,8 @@ class CacheAllocatorConfig {
   using NvmCacheConfig = typename CacheT::NvmCacheT::Config;
   using MemoryTierConfigs = std::vector<MemoryTierCacheConfig>;
   using Key = typename CacheT::Key;
-  using EventTrackerSharedPtr = std::shared_ptr<typename CacheT::EventTracker>;
+  using LegacyEventTrackerSharedPtr =
+      std::shared_ptr<typename CacheT::EventTracker>;
   using Item = typename CacheT::Item;
 
   // Set cache name as a string
@@ -338,7 +339,7 @@ class CacheAllocatorConfig {
 
   // Passes in a callback to initialize an event tracker when the allocator
   // starts
-  CacheAllocatorConfig& setEventTracker(EventTrackerSharedPtr&&);
+  CacheAllocatorConfig& setEventTracker(LegacyEventTrackerSharedPtr&&);
 
   // Set the minimum TTL for an item to be admitted into NVM cache.
   // If nvmAdmissionMinTTL is set to be positive, any item with configured TTL
@@ -570,8 +571,9 @@ class CacheAllocatorConfig {
   // optimization strategy
   std::shared_ptr<PoolOptimizeStrategy> poolOptimizeStrategy{nullptr};
 
-  // Callback for initializing the eventTracker on CacheAllocator construction.
-  EventTrackerSharedPtr eventTracker{nullptr};
+  // Callback for initializing the legacyEventTracker on CacheAllocator
+  // construction.
+  LegacyEventTrackerSharedPtr legacyEventTracker{nullptr};
 
   // whether to allow tracking tail hits in MM2Q
   bool trackTailHits{false};
@@ -603,8 +605,7 @@ class CacheAllocatorConfig {
 
   // the amount of time to wait for a slab to be released before giving up
   // and aborting the release. 0 means we will wait forever
-  std::chrono::milliseconds slabRebalanceTimeout{
-      std::chrono::milliseconds(5000)};
+  std::chrono::milliseconds slabRebalanceTimeout{std::chrono::milliseconds(0)};
 
   // If refcount is larger than this threshold, we will use shared_ptr
   // for handles in IOBuf chains.
@@ -1160,8 +1161,8 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setThrottlerConfig(
 
 template <typename T>
 CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setEventTracker(
-    EventTrackerSharedPtr&& otherEventTracker) {
-  eventTracker = std::move(otherEventTracker);
+    LegacyEventTrackerSharedPtr&& otherEventTracker) {
+  legacyEventTracker = std::move(otherEventTracker);
   return *this;
 }
 
@@ -1350,7 +1351,7 @@ std::map<std::string, std::string> CacheAllocatorConfig<T>::serialize() const {
       stringifyRebalanceStrategy(poolAdviseStrategy);
   configMap["defaultPoolRebalanceStrategy"] =
       stringifyRebalanceStrategy(defaultPoolRebalanceStrategy);
-  configMap["eventTracker"] = eventTracker ? "set" : "empty";
+  configMap["eventTracker"] = legacyEventTracker ? "set" : "empty";
   configMap["nvmAdmissionMinTTL"] = std::to_string(nvmAdmissionMinTTL);
   configMap["delayCacheWorkersStart"] =
       delayCacheWorkersStart ? "true" : "false";

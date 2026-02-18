@@ -81,7 +81,12 @@ class Region {
   // released. Return true if there are no pending operation to this region,
   // false otherwise.
   // @param wait  whether to wait or not (only for test cases)
-  bool readyForReclaim(bool wait);
+  bool readyForReclaim(bool wait, bool allowRead);
+
+  // Wait for all the active readers finished.
+  // When we want to reset the region after reclaim, we need to make sure no
+  // active readers are reading from the region
+  void waitForActiveReaders();
 
   // Opens this region for write and allocate a slot of @size.
   // Fail if there's insufficient space.
@@ -184,6 +189,9 @@ class Region {
   // Checks whether the region's buffer is cleaned up.
   bool isCleanedupLocked() const { return (flags_ & kCleanedup) != 0; }
 
+  // Check if this region is being reclaimed
+  bool isBeingReclaimed() const { return (flags_ & kBeingReclaimed) != 0; }
+
   // Returns the number of active writers using the region.
   uint32_t getActiveWriters() const {
     std::lock_guard l{lock_};
@@ -200,7 +208,7 @@ class Region {
   RegionId id() const { return regionId_; }
 
  private:
-  uint32_t activeOpenLocked();
+  uint32_t activeOpenLocked(bool writersOnly) const;
 
   // Checks to see if there is enough space in the region for a new write of
   // size 'size'.
@@ -217,6 +225,7 @@ class Region {
   static constexpr uint16_t kFlushPending{1u << 2};
   static constexpr uint16_t kFlushed{1u << 3};
   static constexpr uint16_t kCleanedup{1u << 4};
+  static constexpr uint16_t kBeingReclaimed{1u << 5};
 
   const RegionId regionId_{};
   const uint64_t regionSize_{0};
@@ -240,6 +249,7 @@ class Region {
 // descriptor to properly close and update the internal counters.
 class RegionDescriptor {
  public:
+  RegionDescriptor() = default;
   // @param status  status of the open
   RegionDescriptor(OpenStatus status) : status_(status) {}
   static RegionDescriptor makeWriteDescriptor(OpenStatus status,
@@ -300,7 +310,7 @@ class RegionDescriptor {
         mode_(mode),
         physReadMode_(physReadMode) {}
 
-  OpenStatus status_;
+  OpenStatus status_{OpenStatus::Error};
   RegionId regionId_{};
   OpenMode mode_{OpenMode::None};
   // physReadMode_ is applicable only in read mode

@@ -66,10 +66,11 @@ bool ReuseTimeReinsertionPolicy::shouldReinsert(folly::StringPiece key,
   }
 
   auto reuseTime = getReuseTime(key);
-  if ((reuseTime == 0) || (reuseTime >= reuseTimeThreshold_)) {
+  if ((reuseTime == 0) || (reuseTime > reuseTimeThreshold_)) {
     return false;
   }
   reinserted_.inc();
+  reinsertedBytes_.add(value.size());
   return true;
 }
 
@@ -87,6 +88,9 @@ void ReuseTimeReinsertionPolicy::getCounters(
           cachelib::util::CounterVisitor::CounterType::RATE);
   visitor("bc_reinsert_reuse_time_success",
           reinserted_.get(),
+          cachelib::util::CounterVisitor::CounterType::RATE);
+  visitor("bc_reinsert_reuse_time_success_bytes",
+          reinsertedBytes_.get(),
           cachelib::util::CounterVisitor::CounterType::RATE);
   visitor("bc_reinsert_expired",
           expired_.get(),
@@ -120,6 +124,7 @@ size_t ReuseTimeReinsertionPolicy::getReuseTime(folly::StringPiece key) {
     size_t timeSinceLastAccess = bucketSize_ * (std::get<0>(reuseTuple) + 1);
     size_t latestReuseTime = 0;
     if (std::get<1>(reuseTuple) >= 0) {
+      XCHECK(std::get<0>(reuseTuple) < std::get<1>(reuseTuple));
       latestReuseTime =
           (std::get<1>(reuseTuple) - std::get<0>(reuseTuple)) * bucketSize_;
     }

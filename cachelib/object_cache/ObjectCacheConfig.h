@@ -33,7 +33,7 @@ namespace objcache2 {
 template <typename ObjectCache>
 struct ObjectCacheConfig {
   using Key = KAllocation::Key;
-  using EventTrackerSharedPtr = std::shared_ptr<EventInterface<Key>>;
+  using LegacyEventTrackerSharedPtr = std::shared_ptr<LegacyEventTracker>;
   using ItemDestructor = typename ObjectCache::ItemDestructor;
   using RemoveCb = typename ObjectCache::RemoveCb;
   using SerializeCb = typename ObjectCache::SerializeCb;
@@ -99,7 +99,7 @@ struct ObjectCacheConfig {
       util::Throttler::Config config);
 
   // Enable event tracker. This will log all relevant cache events.
-  ObjectCacheConfig& setEventTracker(EventTrackerSharedPtr&& ptr);
+  ObjectCacheConfig& setEventTracker(LegacyEventTrackerSharedPtr&& ptr);
 
   // You MUST set this callback to release the removed/evicted/expired objects
   // memory; otherwise, memory leak will happen.
@@ -266,8 +266,9 @@ struct ObjectCacheConfig {
   // Throttler config of size controller
   util::Throttler::Config sizeControllerThrottlerConfig{};
 
-  // Callback for initializing the eventTracker on CacheAllocator construction
-  EventTrackerSharedPtr eventTracker{nullptr};
+  // Callback for initializing the legacyEventTracker on CacheAllocator
+  // construction
+  LegacyEventTrackerSharedPtr legacyEventTracker{nullptr};
 
   // ItemDestructor which is invoked for each item that is evicted
   // or explicitly from cache
@@ -315,7 +316,6 @@ struct ObjectCacheConfig {
   // on top of Object Size mode guarantees.
   ObjCacheSizeControlMode memoryMode{ObjCacheSizeControlMode::ObjectSize};
 
-  // The number of entries to add or remove per iteration.
   // The limits means different things for different memory modes.
   // For Object Size mode,
   //   - upperLimitBytes: max total object size limit (shrink cache)
@@ -326,8 +326,16 @@ struct ObjectCacheConfig {
   // For RSS mode,
   //   - upperLimitBytes: max RSS limit (shrink cache)
   //   - lowerLimitBytes: min RSS limit (expand cache)
+  // For FreeMemoryOnly mode,
+  //   - lowerLimitBytes: min free memory limit (shrink cache)
   uint64_t upperLimitBytes{0};
   uint64_t lowerLimitBytes{0};
+
+  // In FreeMemoryOnly mode where we do not have average object size
+  // to adjust the cache size by, we used fixed values to shrink and expand.
+  uint64_t shrinkCacheBy{8};
+  uint64_t expandCacheBy{2};
+
   GetFreeMemCb getFreeMemBytes = util::getMemAvailable;
   GetRSSMemCb getRSSMemBytes = util::getRSSBytes;
 
@@ -447,8 +455,8 @@ ObjectCacheConfig<T>& ObjectCacheConfig<T>::enableFragmentationTracking() {
 
 template <typename T>
 ObjectCacheConfig<T>& ObjectCacheConfig<T>::setEventTracker(
-    EventTrackerSharedPtr&& ptr) {
-  eventTracker = std::move(ptr);
+    LegacyEventTrackerSharedPtr&& ptr) {
+  legacyEventTracker = std::move(ptr);
   return *this;
 }
 
