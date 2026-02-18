@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
+#include "cachelib/allocator/nvmcache/NvmItem.h"
 #include "cachelib/common/AtomicCounter.h"
 #include "cachelib/common/EventInterface.h"
 #include "cachelib/navy/block_cache/Allocator.h"
@@ -43,6 +44,7 @@ class BlockCache final : public Engine {
   // See CacheProto for details
   struct Config {
     Device* device{};
+    NavyPersistParams persistParams{};
     ExpiredCheck checkExpired;
     DestructorCallback destructorCb;
     // Checksum data read/written
@@ -57,8 +59,6 @@ class BlockCache final : public Engine {
     uint64_t regionSize{16 * 1024 * 1024};
     // See AbstractCacheProto::setReadBufferSize
     uint32_t readBufferSize{};
-    // Job scheduler for background tasks
-    JobScheduler* scheduler{};
     // Clean region pool size
     uint32_t cleanRegionsPool{1};
     // The number of region_manager threads for reclaim and flush
@@ -73,6 +73,8 @@ class BlockCache final : public Engine {
 
     std::optional<std::reference_wrapper<LegacyEventTracker>>
         legacyEventTracker;
+
+    std::optional<std::reference_wrapper<EventTracker>> eventTracker;
 
     // Maximum number of retry times for in-mem buffer flushing.
     // When exceeding the limit, we will not reschedule any flushing job but
@@ -90,6 +92,8 @@ class BlockCache final : public Engine {
     bool preciseRemove{false};
     // Whether region manager's worker threads should flush asynchronously.
     bool regionManagerFlushAsync{false};
+    // name of this BC instance
+    std::string name{};
 
     // Index related config
     BlockCacheIndexConfig indexConfig{};
@@ -254,7 +258,9 @@ class BlockCache final : public Engine {
   BlockCache(Config&& config, ValidConfigTag);
 
   static std::unique_ptr<Index> createIndex(
-      const BlockCacheIndexConfig& indexConfig);
+      const BlockCacheIndexConfig& indexConfig,
+      const NavyPersistParams& persistParams,
+      const std::string& name);
 
   // Entry disk size (with aux data and aligned)
   uint32_t serializedSize(uint32_t keySize, uint32_t valueSize) const;
@@ -328,15 +334,17 @@ class BlockCache final : public Engine {
     return regionManager_.toRelative(decodeAbsAddress(code).sub(1)).add(1);
   }
 
-  void updateEventTracker(folly::StringPiece key,
-                          AllocatorApiEvent event,
-                          AllocatorApiResult result,
-                          uint32_t size);
+  void recordEvent(folly::StringPiece key,
+                   AllocatorApiEvent event,
+                   AllocatorApiResult result,
+                   uint32_t size,
+                   const NvmItem* nvmItem = nullptr);
 
   AllocatorApiResult reinsertOrRemoveItem(HashedKey hk,
                                           BufferView value,
                                           uint32_t entrySize,
-                                          RelAddress currAddr);
+                                          RelAddress currAddr,
+                                          const EntryDesc& entryDesc);
 
   // Removes an entry key from the index.
   // @return true if the item is successfully removed; false if the item
@@ -345,6 +353,8 @@ class BlockCache final : public Engine {
   bool removeItem(HashedKey hk, RelAddress currAddr);
 
   void validate(Config& config) const;
+
+  void initializeBlockCache();
 
   // Create the reinsertion policy from config.
   // This function may need a reference to index and should be called the last
@@ -388,6 +398,7 @@ class BlockCache final : public Engine {
   // Make sure that this class member is defined after index_.
   std::shared_ptr<BlockCacheReinsertionPolicy> reinsertionPolicy_;
   std::optional<std::reference_wrapper<LegacyEventTracker>> legacyEventTracker_;
+  std::optional<std::reference_wrapper<EventTracker>> eventTracker_;
 
   // thread local counters in synchronized/critical path
   mutable TLCounter lookupCount_;

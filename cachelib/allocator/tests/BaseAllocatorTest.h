@@ -1011,7 +1011,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       movedKeys.insert(oldItem.getKey().str());
     };
 
-    config.enableMovingOnSlabRelease(moveCb, {}, 10);
+    config.enableMovingOnSlabRelease(moveCb, {});
 
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
@@ -3605,8 +3605,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
 
     // Request numSlabs + 1 slabs so that we get numSlabs usable slabs
     typename AllocatorT::Config config;
-    config.enableMovingOnSlabRelease(moveCb, {} /* ChainedItemsMoveSync */,
-                                     -1 /* movingAttemptsLimit */);
+    config.enableMovingOnSlabRelease(moveCb, {} /* ChainedItemsMoveSync */);
     config.setCacheSize((numSlabs + 1) * Slab::kSize);
     AllocatorT allocator(config);
     const size_t numBytes = allocator.getCacheMemoryStats().ramCacheSize;
@@ -5068,9 +5067,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
                       oldItem.getSize());
           ++numMoves;
         },
-        [&m](typename Item::Key) { return std::make_unique<TestSyncObj>(m); },
-        // Attempt a lot of moving so we're more lilely to succeed
-        1'000'000 /* movingAttempts */);
+        [&m](typename Item::Key) { return std::make_unique<TestSyncObj>(m); });
 
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
@@ -5209,7 +5206,6 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
 
     std::string movingKey = "helloworldmoving";
 
-    const size_t numMovingAttempts = 100;
     std::atomic<uint64_t> numMoves{0};
     config.enableMovingOnSlabRelease(
         [&](Item& oldItem, Item& newItem, Item* /* parentPtr */) {
@@ -5219,8 +5215,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
                       oldItem.getSize());
           ++numMoves;
         },
-        {},
-        numMovingAttempts);
+        {});
 
     AllocatorT alloc(config);
     const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
@@ -6968,6 +6963,26 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     // With only one pool, exportStats should fall back to individual
     // pool stats and NOT export aggregated stats (nothing to aggregate)
     EXPECT_FALSE(hasAggregatedStats(alloc));
+  }
+
+  // Reproducing issue where using 128 allocation classes with tail hits
+  // tracking enabled would throw when adding a pool
+  void testMaxAllocSizesWithTailHitsTracking() {
+    typename AllocatorT::Config config;
+    config.setCacheSize(10 * Slab::kSize);
+    config.enableTailHitsTracking();
+
+    AllocatorT alloc(config);
+    const size_t numBytes = alloc.getCacheMemoryStats().ramCacheSize;
+
+    // Create 128 allocation sizes: 128, 256, 384, ..., 16384
+    std::set<uint32_t> allocSizes;
+    for (uint32_t i = 1; i <= 128; ++i) {
+      allocSizes.insert(i * 128);
+    }
+
+    // Assert that adding a pool with 128 allocation sizes does not throw
+    ASSERT_NO_THROW(alloc.addPool("test_pool", numBytes, allocSizes));
   }
 };
 } // namespace tests

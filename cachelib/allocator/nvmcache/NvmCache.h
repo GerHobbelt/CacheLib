@@ -18,6 +18,7 @@
 
 #include <folly/container/F14Map.h>
 #include <folly/container/F14Set.h>
+#include <folly/container/small_vector.h>
 #include <folly/fibers/TimedMutex.h>
 #include <folly/hash/Hash.h>
 #include <folly/json/dynamic.h>
@@ -39,8 +40,10 @@
 #include "cachelib/common/EventInterface.h"
 #include "cachelib/common/Exceptions.h"
 #include "cachelib/common/Hash.h"
+#include "cachelib/common/Time.h"
 #include "cachelib/common/Utils.h"
 #include "cachelib/navy/common/Device.h"
+#include "cachelib/navy/common/Types.h"
 #include "folly/Range.h"
 
 namespace facebook::cachelib {
@@ -167,7 +170,8 @@ class NvmCache {
   NvmCache(C& c,
            Config config,
            bool truncate,
-           const ItemDestructor& itemDestructor);
+           const ItemDestructor& itemDestructor,
+           const navy::NavyPersistParams& navyPersistParams = {});
 
   // Look up item by key
   // @param key         key to lookup
@@ -289,6 +293,46 @@ class NvmCache {
   void markNvmItemRemovedLocked(HashedKey hk);
 
  private:
+  // Helper function to record event with NvmItem metadata
+  // @param event    The allocator API event type
+  // @param key      The key for the event
+  // @param result   The result of the operation
+  // @param nvmItem  The NvmItem to extract metadata from
+  void recordEvent(AllocatorApiEvent event,
+                   folly::StringPiece key,
+                   AllocatorApiResult result,
+                   const NvmItem* nvmItem = nullptr) {
+    if (auto eventTracker = CacheAPIWrapperForNvm<C>::getEventTracker(cache_)) {
+      if (!eventTracker->sampleKey(key)) {
+        return;
+      }
+    } else if (!CacheAPIWrapperForNvm<C>::getLegacyEventTracker(cache_)) {
+      return;
+    }
+
+    if (!nvmItem) {
+      CacheAPIWrapperForNvm<C>::recordEvent(cache_, event, key, result);
+      return;
+    }
+
+    const auto blob = nvmItem->getBlob(0);
+    const auto itemSize = blob.data.size();
+    const auto allocSize = blob.origAllocSize;
+    const auto expiryTime = nvmItem->getExpiryTime();
+    uint32_t ttlSecs = 0;
+    if (expiryTime != 0 && expiryTime > nvmItem->getCreationTime()) {
+      ttlSecs = expiryTime - nvmItem->getCreationTime();
+    }
+
+    CacheAPIWrapperForNvm<C>::recordEvent(
+        cache_, event, key, result,
+        typename C::EventRecordParams{.size = itemSize,
+                                      .ttlSecs = ttlSecs,
+                                      .expiryTime = expiryTime,
+                                      .allocSize = allocSize,
+                                      .poolId = nvmItem->poolId()});
+  }
+
   // returns the itemRemoved_ set size
   // it is the number of items were both in dram and nvm
   // and were removed from dram but not yet removed from nvm
@@ -350,8 +394,9 @@ class NvmCache {
   struct GetCtx {
     NvmCache& cache;       //< the NvmCache instance
     const std::string key; //< key being fetched
-    std::vector<std::shared_ptr<WaitContext<ReadHandle>>> waiters; // list of
-                                                                   // waiters
+    folly::small_vector<std::shared_ptr<WaitContext<ReadHandle>>, 4>
+        waiters;    // list of
+                    // waiters
     WriteHandle it; // will be set when Context is being filled
     util::LatencyTracker tracker_;
     bool valid_;
@@ -534,7 +579,7 @@ class NvmCache {
   std::unique_ptr<cachelib::navy::AbstractCache> navyCache_;
 
   friend class tests::NvmCacheTest;
-  FRIEND_TEST(CachelibAdminTest, WorkingSetAnalysisLoggingTest);
+  FRIEND_TEST(CachelibAdminCoreTest, WorkingSetAnalysisLoggingTest);
 };
 
 template <typename C>
@@ -840,11 +885,8 @@ void NvmCache<C>::evictCB(HashedKey hk,
         : stats().nvmSmallLifetimeSecs_.trackValue(lifetime);
     navyCache_->updateEvictionStats(hk, value, lifetime);
 
-    if (auto legacyEventTracker =
-            CacheAPIWrapperForNvm<C>::getLegacyEventTracker(cache_)) {
-      legacyEventTracker->record(AllocatorApiEvent::NVM_EVICT, hk.key(),
-                                 AllocatorApiResult::EVICTED);
-    }
+    recordEvent(AllocatorApiEvent::NVM_EVICT, hk.key(),
+                AllocatorApiResult::EVICTED, &nvmItem);
   }
 
   bool needDestructor = true;
@@ -973,7 +1015,8 @@ template <typename C>
 NvmCache<C>::NvmCache(C& c,
                       Config config,
                       bool truncate,
-                      const ItemDestructor& itemDestructor)
+                      const ItemDestructor& itemDestructor,
+                      const navy::NavyPersistParams& navyPersistParams)
     : config_(config.validateAndSetDefaults()),
       cache_(c),
       numShards_{config_.navyConfig.getNumShards()},
@@ -998,7 +1041,8 @@ NvmCache<C>::NvmCache(C& c,
       },
       truncate,
       std::move(config.deviceEncryptor),
-      itemDestructor_ ? true : false);
+      itemDestructor_ ? true : false,
+      navyPersistParams);
 }
 
 template <typename C>
@@ -1457,16 +1501,12 @@ void NvmCache<C>::remove(HashedKey hk, DeleteTombStoneGuard tombstone) {
   // capture array reference for delContext. it is stable
   auto delCleanup = [&delContexts, &ctx, this](navy::Status status,
                                                HashedKey) mutable {
-    if (auto legacyEventTracker =
-            CacheAPIWrapperForNvm<C>::getLegacyEventTracker(cache_)) {
-      const auto result = status == navy::Status::Ok
-                              ? AllocatorApiResult::REMOVED
-                              : (status == navy::Status::NotFound
-                                     ? AllocatorApiResult::NOT_FOUND
-                                     : AllocatorApiResult::FAILED);
-      legacyEventTracker->record(AllocatorApiEvent::NVM_REMOVE, ctx.key(),
-                                 result);
-    }
+    const auto result =
+        status == navy::Status::Ok
+            ? AllocatorApiResult::REMOVED
+            : (status == navy::Status::NotFound ? AllocatorApiResult::NOT_FOUND
+                                                : AllocatorApiResult::FAILED);
+    recordEvent(AllocatorApiEvent::NVM_REMOVE, ctx.key(), result);
     delContexts.destroyContext(ctx);
     if (status == navy::Status::Ok || status == navy::Status::NotFound ||
         status == navy::Status::ChecksumError) {

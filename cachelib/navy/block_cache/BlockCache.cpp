@@ -23,7 +23,9 @@
 #include <cstring>
 #include <utility>
 
+#include "cachelib/common/Time.h"
 #include "cachelib/common/inject_pause.h"
+#include "cachelib/navy/block_cache/FixedSizeIndex.h"
 #include "cachelib/navy/block_cache/SparseMapIndex.h"
 #include "cachelib/navy/common/Hash.h"
 #include "cachelib/navy/common/Types.h"
@@ -32,7 +34,6 @@
 namespace facebook::cachelib::navy {
 
 BlockCache::Config& BlockCache::Config::validate() {
-  XDCHECK_NE(scheduler, nullptr);
   if (!device || !evictionPolicy) {
     throw std::invalid_argument("missing required param");
   }
@@ -111,14 +112,28 @@ uint32_t BlockCache::calcAllocAlignSize() const {
 }
 
 std::unique_ptr<Index> BlockCache::createIndex(
-    const BlockCacheIndexConfig& indexConfig) {
-  // always SparseMapIndex for now
-  return std::make_unique<SparseMapIndex>(
-      indexConfig.getNumSparseMapBuckets(),
-      indexConfig.getNumBucketsPerMutex(),
-      indexConfig.isTrackItemHistoryEnabled()
-          ? SparseMapIndex::ExtraField::kItemHitHistory
-          : SparseMapIndex::ExtraField::kTotalHits);
+    const BlockCacheIndexConfig& indexConfig,
+    const NavyPersistParams& persistParams,
+    const std::string& name) {
+  if (indexConfig.isFixedSizeIndexEnabled()) {
+    return std::make_unique<FixedSizeIndex>(
+        indexConfig.getNumChunks(),
+        indexConfig.getNumBucketsPerChunkPower(),
+        indexConfig.getNumBucketsPerMutex(),
+        (indexConfig.useShmToPersist() || persistParams.useShm)
+            ? (persistParams.shmManager.has_value()
+                   ? &(persistParams.shmManager.value().get())
+                   : nullptr)
+            : nullptr,
+        name);
+  } else {
+    return std::make_unique<SparseMapIndex>(
+        indexConfig.getNumSparseMapBuckets(),
+        indexConfig.getNumBucketsPerMutex(),
+        indexConfig.isTrackItemHistoryEnabled()
+            ? SparseMapIndex::ExtraField::kItemHitHistory
+            : SparseMapIndex::ExtraField::kTotalHits);
+  }
 }
 
 BlockCache::BlockCache(Config&& config)
@@ -139,7 +154,8 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
       regionSize_{config.regionSize},
       itemDestructorEnabled_{config.itemDestructorEnabled},
       preciseRemove_{config.preciseRemove},
-      index_(createIndex(config.indexConfig)),
+      index_(
+          createIndex(config.indexConfig, config.persistParams, config.name)),
       regionManager_{config.getNumRegions(),
                      config.regionSize,
                      config.cacheBaseOffset,
@@ -162,6 +178,7 @@ BlockCache::BlockCache(Config&& config, ValidConfigTag)
   XDCHECK_NE(readBufferSize_, 0u);
 
   legacyEventTracker_ = config.legacyEventTracker;
+  eventTracker_ = config.eventTracker;
 }
 std::shared_ptr<BlockCacheReinsertionPolicy> BlockCache::makeReinsertionPolicy(
     const BlockCacheReinsertionConfig& reinsertionConfig) {
@@ -473,21 +490,32 @@ Status BlockCache::remove(HashedKey hk) {
   return Status::NotFound;
 }
 
-// Callback for region eviction. The evicted region is reclaimed by removing,
-// evicting or reinserting each item in the region so that the region
-// can be freed.
-//
-// See @RegionEvictCallback for details
+/**
+ * Callback for region eviction.
+ *
+ * This function is called when a region in the block cache is being evicted.
+ * The evicted region is reclaimed by iterating over each item in the region and
+ * either removing, evicting, or reinserting the item, depending on its state
+ * and policy. This process frees up the region for reuse.
+ *
+ * If a checksum error is detected in an item's descriptor, the reclaim process
+ * is aborted for the remaining items in the region, and their eviction
+ * callbacks will not be invoked. If a cheksum error is detected in the value,
+ * we can continue working on the remaining items as the metadata is still valid
+ * and that is what we need to find the next item to evict/remove/reinsert.
+ *
+ * Note: The time between item removal and callback invocation is not
+ * guaranteed. If an item is replaced, callbacks for both the old and new values
+ * may be invoked in any order.
+ *
+ * @param rid    The RegionId of the region being evicted.
+ * @param buffer A BufferView containing the data of the region to be reclaimed.
+ * @return       The number of items successfully evicted from the region.
+ *
+ * See @RegionEvictCallback for further details.
+ */
 uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
-  // Eviction callback guarantees are the following:
-  //   - Every value inserted will get eviction callback at some point of
-  //     time.
-  //   - It is invoked only once per insertion.
-  //
-  // We do not guarantee time between remove and callback invocation. If a
-  // value v1 was replaced with v2 user will get callbacks for both v1 and
-  // v2 when they are evicted (in no particular order).
-  uint32_t evictionCount = 0; // item that was evicted during reclaim
+  uint32_t evictionCount = 0;
   auto& region = regionManager_.getRegion(rid);
   auto offset = region.getLastEntryEndOffset();
   while (offset > 0) {
@@ -498,9 +526,11 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
     if (desc.csSelf != desc.computeChecksum()) {
       reclaimEntryHeaderChecksumErrorCount_.inc();
       XLOGF(ERR,
-            "Item header checksum mismatch in onRegionReclaim(). Region {} is "
-            "likely corrupted. Aborting reclaim. Remaining items in the region "
-            "will not be cleaned up (destructor won't be invoked). ",
+            "Item header checksum mismatch in onRegionReclaim(). Item {} is "
+            "likely corrupted. Aborting reclaim. This and remaining items in "
+            "the region "
+            "will not be cleaned up (destructor won't be invoked) nor "
+            "reinserted. ",
             "Expected: {}, Actual: {}, Offset-end: {}, Physical-offset-end: {},"
             " Header size: {}, Header (hex): {}",
             rid.index(),
@@ -513,53 +543,37 @@ uint32_t BlockCache::onRegionReclaim(RegionId rid, BufferView buffer) {
                 folly::ByteRange(entryEnd - sizeof(EntryDesc), entryEnd)));
       break;
     }
-
+    /*
+     * Entry Layout:
+     * | Value | Padding | Key | EntryDesc |
+     * ^                                 ^
+     * entryEnd - entrySize            entryEnd
+     * (value starts here)
+     */
     const auto entrySize = serializedSize(desc.keySize, desc.valueSize);
     HashedKey hk =
         makeHK(entryEnd - sizeof(EntryDesc) - desc.keySize, desc.keySize);
     BufferView value{desc.valueSize, entryEnd - entrySize};
 
-    if (checksumData_ && desc.cs != checksum(value)) {
-      // We do not need to abort here since the EntryDesc checksum was good, so
-      // we can safely proceed to read the next entry.
-      XLOGF(ERR,
-            "Item value checksum mismatch in onRegionReclaim(). Region {} is "
-            "likely corrupted. Aborting reclaim. Remaining items in the region "
-            "will not be cleaned up (destructor won't be invoked). ",
-            "Expected: {}, Actual: {}, Offset: {}, Physical-offset: {}, "
-            "Value-size: {}, Payload (hex): {}",
-            rid.index(),
-            desc.cs,
-            checksum(value),
-            addrEnd.offset() - entrySize,
-            regionManager_.physicalOffset(addrEnd) - entrySize,
-            desc.valueSize,
-            folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
-      reclaimValueChecksumErrorCount_.inc();
-      removeItem(hk, RelAddress{rid, offset});
-      // Reset the value to nullptr to avoid the destructor doing wrong thing
-      value = BufferView();
+    AllocatorApiResult reinsertionRes = reinsertOrRemoveItem(
+        hk, value, entrySize, RelAddress{rid, offset}, desc);
+    switch (reinsertionRes) {
+    case AllocatorApiResult::EVICTED:
+      evictionCount++;
+      usedSizeBytes_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
+      break;
+    case AllocatorApiResult::REMOVED:
+      holeCount_.sub(1);
+      holeSizeTotal_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
+      break;
+    default:
+      break;
+    }
+    if (destructorCb_ && reinsertionRes == AllocatorApiResult::EVICTED) {
+      destructorCb_(hk, value, DestructorEvent::Recycled);
     } else {
-      AllocatorApiResult reinsertionRes =
-          reinsertOrRemoveItem(hk, value, entrySize, RelAddress{rid, offset});
-      switch (reinsertionRes) {
-      case AllocatorApiResult::EVICTED:
-        evictionCount++;
-        usedSizeBytes_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
-        break;
-      case AllocatorApiResult::REMOVED:
-        holeCount_.sub(1);
-        holeSizeTotal_.sub(decodeSizeHint(encodeSizeHint(entrySize)));
-        break;
-      default:
-        break;
-      }
-      if (destructorCb_ && reinsertionRes == AllocatorApiResult::EVICTED) {
-        destructorCb_(hk, value, DestructorEvent::Recycled);
-      } else {
-        updateEventTracker(hk.key(), AllocatorApiEvent::NVM_EVICT,
-                           reinsertionRes, entrySize);
-      }
+      recordEvent(hk.key(), AllocatorApiEvent::NVM_EVICT, reinsertionRes,
+                  entrySize);
     }
     XDCHECK_GE(offset, entrySize);
     offset -= entrySize;
@@ -632,19 +646,75 @@ bool BlockCache::removeItem(HashedKey hk, RelAddress currAddr) {
   return false;
 }
 
-void BlockCache::updateEventTracker(folly::StringPiece key,
-                                    AllocatorApiEvent event,
-                                    AllocatorApiResult result,
-                                    uint32_t size) {
-  if (legacyEventTracker_.has_value()) {
+/**
+ * Record event, key, result, size and info from nvmItem.
+ *
+ * @param key              The key associated with the event.
+ * @param event            The event of type AllocatorApiEvent.
+ * @param result           The result of type AllocatorApiResult.
+ * @param size             The size of the item in NVM.
+ * @param params           Optional struct of type EventRecordParams.
+ *
+ * @return                 void
+ */
+void BlockCache::recordEvent(folly::StringPiece key,
+                             AllocatorApiEvent event,
+                             AllocatorApiResult result,
+                             uint32_t size,
+                             const NvmItem* nvmItem) {
+  if (eventTracker_.has_value()) {
+    if (!eventTracker_->get().sampleKey(key)) {
+      return;
+    }
+    EventInfo eventInfo;
+    eventInfo.event = event;
+    eventInfo.result = result;
+    eventInfo.size = size;
+    eventInfo.key = key;
+
+    // Extract additional information from NvmItem if available
+    if (nvmItem) {
+      eventInfo.poolId = nvmItem->poolId();
+      const auto expiryTime = nvmItem->getExpiryTime();
+      const auto creationTime = nvmItem->getCreationTime();
+
+      // expiryTime == 0 means no TTL was set for this item
+      if (expiryTime != 0) {
+        eventInfo.expiryTime = expiryTime;
+
+        // Calculate configured TTL from expiryTime and creationTime
+        // TTL = expiryTime - creationTime
+        if (expiryTime > creationTime) {
+          eventInfo.ttlSecs = expiryTime - creationTime;
+        }
+
+        // Calculate time to expire from current time
+        const auto currentTime = util::getCurrentTimeSec();
+        if (expiryTime > currentTime) {
+          eventInfo.timeToExpire =
+              static_cast<uint32_t>(expiryTime - currentTime);
+        }
+      }
+
+      // Access the allocation size of the item being stored
+      if (nvmItem->getNumBlobs() > 0) {
+        const auto blob = nvmItem->getBlob(0);
+        eventInfo.allocSize = blob.origAllocSize;
+      }
+    }
+
+    eventTracker_->get().record(eventInfo);
+  } else if (legacyEventTracker_.has_value()) {
     legacyEventTracker_->get().record(event, key, result, size);
   }
 }
 
-AllocatorApiResult BlockCache::reinsertOrRemoveItem(HashedKey hk,
-                                                    BufferView value,
-                                                    uint32_t entrySize,
-                                                    RelAddress currAddr) {
+AllocatorApiResult BlockCache::reinsertOrRemoveItem(
+    HashedKey hk,
+    BufferView value,
+    uint32_t entrySize,
+    RelAddress currAddr,
+    const EntryDesc& entryDesc) {
   auto removeItem = [this, hk, currAddr](bool expired) {
     if (index_->removeIfMatch(hk.keyHash(), encodeRelAddress(currAddr))) {
       if (expired) {
@@ -662,13 +732,36 @@ AllocatorApiResult BlockCache::reinsertOrRemoveItem(HashedKey hk,
     return AllocatorApiResult::REMOVED;
   }
 
-  if (checkExpired_ && checkExpired_(value)) {
-    return removeItem(true);
+  try {
+    if (checkExpired_ && checkExpired_(value)) {
+      return removeItem(true);
+    }
+
+    if (!reinsertionPolicy_ ||
+        !reinsertionPolicy_->shouldReinsert(hk.key(), toStringPiece(value))) {
+      return removeItem(false);
+    }
+  } catch (const std::exception& e) {
+    XLOGF(ERR, "Exception in reinsertOrRemoveItem: {}", e.what());
+    return AllocatorApiResult::CORRUPTED;
   }
 
-  if (!reinsertionPolicy_ ||
-      !reinsertionPolicy_->shouldReinsert(hk.key(), toStringPiece(value))) {
-    return removeItem(false);
+  // Validate checksum as we want to reinsert the item
+  if (checksumData_ && entryDesc.cs != checksum(value)) {
+    // We do not need to abort here since the EntryDesc checksum was good, so
+    // we can safely proceed to read the next entry.
+    XLOGF(ERR,
+          "Item value checksum mismatch in reinsertOrRemoveItem(). "
+          "Item is likely corrupted. Item will not be reinserted. "
+          "We will continue evaluating remaining items in the region."
+          "Expected: {}, Actual: {}, Value-size: {}, Payload (hex): {}",
+          entryDesc.cs,
+          checksum(value),
+          entryDesc.valueSize,
+          folly::hexlify(folly::ByteRange(value.data(), value.dataEnd())));
+    reclaimValueChecksumErrorCount_.inc();
+    removeItem(false);
+    return AllocatorApiResult::CORRUPTED;
   }
 
   // Priority of an re-inserted item is determined by its past accesses
@@ -849,6 +942,10 @@ void BlockCache::flush() {
 void BlockCache::reset() {
   XLOG(INFO, "Reset block cache");
   index_->reset();
+  initializeBlockCache();
+}
+
+void BlockCache::initializeBlockCache() {
   // Allocator resets region manager
   allocator_.reset();
 
@@ -956,7 +1053,7 @@ void BlockCache::persist(RecordWriter& rw) {
 
 bool BlockCache::recover(RecordReader& rr) {
   XLOG(INFO, "Starting block cache recovery");
-  reset();
+  initializeBlockCache();
   try {
     tryRecover(rr);
   } catch (const std::exception& e) {

@@ -54,12 +54,10 @@ std::unique_ptr<JobScheduler> makeJobScheduler() {
 }
 
 // 4x16k regions
-BlockCache::Config makeConfig(JobScheduler& scheduler,
-                              std::unique_ptr<EvictionPolicy> policy,
+BlockCache::Config makeConfig(std::unique_ptr<EvictionPolicy> policy,
                               Device& device,
                               uint64_t cacheSize = kDeviceSize) {
   BlockCache::Config config;
-  config.scheduler = &scheduler;
   config.regionSize = kRegionSize;
   config.cacheSize = cacheSize;
   config.device = &device;
@@ -71,6 +69,13 @@ BlockCacheReinsertionConfig makeHitsReinsertionConfig(
     uint8_t hitsReinsertThreshold) {
   BlockCacheReinsertionConfig config{};
   config.enableHitsBased(hitsReinsertThreshold);
+  return config;
+}
+
+BlockCacheReinsertionConfig makePctReinsertionConfig(
+    unsigned int pctThreshold) {
+  BlockCacheReinsertionConfig config{};
+  config.enablePctBased(pctThreshold);
   return config;
 }
 
@@ -144,7 +149,7 @@ class CollisionCreator {
     auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
     device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
     auto ex = makeJobScheduler();
-    auto config = makeConfig(*ex, std::move(policy), *device);
+    auto config = makeConfig(std::move(policy), *device);
     if (configModifier) {
       configModifier(config);
     }
@@ -185,7 +190,7 @@ TEST(BlockCache, InsertLookup) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -237,7 +242,7 @@ TEST(BlockCache, InsertLookupSync) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 1;
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
@@ -281,7 +286,7 @@ TEST(BlockCache, CouldExist) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -301,7 +306,7 @@ TEST(BlockCache, AsyncCallbacks) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
   MockInsertCB cbInsert;
@@ -340,7 +345,7 @@ TEST(BlockCache, Remove) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
   BufferGen bg;
@@ -447,7 +452,7 @@ TEST(BlockCache, SimpleReclaim) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -489,7 +494,7 @@ TEST(BlockCache, HoleStats) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   // items which are accessed once will be reinserted on reclaim
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
   auto engine = makeEngine(std::move(config));
@@ -582,10 +587,11 @@ TEST(BlockCache, ReclaimCorruption) {
   auto device = std::make_unique<MockDevice>(kDeviceSize, 1 /* ioAlignment */,
                                              nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.checksum = true;
-  // items which are accessed once will be reinserted on reclaim
-  config.reinsertionConfig = makeHitsReinsertionConfig(1);
+  // Use 100% reinsertion so all items are eligible for reinsertion
+  // so that value checksuming will occur
+  config.reinsertionConfig = makePctReinsertionConfig(100);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -668,7 +674,7 @@ TEST(BlockCache, StackAlloc) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = std::make_unique<MockSingleThreadJobScheduler>();
   auto exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.readBufferSize = 2048;
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
@@ -705,7 +711,7 @@ TEST(BlockCache, RegionUnderflow) {
   // Although 2k read buffer, shouldn't underflow the region!
   EXPECT_CALL(*device, readImpl(0, 1024, _));
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 4;
   config.readBufferSize = 2048;
 
@@ -731,7 +737,7 @@ TEST(BlockCache, SmallReadBuffer) {
   EXPECT_CALL(*device, writeImpl(0, 16 * 1024, _, _));
   EXPECT_CALL(*device, readImpl(0, 8192, _));
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 4;
   // Small read buffer. We will automatically align to 8192 when we read.
   // This is no longer useful with index saving the object sizes.
@@ -760,7 +766,7 @@ TEST(BlockCache, SmallAllocAlignment) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = std::make_unique<NiceMock<MockDevice>>(kDeviceSize, 1024);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 4;
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
@@ -812,7 +818,7 @@ TEST(BlockCache, MultipleAllocAlignmentSizeItems) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = std::make_unique<NiceMock<MockDevice>>(kDeviceSize, 1024);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 4;
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
@@ -861,7 +867,7 @@ TEST(BlockCache, StackAllocReclaim) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = std::make_unique<NiceMock<MockDevice>>(kDeviceSize, 1024);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -938,7 +944,7 @@ TEST(BlockCache, ReadRegionDuringReclaim) {
   auto ex = std::make_unique<MockJobScheduler>();
   auto exPtr = ex.get();
   // Huge size class to fill a region in 4 allocs
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 2;
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
@@ -1038,7 +1044,7 @@ TEST(BlockCache, DeviceFailure) {
   }
 
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -1070,7 +1076,7 @@ TEST(BlockCache, Flush) {
   EXPECT_CALL(*device, flushImpl());
 
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -1120,7 +1126,7 @@ TEST(BlockCache, Reset) {
   proxyPtr->setRealDevice(setupResetTestDevice(kDeviceSize));
 
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *proxyPtr);
+  auto config = makeConfig(std::move(policy), *proxyPtr);
   config.numInMemBuffers = 3;
   expectRegionsTracked(mp, {0, 1, 2, 3});
   auto engine = makeEngine(std::move(config));
@@ -1176,7 +1182,7 @@ TEST(BlockCache, DestructorCallback) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
   auto* exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 9;
   config.destructorCb = toCallback(cb);
   auto engine = makeEngine(std::move(config));
@@ -1227,7 +1233,7 @@ TEST(BlockCache, RegionLastOffset) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -1269,7 +1275,7 @@ TEST(BlockCache, RegionLastOffsetOnReset) {
   auto& mp = *policy;
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -1336,7 +1342,7 @@ TEST(BlockCache, Recovery) {
   auto device =
       createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 2;
   auto engine = makeEngine(std::move(config), metadataSize);
   auto driver = makeDriver(std::move(engine), std::move(ex), std::move(device),
@@ -1403,7 +1409,7 @@ TEST(BlockCache, RecoveryWithDifferentCacheSize) {
   folly::IOBufQueue originalMetadata;
   {
     auto config =
-        makeConfig(*ex, std::make_unique<NiceMock<MockPolicy>>(&hits), *device);
+        makeConfig(std::make_unique<NiceMock<MockPolicy>>(&hits), *device);
     auto engine = makeEngine(std::move(config), metadataSize);
 
     auto numItems = kDeviceSize / kRegionSize;
@@ -1446,7 +1452,7 @@ TEST(BlockCache, RecoveryWithDifferentCacheSize) {
   // Recover with the right size
   {
     auto config =
-        makeConfig(*ex, std::make_unique<NiceMock<MockPolicy>>(&hits), *device);
+        makeConfig(std::make_unique<NiceMock<MockPolicy>>(&hits), *device);
     auto engine = makeEngine(std::move(config), metadataSize);
     auto rr = createMemoryRecordReader(originalMetadata);
     ASSERT_TRUE(engine->recover(*rr));
@@ -1465,7 +1471,7 @@ TEST(BlockCache, RecoveryWithDifferentCacheSize) {
   // Creat engine with larger size
   {
     auto config =
-        makeConfig(*ex, std::make_unique<NiceMock<MockPolicy>>(&hits), *device);
+        makeConfig(std::make_unique<NiceMock<MockPolicy>>(&hits), *device);
     config.cacheSize += 4096;
     ASSERT_THROW(makeEngine(std::move(config), metadataSize),
                  std::invalid_argument);
@@ -1495,7 +1501,7 @@ TEST(BlockCache, SmallerSlotSizes) {
 
     size_t metadataSize = 3 * 1024 * 1024;
     auto ex = makeJobScheduler();
-    auto config = makeConfig(*ex, std::move(policy), *device);
+    auto config = makeConfig(std::move(policy), *device);
     try {
       auto engine = makeEngine(std::move(config), metadataSize);
     } catch (const std::invalid_argument& e) {
@@ -1509,7 +1515,7 @@ TEST(BlockCache, SmallerSlotSizes) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   size_t metadataSize = 3 * 1024 * 1024;
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device, myDeviceSize);
+  auto config = makeConfig(std::move(policy), *device, myDeviceSize);
   config.numInMemBuffers = 4;
   auto engine = makeEngine(std::move(config), metadataSize);
   auto driver = makeDriver(std::move(engine), std::move(ex), std::move(device),
@@ -1560,7 +1566,7 @@ TEST(BlockCache, HoleStatsRecovery) {
   auto device =
       createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config), metadataSize);
   auto driver = makeDriver(std::move(engine), std::move(ex), std::move(device),
                            metadataSize);
@@ -1616,7 +1622,7 @@ TEST(BlockCache, RecoveryBadConfig) {
     auto deviceSize = metadataSize + kDeviceSize;
     auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
     auto ex = makeJobScheduler();
-    auto config = makeConfig(*ex, std::move(policy), *device);
+    auto config = makeConfig(std::move(policy), *device);
     auto engine = makeEngine(std::move(config), metadataSize);
     auto driver = makeDriver(std::move(engine), std::move(ex),
                              std::move(device), metadataSize);
@@ -1643,7 +1649,7 @@ TEST(BlockCache, RecoveryBadConfig) {
     auto deviceSize = metadataSize + kDeviceSize;
     auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
     auto ex = makeJobScheduler();
-    auto config = makeConfig(*ex, std::move(policy), *device);
+    auto config = makeConfig(std::move(policy), *device);
     config.regionSize = 8 * 1024; // Region size differs from original
     auto engine = makeEngine(std::move(config), metadataSize);
     auto driver = makeDriver(std::move(engine), std::move(ex),
@@ -1658,7 +1664,7 @@ TEST(BlockCache, RecoveryBadConfig) {
     auto deviceSize = metadataSize + kDeviceSize;
     auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
     auto ex = makeJobScheduler();
-    auto config = makeConfig(*ex, std::move(policy), *device);
+    auto config = makeConfig(std::move(policy), *device);
     config.checksum = true;
     auto engine = makeEngine(std::move(config));
     auto driver = makeDriver(std::move(engine), std::move(ex),
@@ -1677,7 +1683,7 @@ TEST(BlockCache, RecoveryCorruptedData) {
     auto deviceSize = metadataSize + kDeviceSize;
     auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
     auto ex = makeJobScheduler();
-    auto config = makeConfig(*ex, std::move(policy), *device);
+    auto config = makeConfig(std::move(policy), *device);
     auto engine = makeEngine(std::move(config), metadataSize);
     auto rw = createMetadataRecordWriter(*device, metadataSize);
     driver = makeDriver(std::move(engine), std::move(ex), std::move(device),
@@ -1704,7 +1710,7 @@ TEST(BlockCache, NoJobsOnStartup) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = std::make_unique<MockJobScheduler>();
   auto exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -1722,7 +1728,7 @@ TEST(BlockCache, Checksum) {
       createMemoryDevice(kDeviceSize, nullptr /* encryption */, kIOAlignSize);
   auto ex = std::make_unique<MockSingleThreadJobScheduler>();
   auto exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.readBufferSize = 2048;
   config.checksum = true;
   auto engine = makeEngine(std::move(config));
@@ -1785,7 +1791,7 @@ TEST(BlockCache, HitsReinsertionPolicy) {
   auto policy = std::make_unique<NiceMock<MockPolicy>>(&hits);
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
@@ -1896,7 +1902,7 @@ TEST(BlockCache, HitsReinsertionPolicyRecovery) {
   auto device =
       createMemoryDevice(deviceSize, nullptr /* encryption */, ioAlignSize);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
   auto engine = makeEngine(std::move(config), metadataSize);
   auto driver = makeDriver(std::move(engine), std::move(ex), std::move(device),
@@ -1932,7 +1938,7 @@ TEST(BlockCache, UsePriorities) {
   auto deviceSize = metadataSize + kRegionSize * 6;
   auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device, kRegionSize * 6);
+  auto config = makeConfig(std::move(policy), *device, kRegionSize * 6);
   // 3 priorities
   config.allocatorsPerPriority = {1, 1, 1};
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
@@ -1989,7 +1995,7 @@ TEST(BlockCache, UsePrioritiesSizeClass) {
   auto deviceSize = metadataSize + kRegionSize * 6;
   auto device = createMemoryDevice(deviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device, kRegionSize * 6);
+  auto config = makeConfig(std::move(policy), *device, kRegionSize * 6);
   config.allocatorsPerPriority = {1, 1, 1};
   config.reinsertionConfig = makeHitsReinsertionConfig(1);
   // Enable in-mem buffer so size align on 512 bytes boundary
@@ -2053,7 +2059,7 @@ TEST(BlockCache, DeviceFlushFailureSync) {
   EXPECT_CALL(*device, writeImpl(_, _, _, _)).WillRepeatedly(Return(false));
 
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 4;
   config.inMemBufFlushRetryLimit = kFlushRetryLimit;
   auto engine = makeEngine(std::move(config));
@@ -2095,7 +2101,7 @@ TEST(BlockCache, DeviceFlushFailureAsync) {
   EXPECT_CALL(*device, writeImpl(_, _, _, _)).WillRepeatedly(Return(false));
 
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 4;
   config.inMemBufFlushRetryLimit = kFlushRetryLimit;
   auto engine = makeEngine(std::move(config));
@@ -2185,7 +2191,7 @@ TEST(BlockCache, testItemDestructor) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = makeJobScheduler();
   auto* exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 9;
   config.destructorCb = toCallback(cb);
   config.itemDestructorEnabled = true;
@@ -2232,7 +2238,7 @@ TEST(BlockCache, RandomAlloc) {
   auto device = createMemoryDevice(kDeviceSize, nullptr /* encryption */);
   auto ex = std::make_unique<MockJobScheduler>();
   auto exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));
 
@@ -2292,7 +2298,7 @@ TEST(BlockCache, SizeAndAlignment) {
       alignSize * (static_cast<uint64_t>(1) << 32));
   auto ex = makeJobScheduler();
   // auto* exPtr = ex.get();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.numInMemBuffers = 9;
 
   config.itemDestructorEnabled = true;
@@ -2321,7 +2327,7 @@ TEST(BlockCache, RetryRead) {
   auto device = std::make_unique<MockDevice>(kDeviceSize, 1024);
 
   auto ex = makeJobScheduler();
-  auto config = makeConfig(*ex, std::move(policy), *device);
+  auto config = makeConfig(std::move(policy), *device);
   config.checksum = true;
   auto engine = makeEngine(std::move(config));
   auto driver = makeDriver(std::move(engine), std::move(ex));

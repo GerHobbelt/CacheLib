@@ -25,6 +25,7 @@
 #include "cachelib/common/PercentileStats.h"
 #include "cachelib/navy/common/Buffer.h"
 #include "cachelib/navy/common/Hash.h"
+#include "cachelib/shm/ShmManager.h"
 
 namespace facebook {
 namespace cachelib {
@@ -50,6 +51,25 @@ enum class Status {
 
   // Internal checksum mismatch (header or value)
   ChecksumError,
+};
+
+// Internal struct for the parameters to configure navy persistence.
+// User can configure whether to use shm or flash by using setPersistUsingShm()
+// in BlockCacheIndexConfig. (TODO: Currently it's just set using the index type
+// (SparseMapIndex or FixedSizeIndex) with
+// BlockCacheConfig::enableSparseMapIndex() or
+// BlockCacheConfig::enableFixedSizeIndex()).
+// This struct is used to pass all the parameters for navy persistence
+// internally.
+struct NavyPersistParams {
+  // Whether to use shm or flash for navy persistence
+  // TODO: For now, this will be enforced by the configured index type.
+  // (Shm persistence is not supported by SparseMapIndex while FixedSizeIndex is
+  // only with the shm persistence. We probably need to support persistence
+  // using flash for FixedSizeIndex in the future)
+  bool useShm{false};
+
+  std::optional<std::reference_wrapper<ShmManager>> shmManager;
 };
 
 enum class DestructorEvent {
