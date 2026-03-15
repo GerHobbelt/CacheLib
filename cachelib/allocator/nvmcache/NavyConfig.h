@@ -663,7 +663,7 @@ class BlockCacheConfig {
 
   // Number of allocators per priority.
   // Do not set this directly. This should be configured by setAllocatorCount
-  // for FIFO and LRU, and enableSegmentedFifio for segmented FIFO.
+  // for FIFO and LRU, and enableSegmentedFifo for segmented FIFO.
   std::vector<uint32_t> allocatorsPerPriority_{1};
 
   // Index related config. If not specified, SparseMapIndex will be used
@@ -1110,7 +1110,7 @@ class NavyConfig {
 
   // ============ Other settings =============
   // Maximum number of concurrent inserts we allow globally for Navy.
-  // 0 means unlimited.
+  // 0 rejects all inserts. Default of 1'000'000 is effectively no limit.
   uint32_t maxConcurrentInserts_{1'000'000};
   // Total memory limit for in-flight parcels.
   // Once this is reached, requests will be rejected until the parcel
