@@ -14,16 +14,17 @@
  * limitations under the License.
  */
 
-include "thrift/annotation/thrift.thrift"
+#include "cachelib/interface/Stats.h"
 
-@thrift.AllowLegacyMissingUris
-package;
+namespace facebook::cachelib::interface::detail {
 
-namespace cpp2 facebook.cachelib.serialization
-
-struct ShmManagerObject {
-  @thrift.AllowUnsafeRequiredFieldQualifier
-  1: required byte shmVal;
-  @thrift.AllowUnsafeRequiredFieldQualifier
-  3: required map<string, string> nameToKeyMap;
+bool shouldSample(size_t sampleRate) {
+  thread_local size_t counter = 0;
+  if (sampleRate > 0) {
+    return counter++ % sampleRate == 0;
+  } else {
+    return false;
+  }
 }
+
+} // namespace facebook::cachelib::interface::detail

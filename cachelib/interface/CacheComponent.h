@@ -119,6 +119,10 @@ class CacheComponent {
    */
   virtual folly::coro::Task<UnitResult> remove(ReadHandle&& handle) = 0;
 
+  /**
+   * Get stats for the cache component.
+   * @return stats for the cache component
+   */
   virtual CacheComponentStats getStats() const noexcept = 0;
 
  protected:
@@ -174,8 +178,9 @@ class CacheComponent {
  */
 class CacheComponentWithStats : public CacheComponent {
  public:
-  CacheComponentWithStats()
-      : stats_(std::make_unique<CacheComponentStatsCollector>()) {}
+  CacheComponentWithStats(
+      const CacheComponentStatsCollector::LatencySamplingConfig& config = {})
+      : stats_(std::make_unique<CacheComponentStatsCollector>(config)) {}
 
   CacheComponentStats getStats() const noexcept override {
     return CacheComponentStats(*stats_);
