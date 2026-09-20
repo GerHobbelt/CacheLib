@@ -51,7 +51,9 @@ struct ObjectCacheItem {
 enum class ObjectCacheDestructorContext {
   // evicted from cache
   kEvicted,
-  // removed by user calling remove()/insertOrReplace() or due to expired
+  // removed by user calling remove()/insertOrReplace() or due to expired.
+  // Use ObjectCacheDestructorData::removedBySuccessfulReplacement to
+  // distinguish a successful insertOrReplace() from other removals.
   kRemoved,
   // unknown cases
   kUnknown,
@@ -63,13 +65,15 @@ struct ObjectCacheDestructorData {
                             const KAllocation::Key& k,
                             uint32_t expiryTime,
                             uint32_t creationTime,
-                            uint32_t lastAccessTime)
+                            uint32_t lastAccessTime,
+                            bool removedBySuccessfulReplacement = false)
       : context(ctx),
         objectPtr(ptr),
         key(k),
         expiryTime(expiryTime),
         creationTime(creationTime),
-        lastAccessTime(lastAccessTime) {}
+        lastAccessTime(lastAccessTime),
+        removedBySuccessfulReplacement(removedBySuccessfulReplacement) {}
 
   // release the evicted/removed/expired object memory
   template <typename T>
@@ -94,6 +98,10 @@ struct ObjectCacheDestructorData {
 
   // the last time this object was accessed
   uint32_t lastAccessTime;
+
+  // Whether the object was removed by an insertOrReplace() that successfully
+  // installed its replacement. Always false for kEvicted/kUnknown.
+  bool removedBySuccessfulReplacement;
 };
 
 // Information about cache memory capacity calculated from configuration
@@ -310,6 +318,13 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   // @return shared pointer to a const version of the object
   template <typename T>
   std::shared_ptr<const T> find(folly::StringPiece key);
+
+  // Inspect an object in RAM without filtering expired items or updating
+  // access tracking such as LRU promotion, matching the RAM lookup semantics
+  // of CacheAllocator::inspectCache(). The item remains pinned until the
+  // returned shared pointer is released.
+  template <typename T>
+  std::shared_ptr<const T> inspectCache(folly::StringPiece key);
 
   // Return whether an object exists in cache without looking up the device.
   StorageMedium existFast(folly::StringPiece key);
@@ -742,6 +757,8 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   TLCounter evictions_{};
   TLCounter lookups_;
   TLCounter succL1Lookups_;
+  TLCounter inspections_;
+  TLCounter succL1Inspections_;
   TLCounter inserts_;
   TLCounter insertErrors_;
   TLCounter replaces_;
@@ -792,6 +809,9 @@ void ObjectCache<AllocatorT>::init() {
           auto& item = data.item;
 
           auto itemPtr = getAlignedItemPtr(item.getMemory());
+          const bool removedBySuccessfulReplacement =
+              ctx == ObjectCacheDestructorContext::kRemoved &&
+              item.isRemovedByReplacement();
 
           SCOPE_EXIT {
             if (config_.objectSizeTrackingEnabled) {
@@ -804,7 +824,8 @@ void ObjectCache<AllocatorT>::init() {
             // execute user defined item destructor
             config_.itemDestructor(ObjectCacheDestructorData(
                 ctx, itemPtr->objectPtr, item.getKey(), item.getExpiryTime(),
-                item.getCreationTime(), item.getLastAccessTime()));
+                item.getCreationTime(), item.getLastAccessTime(),
+                removedBySuccessfulReplacement));
           };
         });
   } else {
@@ -822,6 +843,9 @@ void ObjectCache<AllocatorT>::init() {
       auto& item = data.item;
 
       auto itemPtr = getAlignedItemPtr(item.getMemory());
+      const bool removedBySuccessfulReplacement =
+          ctx == ObjectCacheDestructorContext::kRemoved &&
+          item.isRemovedByReplacement();
 
       SCOPE_EXIT {
         if (config_.objectSizeTrackingEnabled) {
@@ -834,7 +858,8 @@ void ObjectCache<AllocatorT>::init() {
         // execute user defined item destructor
         config_.removeCb(ObjectCacheDestructorData(
             ctx, itemPtr->objectPtr, item.getKey(), item.getExpiryTime(),
-            item.getCreationTime(), item.getLastAccessTime()));
+            item.getCreationTime(), item.getLastAccessTime(),
+            removedBySuccessfulReplacement));
       };
     });
   }
@@ -972,6 +997,24 @@ std::shared_ptr<const T> ObjectCache<AllocatorT>::find(folly::StringPiece key) {
 
   auto ptr = getAlignedItemPtr(found->getMemory())->objectPtr;
   // Use custom deleter
+  auto deleter = Deleter<const T>(std::move(found));
+  return std::shared_ptr<const T>(reinterpret_cast<const T*>(ptr),
+                                  std::move(deleter));
+}
+
+template <typename AllocatorT>
+template <typename T>
+std::shared_ptr<const T> ObjectCache<AllocatorT>::inspectCache(
+    folly::StringPiece key) {
+  inspections_.inc();
+  auto inspected = this->l1Cache_->inspectCache(key);
+  auto found = std::move(inspected.first);
+  if (!found) {
+    return nullptr;
+  }
+  succL1Inspections_.inc();
+
+  auto ptr = getAlignedItemPtr(found->getMemory())->objectPtr;
   auto deleter = Deleter<const T>(std::move(found));
   return std::shared_ptr<const T>(reinterpret_cast<const T*>(ptr),
                                   std::move(deleter));
@@ -1221,6 +1264,10 @@ void ObjectCache<AllocatorT>::getObjectCacheCounters(
   visitor("objcache.lookups", lookups_.get(),
           util::CounterVisitor::CounterType::RATE);
   visitor("objcache.lookups.l1_hits", succL1Lookups_.get(),
+          util::CounterVisitor::CounterType::RATE);
+  visitor("objcache.inspections", inspections_.get(),
+          util::CounterVisitor::CounterType::RATE);
+  visitor("objcache.inspections.l1_hits", succL1Inspections_.get(),
           util::CounterVisitor::CounterType::RATE);
   visitor("objcache.inserts", inserts_.get(),
           util::CounterVisitor::CounterType::RATE);

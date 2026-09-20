@@ -1042,7 +1042,8 @@ class CacheAllocator : public CacheBase {
                     // enabled but failed to persist it.
     kSavedOnlyNvmCache, // Successfully persisted the enabled NvM cache only;
                         // Failed to persist DRAM cache.
-    kFailed // Failed to persist both the DRAM cache and the enabled NvmCache.
+    kFailed, // Failed to persist both the DRAM cache and the enabled NvmCache.
+    kSkipped // Duplicate shutDown() call
   };
 
   // Persists the state of the cache allocator. On a successful shutdown,
@@ -1059,9 +1060,10 @@ class CacheAllocator : public CacheBase {
   // @return  A ShutDownStatus value indicating the result of the shutDown
   //          operation.
   //          kSuccess - successfully shut down and can be re-attached
-  //          kFailed - failure due to outstanding active handle or error with
-  //                    cache dir
+  //          kFailed - failure due to outstanding active handles, error with
+  //                    cache dir or error stopping background workers
   //          kSavedOnlyDRAM and kSavedOnlyNvmCache - partial content saved
+  //          kSkipped - duplicate shutdown call
   ShutDownStatus shutDown();
 
   // No-op for workers that are already running. Typically user uses this in
@@ -1222,9 +1224,10 @@ class CacheAllocator : public CacheBase {
     stats_.numAbortedSlabReleases.inc();
   }
 
-  // Check if shutdown is in progress
-  bool isShutdownInProgress() const override final {
-    return shutDownInProgress_.load();
+  // Check if a fast shutdown has been triggered, signalling workers to abort
+  // in-progress work (e.g. slab release) so shutDown() can proceed quickly.
+  bool isFastShutdownTriggered() const override final {
+    return triggerFastShutdown_.load();
   }
 
   // return the distribution of the keys in the cache. This is expensive to
@@ -1420,7 +1423,9 @@ class CacheAllocator : public CacheBase {
   // returns true if there was no error in trying to cleanup the segment
   // because another process was attached. False if the user tried to clean up
   // and the cache was actually attached.
-  static bool cleanupStrayShmSegments(const std::string& cacheDir, bool posix);
+  static bool cleanupStrayShmSegments(const std::string& cacheDir,
+                                      bool posix,
+                                      const std::string& hugePageMountDir = "");
 
   // gives a relative offset to a pointer within the cache.
   uint64_t getItemPtrAsOffset(const void* ptr);
@@ -2250,6 +2255,14 @@ class CacheAllocator : public CacheBase {
                   std::chrono::seconds timeout = std::chrono::seconds{0});
 
   ShmSegmentOpts createShmCacheOpts();
+
+  // Builds the shm options for an access-container (hash table) segment,
+  ShmSegmentOpts createShmAccessOpts();
+
+  // Validates and applies a requested huge page size (bytes; 0 == normal) onto
+  // opts, throwing if the kernel does not support the size.
+  void applyHugePageOpts(ShmSegmentOpts& opts, const PageSize& pageSize) const;
+
   std::unique_ptr<MemoryAllocator> createNewMemoryAllocator();
   std::unique_ptr<MemoryAllocator> restoreMemoryAllocator();
   std::unique_ptr<CCacheManager> restoreCCacheManager();
@@ -2641,8 +2654,13 @@ class CacheAllocator : public CacheBase {
   // admission policy for nvmcache
   std::shared_ptr<NvmAdmissionPolicy<CacheT>> nvmAdmissionPolicy_;
 
-  // indicates if the shutdown of cache is in progress or not
-  std::atomic<bool> shutDownInProgress_{false};
+  // set when a fast shutdown is requested; signals background workers to abort
+  // in-progress work so shutDown() can complete quickly
+  std::atomic<bool> triggerFastShutdown_{false};
+
+  // shutDown() is one-shot. The first caller to flip this false->true owns the
+  // (destructive, non-idempotent) teardown. This is never reset.
+  std::atomic<bool> shutDownStarted_{false};
 
   // END private members
 
@@ -2736,7 +2754,8 @@ CacheAllocator<CacheTrait>::CacheAllocator(
                    : nullptr),
       shmManager_(type != InitMemType::kNone
                       ? std::make_unique<ShmManager>(config_.cacheDir,
-                                                     config_.isUsingPosixShm())
+                                                     config_.isUsingPosixShm(),
+                                                     config_.hugePageMountDir)
                       : nullptr),
       deserializer_(type == InitMemType::kMemAttach ? createDeserializer()
                                                     : nullptr),
@@ -2794,7 +2813,36 @@ ShmSegmentOpts CacheAllocator<CacheTrait>::createShmCacheOpts() {
     throw std::invalid_argument("CacheLib only supports a single memory tier");
   }
   opts.memBindNumaNodes = config_.memoryTierConfigs[0].getMemBind();
+  applyHugePageOpts(opts, config_.hugePageSize);
   return opts;
+}
+
+template <typename CacheTrait>
+ShmSegmentOpts CacheAllocator<CacheTrait>::createShmAccessOpts() {
+  ShmSegmentOpts opts;
+  applyHugePageOpts(opts, config_.hugePageSize);
+  return opts;
+}
+
+template <typename CacheTrait>
+void CacheAllocator<CacheTrait>::applyHugePageOpts(
+    ShmSegmentOpts& opts, const PageSize& pageSize) const {
+  if (!pageSize.isHugePage()) {
+    return;
+  } else if (!PageSize::supportedHugePageSizes().contains(
+                 pageSize.getPageSize())) {
+    throw std::invalid_argument(fmt::format(
+        "Requested huge page size {} is not supported by the kernel",
+        pageSize.getPageSize()));
+  } else if (config_.hugePageMountDir.empty() && config_.usePosixShm) {
+    throw std::invalid_argument(
+        "Requested huge pages for POSIX shared memory regions but didn't "
+        "supply a hugetlbfs mount");
+  }
+  opts.pageSize = pageSize;
+  // The segment is attached at a page-aligned address, so its alignment must be
+  // at least the huge page size or the kernel rejects the mapping
+  opts.alignment = std::max(opts.alignment, pageSize.getPageSize());
 }
 
 template <typename CacheTrait>
@@ -3004,7 +3052,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
                 name,
                 AccessContainer::getRequiredSize(config.getNumBuckets()),
                 nullptr,
-                ShmSegmentOpts(config.getPageSize()))
+                createShmAccessOpts())
             .addr,
         compressor_,
         [this](Item* it) -> WriteHandle { return acquire(it); });
@@ -3012,9 +3060,10 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
     return std::make_unique<AccessContainer>(
         deserializer_->deserialize<AccessSerializationType>(),
         config,
-        shmManager_->attachShm(name),
+        shmManager_->attachShm(name, nullptr, createShmAccessOpts()),
         compressor_,
-        [this](Item* it) -> WriteHandle { return acquire(it); });
+        [this](Item* it) -> WriteHandle { return acquire(it); },
+        config_.hugePageSize);
   }
 
   // Invalid type
@@ -3848,6 +3897,7 @@ CacheAllocator<CacheTrait>::insertOrReplace(const WriteHandle& handle) {
   // Remove from LRU as well if we do have a handle of old item
   if (replaced) {
     stats_.numInsertOrReplaceReplaced.inc();
+    replaced->markRemovedByReplacement();
     removeFromMMContainer(*replaced);
   } else {
     stats_.numInsertOrReplaceInserted.inc();
@@ -5300,7 +5350,7 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
   try {
     auto releaseContext = allocator_->startSlabRelease(
         pid, victim, receiver, mode, hint,
-        [this]() -> bool { return shutDownInProgress_; });
+        [this]() -> bool { return isFastShutdownTriggered(); });
 
     // No work needed if the slab is already released
     if (releaseContext.isReleased()) {
@@ -5692,7 +5742,7 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     // when checking with the AllocationClass
     itemFreed = true;
 
-    if (isShutdownInProgress()) {
+    if (isFastShutdownTriggered()) {
       abortWithMessage("due to shutdown");
     }
 
@@ -5888,16 +5938,26 @@ CacheAllocator<CacheTrait>::shutDown() {
   XDCHECK(!config_.cacheDir.empty());
 
   if (config_.enableFastShutdown) {
-    shutDownInProgress_ = true;
+    triggerFastShutdown_ = true;
   }
 
-  stopWorkers();
+  if (!stopWorkers()) {
+    XLOG(ERR) << "Failed to stop workers during shutdown, aborting";
+    return ShutDownStatus::kFailed;
+  }
 
   const auto handleCount = getNumActiveHandles();
   if (handleCount != 0) {
     XLOGF(ERR, "Found {} active handles while shutting down cache. aborting",
           handleCount);
     return ShutDownStatus::kFailed;
+  }
+
+  // The rest of the procedure is one-shot, the first caller owns the
+  // destructive teardown below.
+  if (shutDownStarted_.exchange(true)) {
+    XLOG(WARN) << "Duplicate shutDown() call ignored";
+    return ShutDownStatus::kSkipped;
   }
 
   const auto nvmShutDownStatusOpt = saveNvmCache();
@@ -6435,12 +6495,14 @@ bool CacheAllocator<CacheTrait>::stopBackgroundPromoter(
 
 template <typename CacheTrait>
 bool CacheAllocator<CacheTrait>::cleanupStrayShmSegments(
-    const std::string& cacheDir, bool posix) {
+    const std::string& cacheDir,
+    bool posix,
+    const std::string& hugePageMountDir) {
   if (util::getStatIfExists(cacheDir, nullptr) && util::isDir(cacheDir)) {
     try {
       // cache dir exists. clean up only if there are no other processes
       // attached. if another process was attached, the following would fail.
-      ShmManager::cleanup(cacheDir, posix);
+      ShmManager::cleanup(cacheDir, posix, hugePageMountDir);
     } catch (const std::exception& e) {
       XLOGF(ERR, "Error cleaning up {}. Exception: ", cacheDir, e.what());
       return false;
@@ -6449,11 +6511,14 @@ bool CacheAllocator<CacheTrait>::cleanupStrayShmSegments(
     // cache dir did not exist. Try to nuke the segments we know by name.
     // Any other concurrent process can not be attached to the segments or
     // even if it does, we want to mark it for destruction.
-    ShmManager::removeByName(cacheDir, detail::kShmInfoName, posix);
-    ShmManager::removeByName(cacheDir, detail::kShmCacheName, posix);
-    ShmManager::removeByName(cacheDir, detail::kShmHashTableName, posix);
+    ShmManager::removeByName(cacheDir, detail::kShmInfoName, posix,
+                             hugePageMountDir);
+    ShmManager::removeByName(cacheDir, detail::kShmCacheName, posix,
+                             hugePageMountDir);
+    ShmManager::removeByName(cacheDir, detail::kShmHashTableName, posix,
+                             hugePageMountDir);
     ShmManager::removeByName(cacheDir, detail::kShmChainedItemHashTableName,
-                             posix);
+                             posix, hugePageMountDir);
   }
   return true;
 }

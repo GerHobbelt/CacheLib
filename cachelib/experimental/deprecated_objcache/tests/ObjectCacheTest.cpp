@@ -16,9 +16,11 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstring-conversion"
+#include <fmt/format.h>
 #include <folly/futures/Promise.h>
 #include <folly/futures/SharedPromise.h>
 #pragma GCC diagnostic pop
+#include <folly/testing/TestUtil.h>
 #include <gtest/gtest.h>
 
 #include <vector>
@@ -350,7 +352,7 @@ TEST(ObjectCache, F14MapSimple) {
 
   for (int i = 0; i < 100; i++) {
     auto f14 = objcache->create<ObjCacheF14Map<int, int>>(
-        0 /* poolId */, folly::sformat("key_{}", i));
+        0 /* poolId */, fmt::format("key_{}", i));
     for (int j = 0; j < 100; j++) {
       f14->insert(std::make_pair(j, i));
     }
@@ -358,7 +360,7 @@ TEST(ObjectCache, F14MapSimple) {
   }
   for (int i = 0; i < 100; i++) {
     auto f14 =
-        objcache->find<ObjCacheF14Map<int, int>>(folly::sformat("key_{}", i));
+        objcache->find<ObjCacheF14Map<int, int>>(fmt::format("key_{}", i));
     for (int j = 0; j < 100; j++) {
       EXPECT_EQ(i, (*f14)[j]);
     }
@@ -376,15 +378,14 @@ TEST(ObjectCache, F14MapWithStrings) {
 
   ObjCacheString ts = "01234567890123456789";
   for (int i = 0; i < 100; i++) {
-    auto f14 =
-        objcache->create<Map>(0 /* poolId */, folly::sformat("key_{}", i));
+    auto f14 = objcache->create<Map>(0 /* poolId */, fmt::format("key_{}", i));
     for (int j = 0; j < 100; j++) {
       f14->insert(std::make_pair(j, ts));
     }
     objcache->insertOrReplace(f14);
   }
   for (int i = 0; i < 100; i++) {
-    auto f14 = objcache->find<Map>(folly::sformat("key_{}", i));
+    auto f14 = objcache->find<Map>(fmt::format("key_{}", i));
     for (int j = 0; j < 100; j++) {
       EXPECT_EQ(ts, (*f14)[j]);
     }
@@ -402,20 +403,19 @@ TEST(ObjectCache, F14MapWithKeyStrings) {
 
   ObjCacheString ts = "01234567890123456789";
   for (int i = 0; i < 100; i++) {
-    auto f14 =
-        objcache->create<Map>(0 /* poolId */, folly::sformat("key_{}", i));
+    auto f14 = objcache->create<Map>(0 /* poolId */, fmt::format("key_{}", i));
     for (int j = 0; j < 100; j++) {
       f14->insert(std::make_pair(
-          ObjCacheString{folly::sformat("key_{}", j).c_str()},
-          ObjCacheString{folly::sformat("val_{}_{}", ts, j).c_str()}));
+          ObjCacheString{fmt::format("key_{}", j).c_str()},
+          ObjCacheString{fmt::format("val_{}_{}", ts, j).c_str()}));
     }
     objcache->insertOrReplace(f14);
   }
   for (int i = 0; i < 100; i++) {
-    auto f14 = objcache->find<Map>(folly::sformat("key_{}", i));
+    auto f14 = objcache->find<Map>(fmt::format("key_{}", i));
     for (int j = 0; j < 100; j++) {
-      EXPECT_EQ(ObjCacheString{folly::sformat("val_{}_{}", ts, j).c_str()},
-                (*f14)[ObjCacheString{folly::sformat("key_{}", j).c_str()}]);
+      EXPECT_EQ(ObjCacheString{fmt::format("val_{}_{}", ts, j).c_str()},
+                (*f14)[ObjCacheString{fmt::format("key_{}", j).c_str()}]);
     }
   }
 }
@@ -433,25 +433,25 @@ TEST(ObjectCache, NestedContainers) {
   ObjCacheString ts = "01234567890123456789";
   for (int i = 0; i < 10; i++) {
     auto f14 =
-        objcache->create<Nested>(0 /* poolId */, folly::sformat("key_{}", i));
+        objcache->create<Nested>(0 /* poolId */, fmt::format("key_{}", i));
     for (int j = 0; j < 10; j++) {
       for (int z = 0; z < 10; z++) {
-        ObjCacheString key{folly::sformat("key_{}", j).c_str()};
+        ObjCacheString key{fmt::format("key_{}", j).c_str()};
         (*f14)[key].insert(std::make_pair(
-            ObjCacheString{folly::sformat("key_{}", z).c_str()},
-            ObjCacheString{folly::sformat("val_{}_{}", ts, z).c_str()}));
+            ObjCacheString{fmt::format("key_{}", z).c_str()},
+            ObjCacheString{fmt::format("val_{}_{}", ts, z).c_str()}));
       }
     }
     objcache->insertOrReplace(f14);
   }
   for (int i = 0; i < 10; i++) {
-    auto f14 = objcache->find<Nested>(folly::sformat("key_{}", i));
+    auto f14 = objcache->find<Nested>(fmt::format("key_{}", i));
     for (int j = 0; j < 10; j++) {
       for (int z = 0; z < 10; z++) {
-        ObjCacheString key{folly::sformat("key_{}", j).c_str()};
+        ObjCacheString key{fmt::format("key_{}", j).c_str()};
         EXPECT_EQ(
-            ObjCacheString{folly::sformat("val_{}_{}", ts, z).c_str()},
-            (*f14)[key][ObjCacheString{folly::sformat("key_{}", z).c_str()}]);
+            ObjCacheString{fmt::format("val_{}_{}", ts, z).c_str()},
+            (*f14)[key][ObjCacheString{fmt::format("key_{}", z).c_str()}]);
       }
     }
   }
@@ -653,11 +653,13 @@ TEST(ObjectCache, Compaction) {
 TEST(ObjectCache, PersistenceSimple) {
   using Vector = std::vector<int, LruObjectCache::Alloc<int>>;
 
+  folly::test::TemporaryDirectory tmpDir;
+  std::string tmpFilePath = (tmpDir.path() / "persist").string();
+
   LruAllocator::Config cacheAllocatorConfig;
   cacheAllocatorConfig.setCacheSize(100 * 1024 * 1024);
   LruObjectCache::Config config;
   config.setCacheAllocatorConfig(cacheAllocatorConfig);
-  std::string tmpFilePath = std::tmpnam(nullptr);
   config.enablePersistence(
       5 /* persistorRestorerThreadCount */,
       0 /* restorerTimeOutDurationInSec */,
@@ -772,9 +774,11 @@ TEST(ObjectCache, PersistenceSimple) {
 TEST(ObjectCache, PersistenceSimpleWithRecoverTimeOut) {
   using Vector = std::vector<int, LruObjectCache::Alloc<int>>;
 
+  folly::test::TemporaryDirectory tmpDir;
+  std::string tmpFilePath = (tmpDir.path() / "persist").string();
+
   LruAllocator::Config cacheAllocatorConfig;
   cacheAllocatorConfig.setCacheSize(100 * 1024 * 1024);
-  std::string tmpFilePath = std::tmpnam(nullptr);
   LruObjectCache::Config config;
   config.setCacheAllocatorConfig(cacheAllocatorConfig);
   config.enablePersistence(
@@ -882,7 +886,8 @@ TEST(ObjectCache, PersistenceMultipleTypes) {
       ObjCacheString, ObjCacheString, std::less<ObjCacheString>,
       LruObjectCache::Alloc<std::pair<const ObjCacheString, ObjCacheString>>>;
 
-  std::string tmpFilePath = std::tmpnam(nullptr);
+  folly::test::TemporaryDirectory tmpDir;
+  std::string tmpFilePath = (tmpDir.path() / "persist").string();
   LruAllocator::Config cacheAllocatorConfig;
   cacheAllocatorConfig.setCacheSize(100 * 1024 * 1024);
   LruObjectCache::Config config;

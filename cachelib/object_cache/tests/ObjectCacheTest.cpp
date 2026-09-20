@@ -19,6 +19,7 @@
 #include <folly/Random.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 
@@ -220,7 +221,7 @@ class ObjectCacheTest : public ::testing::Test {
     // add #numEntriesLimit objects
     for (size_t i = 1; i <= numEntriesLimit; i++) {
       auto [allocRes, _, __] = objcache->insertOrReplace(
-          folly::sformat("Foo_{}", i), std::make_unique<Foo>());
+          fmt::format("Foo_{}", i), std::make_unique<Foo>());
       ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, allocRes);
     }
 
@@ -405,6 +406,87 @@ class ObjectCacheTest : public ::testing::Test {
     std::this_thread::sleep_for(std::chrono::seconds{3});
     auto found2 = objcache->template find<Foo>("Foo");
     ASSERT_EQ(nullptr, found2);
+  }
+
+  void testInspectCacheIncludingExpiredUntilReaped() {
+    ObjectCacheConfig config;
+    config.setCacheName("test")
+        .setCacheCapacity(10'000)
+        .setDelayCacheWorkersStart()
+        .setItemReaperInterval(std::chrono::milliseconds{10})
+        .setItemDestructor(
+            [](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+    auto objcache = ObjectCache::create(config);
+
+    auto foo = std::make_unique<Foo>();
+    foo->a = 1;
+    auto [status, inserted, replaced] = objcache->insertOrReplace(
+        "Foo", std::move(foo), 0 /* objectSize */, 1000 /* ttlSecs */);
+    ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, status);
+    ASSERT_EQ(nullptr, replaced);
+    ASSERT_TRUE(
+        objcache->updateExpiryTimeSec(inserted, util::getCurrentTimeSec() - 1));
+    inserted.reset();
+
+    EXPECT_EQ(nullptr, objcache->template find<Foo>("Foo"));
+    auto expired = objcache->template inspectCache<Foo>("Foo");
+    ASSERT_NE(nullptr, expired);
+    EXPECT_EQ(1, expired->a);
+
+    const auto traversalsBefore =
+        objcache->getL1Cache().getReaperStats().numTraversals;
+    objcache->startCacheWorkers();
+    ASSERT_EVENTUALLY_TRUE([&] {
+      return objcache->getL1Cache().getReaperStats().numTraversals >
+             traversalsBefore;
+    });
+    EXPECT_EQ(expired.get(), objcache->template inspectCache<Foo>("Foo").get());
+
+    expired.reset();
+    ASSERT_EVENTUALLY_TRUE(
+        [&] { return objcache->template inspectCache<Foo>("Foo") == nullptr; });
+  }
+
+  void testSuccessfulReplacementFlag() {
+    std::atomic<int> numReplaced{0};
+    std::atomic<int> numNotReplaced{0};
+    ObjectCacheConfig config;
+    config.setCacheName("test")
+        .setCacheCapacity(10'000)
+        .setItemReaperInterval(std::chrono::seconds{1})
+        .setItemDestructor([&](ObjectCacheDestructorData data) {
+          EXPECT_EQ(data.context, ObjectCacheDestructorContext::kRemoved);
+          if (data.removedBySuccessfulReplacement) {
+            ++numReplaced;
+          } else {
+            ++numNotReplaced;
+          }
+          data.deleteObject<Foo>();
+        });
+    auto objcache = ObjectCache::create(config);
+
+    objcache->insertOrReplace("k", std::make_unique<Foo>(), 0 /*object size*/,
+                              1000 /*ttlSecs*/);
+    auto heldOldObject = objcache->template find<Foo>("k");
+    auto [status, newObject, replacedObject] = objcache->insertOrReplace(
+        "k", std::make_unique<Foo>(), 0 /*object size*/, 1000 /*ttlSecs*/);
+    ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, status);
+
+    heldOldObject.reset();
+    EXPECT_EQ(0, numReplaced.load());
+    replacedObject.reset();
+    EXPECT_EQ(1, numReplaced.load());
+    EXPECT_EQ(0, numNotReplaced.load());
+
+    ASSERT_TRUE(objcache->remove("k"));
+    newObject.reset();
+    EXPECT_EQ(1, numReplaced.load());
+    EXPECT_EQ(1, numNotReplaced.load());
+
+    objcache->insertOrReplace("e", std::make_unique<Foo>(), 0 /*object size*/,
+                              1 /*ttlSecs*/);
+    ASSERT_EVENTUALLY_TRUE([&] { return numNotReplaced.load() == 2; });
+    EXPECT_EQ(1, numReplaced.load());
   }
 
   void testExpirationWithCustomizedReaper() {
@@ -1240,8 +1322,8 @@ class ObjectCacheTest : public ::testing::Test {
         object->a().value() = i;
         object->b().value() = i + 1;
         object->c().value() = i + 2;
-        objcache->insertOrReplace(folly::sformat("key_{}", i),
-                                  std::move(object), objectSize);
+        objcache->insertOrReplace(fmt::format("key_{}", i), std::move(object),
+                                  objectSize);
         totalObjectSize += objectSize;
       }
       ASSERT_EQ(objcache->getNumEntries(), objectNum);
@@ -1254,7 +1336,7 @@ class ObjectCacheTest : public ::testing::Test {
       ASSERT_EQ(objcache->recover(), true);
       for (int i = 0; i < objectNum; i++) {
         auto found =
-            objcache->template find<ThriftFoo>(folly::sformat("key_{}", i));
+            objcache->template find<ThriftFoo>(fmt::format("key_{}", i));
         EXPECT_NE(nullptr, found);
         EXPECT_EQ(i, found->a_ref());
         EXPECT_EQ(i + 1, found->b_ref());
@@ -1384,8 +1466,8 @@ class ObjectCacheTest : public ::testing::Test {
         object->a = i;
         object->b = i + 1;
         object->c = i + 2;
-        objcache->insertOrReplace(folly::sformat("key_{}", i),
-                                  std::move(object), objectSize);
+        objcache->insertOrReplace(fmt::format("key_{}", i), std::move(object),
+                                  objectSize);
         totalObjectSize += objectSize;
       }
       ASSERT_EQ(objcache->getNumEntries(), objectNum);
@@ -1397,7 +1479,7 @@ class ObjectCacheTest : public ::testing::Test {
       auto objcache = ObjectCache::create(config);
       ASSERT_EQ(objcache->recover(), true);
       for (int i = 0; i < objectNum; i++) {
-        auto found = objcache->template find<Foo>(folly::sformat("key_{}", i));
+        auto found = objcache->template find<Foo>(fmt::format("key_{}", i));
         EXPECT_NE(nullptr, found);
         EXPECT_EQ(i, found->a);
         EXPECT_EQ(i + 1, found->b);
@@ -1744,7 +1826,7 @@ class ObjectCacheTest : public ::testing::Test {
     auto runReplaceOps = [&] {
       for (int i = 0; i < 2000; i++) {
         // Rotate through 5 different keys
-        auto key = folly::sformat("key_{}", i % 5);
+        auto key = fmt::format("key_{}", i % 5);
         auto foo2 = std::make_unique<Foo>();
         objcache->insertOrReplace(key, std::move(foo2));
       }
@@ -1753,7 +1835,7 @@ class ObjectCacheTest : public ::testing::Test {
     auto runFindOps = [&] {
       for (int i = 0; i < 2000; i++) {
         // Rotate through 5 different keys
-        auto key = folly::sformat("key_{}", i % 5);
+        auto key = fmt::format("key_{}", i % 5);
         auto res = objcache->template find<Foo>(key);
       }
     };
@@ -1780,7 +1862,7 @@ class ObjectCacheTest : public ::testing::Test {
 
     auto runInsertOps = [&](int id) {
       for (int i = 0; i < 2000; i++) {
-        auto key = folly::sformat("key_{}_{}", id, i);
+        auto key = fmt::format("key_{}_{}", id, i);
         auto foo2 = std::make_unique<Foo>();
         objcache->insertOrReplace(key, std::move(foo2));
       }
@@ -1788,7 +1870,7 @@ class ObjectCacheTest : public ::testing::Test {
 
     auto runFindOps = [&](int id) {
       for (int i = 0; i < 2000; i++) {
-        auto key = folly::sformat("key_{}_{}", id, i);
+        auto key = fmt::format("key_{}_{}", id, i);
         auto res = objcache->template find<Foo>(key);
       }
     };
@@ -2025,6 +2107,12 @@ TYPED_TEST(ObjectCacheTest, UserItemDestructor) {
   this->testUserItemDestructor();
 }
 TYPED_TEST(ObjectCacheTest, Expiration) { this->testExpiration(); }
+TYPED_TEST(ObjectCacheTest, InspectCacheIncludingExpiredUntilReaped) {
+  this->testInspectCacheIncludingExpiredUntilReaped();
+}
+TYPED_TEST(ObjectCacheTest, SuccessfulReplacementFlag) {
+  this->testSuccessfulReplacementFlag();
+}
 TYPED_TEST(ObjectCacheTest, ExpirationWithCustomizedReaper) {
   this->testExpirationWithCustomizedReaper();
 }
@@ -2273,8 +2361,8 @@ TEST(ObjectCacheTest, RuntimeTotalObjectSizeLimitRejectsZero) {
 
   auto objcache = ObjectCache::create(config);
   for (size_t i = 0; i < 4; i++) {
-    objcache->insertOrReplace(folly::sformat("key_{}", i),
-                              std::make_unique<Foo>(), 25);
+    objcache->insertOrReplace(fmt::format("key_{}", i), std::make_unique<Foo>(),
+                              25);
   }
 
   ASSERT_EQ(objcache->getTotalObjectSize(), 100);
@@ -2398,7 +2486,7 @@ TEST(ObjectCacheTest, FreeMemSizeControlTest) {
   auto objcacheB = ObjectCache::create(configB);
 
   for (size_t i = 0; i < maxNumEntries; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcacheA->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                                itemSize);
   }
@@ -2406,7 +2494,7 @@ TEST(ObjectCacheTest, FreeMemSizeControlTest) {
   auto totalSizeA = objcacheA->getTotalObjectSize();
 
   for (size_t i = 0; i < maxNumEntries; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcacheB->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                                itemSize);
   }
@@ -2468,7 +2556,7 @@ TEST(ObjectCacheTest, RSSSizeControlTest) {
   auto objcacheB = ObjectCache::create(configB);
 
   for (size_t i = 0; i < maxNumEntries; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcacheA->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                                itemSize);
   }
@@ -2476,7 +2564,7 @@ TEST(ObjectCacheTest, RSSSizeControlTest) {
   auto totalSizeA = objcacheA->getTotalObjectSize();
 
   for (size_t i = 0; i < maxNumEntries; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcacheB->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                                itemSize);
   }
@@ -2505,7 +2593,7 @@ TEST(ObjectCacheTest, PeekToFindTest) {
   for (; seq < 128; seq++) {
     auto foo = std::make_unique<Foo>();
     foo->a = seq;
-    auto key = folly::sformat("key_{}", seq);
+    auto key = fmt::format("key_{}", seq);
     objcache->insertOrReplace(key, std::move(foo));
   }
 
@@ -2518,7 +2606,7 @@ TEST(ObjectCacheTest, PeekToFindTest) {
   // Add one entry and key_0 should be still there
   auto foo = std::make_unique<Foo>();
   foo->a = seq;
-  auto key = folly::sformat("key_{}", seq++);
+  auto key = fmt::format("key_{}", seq++);
   objcache->insertOrReplace(key, std::move(foo));
 
   auto checkExist = objcache->find<Foo>("key_0");
@@ -2538,7 +2626,7 @@ TEST(ObjectCacheTest, PeekToFindTest) {
   // Add one entry and key_2 should be evicted
   foo = std::make_unique<Foo>();
   foo->a = seq;
-  key = folly::sformat("key_{}", seq++);
+  key = fmt::format("key_{}", seq++);
   objcache->insertOrReplace(key, std::move(foo));
 
   checkExist = objcache->find<Foo>("key_2");

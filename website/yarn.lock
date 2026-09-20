@@ -1504,7 +1504,7 @@
     "@docusaurus/theme-search-algolia" "2.1.0"
     "@docusaurus/types" "2.1.0"
 
-"@docusaurus/react-loadable@5.5.2", "react-loadable@npm:@docusaurus/react-loadable@5.5.2":
+"@docusaurus/react-loadable@5.5.2":
   version "5.5.2"
   resolved "https://registry.yarnpkg.com/@docusaurus/react-loadable/-/react-loadable-5.5.2.tgz#81aae0db81ecafbdaee3651f12804580868fa6ce"
   integrity sha512-A3dYjdBGuy0IGT+wyLIGIKLRE+sAk1iNk0f1HjNDysO7u8lhL4N3VEm+FAubmJbAztn94F7MxBTPmnixbiyFdQ==
@@ -3206,15 +3206,15 @@ bail@^2.0.0:
   resolved "https://registry.yarnpkg.com/bail/-/bail-2.0.2.tgz#d26f5cd8fe5d6f832a31517b9f7c356040ba6d5d"
   integrity sha512-0xO6mYd7JB2YesxDKplafRpsiOzPt9V02ddPCLbY1xYGPOX24NTyN50qnUxgCPcSoYMhKpAuBTjQoRZCAkUDRw==
 
-balanced-match@^1.0.0:
-  version "1.0.2"
-  resolved "https://registry.yarnpkg.com/balanced-match/-/balanced-match-1.0.2.tgz#e83e3a7e3f300b34cb9d87f615fa0cbf357690ee"
-  integrity sha512-3oSeUO0TMV67hN1AmbXsK4yaqU7tjiHlbxRDZOpH0KW9+CeX4bRAaX0Anxt0tx2MrpRpWwQaPwIlISEJhYU5Pw==
-
 balanced-match@^2.0.0:
   version "2.0.0"
   resolved "https://registry.yarnpkg.com/balanced-match/-/balanced-match-2.0.0.tgz#dc70f920d78db8b858535795867bf48f820633d9"
   integrity sha512-1ugUSr8BHXRnK23KfuYS+gVMC3LB8QGH9W1iGtDPsNWoQbgtXSExkBu2aDR4epiGWZOjZsj6lDl/N/AqqTC3UA==
+
+balanced-match@^4.0.2:
+  version "4.0.4"
+  resolved "https://registry.yarnpkg.com/balanced-match/-/balanced-match-4.0.4.tgz#bfb10662feed8196a2c62e7c68e17720c274179a"
+  integrity sha512-BLrgEcRTwX2o6gGxGOCNyMvGSp35YofuYzw9h1IMTRmKqttAZZVU67bdb9Pr2vUHA8+j3i2tJfjO6C6+4myGTA==
 
 base16@^1.0.0:
   version "1.0.0"
@@ -3305,13 +3305,12 @@ boxen@^6.2.1:
     widest-line "^4.0.1"
     wrap-ansi "^8.0.1"
 
-brace-expansion@^1.1.12, brace-expansion@^1.1.7:
-  version "1.1.16"
-  resolved "https://registry.yarnpkg.com/brace-expansion/-/brace-expansion-1.1.16.tgz#723d3a30c0558c225abc9fc479a73e14e26c3c2f"
-  integrity sha512-IDw48K2/2kRkg9LdJxurvq3lV3aBgq0REY89duEqFRthjlPdXHKMj7EnQOXVckxzgisinf3nHfrcE2FufFLXMw==
+brace-expansion@^1.1.7, brace-expansion@^5.0.9:
+  version "5.0.9"
+  resolved "https://registry.yarnpkg.com/brace-expansion/-/brace-expansion-5.0.9.tgz#7c72438809b5fa5babf54199a1f1c281a6984fcf"
+  integrity sha512-ScQ4IuvIEF1TMlP7Zt+vjJ//9zlPb2SDcxWxM3bk8s6t6GGdJ7KO1dCcTidOPJKePW30LE/2cT7wCyPho9/Wxg==
   dependencies:
-    balanced-match "^1.0.0"
-    concat-map "0.0.1"
+    balanced-match "^4.0.2"
 
 braces@^3.0.3, braces@~3.0.2:
   version "3.0.3"
@@ -3786,11 +3785,6 @@ compression@^1.8.1:
     on-headers "~1.1.0"
     safe-buffer "5.2.1"
     vary "~1.1.2"
-
-concat-map@0.0.1:
-  version "0.0.1"
-  resolved "https://registry.yarnpkg.com/concat-map/-/concat-map-0.0.1.tgz#d8a96bd77fd68df7793a73036a3ba0d5405d477b"
-  integrity sha512-/Srv4dswyQNBfohGpz9o6Yb3Gz3SrUDqBH5rTuhGR7ahtlbYKnVxw2bCFMRljaA7EXHaXZ8wsHdodFvbkhKmqg==
 
 configstore@^5.0.1:
   version "5.0.1"
@@ -5479,9 +5473,9 @@ fast-levenshtein@~2.0.6:
   integrity sha512-DCXu6Ifhqcks7TZKY3Hxp3y6qphY5SJZmrWMDrKcERSOXWQdMhU9Ig/PYrzyw/ul9jOIyh0N4M0tbC5hodg8dw==
 
 fast-uri@^3.0.1:
-  version "3.1.3"
-  resolved "https://registry.yarnpkg.com/fast-uri/-/fast-uri-3.1.3.tgz#f695a40f006aba505631573a0021ddb21194ad11"
-  integrity sha512-i70LwGWUduXqzicKXWshooq+sWL1K3WUU5rKZNG/0i3a1OSoX3HqhH5WbWwTmqWfor4urUakGPiRQcleRZTwOg==
+  version "3.1.5"
+  resolved "https://registry.yarnpkg.com/fast-uri/-/fast-uri-3.1.5.tgz#610f37419a030270430cecd68d74e3d4d96725d0"
+  integrity sha512-gHwA1O9LDIcKunMKhObS/HimwtehO1nPUECKAu5TpKgaO19fcWEl4bliWe1jWxVFvIXztJjjQ4L8XQ1EU9f7Jw==
 
 fastest-levenshtein@^1.0.12:
   version "1.0.16"
@@ -7033,17 +7027,17 @@ joi@^17.11.0, joi@^17.6.0:
   integrity sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ==
 
 js-yaml@^3.13.1:
-  version "3.15.0"
-  resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-3.15.0.tgz#586e5214eafe3e893756a41e979b50d89d3e4a67"
-  integrity sha512-ttBQIIQPDeLjpPOohtUdXuXUVoA2uIB6fEH9HyJ7234s5mBJ5wTx20njxplLZQgLaOfpmPQA7X2t5AX6tIPbog==
+  version "3.15.1"
+  resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-3.15.1.tgz#24bc95028f361cdaaa84745b06a109c4486773c0"
+  integrity sha512-S99WuO3HlhO3XN41EtYUNl9zzXjoJx7QvmipxsJVxtCBT0YHEFy+iOJhjSvrmV12nYhWpZaM8lPHkJm0yUMbag==
   dependencies:
     argparse "^1.0.7"
     esprima "^4.0.0"
 
-js-yaml@^4.1.0, js-yaml@^4.1.1:
-  version "4.3.0"
-  resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-4.3.0.tgz#d1900572a7f7cf0b5f540c83673e60bad3436592"
-  integrity sha512-1td788aAnnZ5qs7V2QIRl1owjtYpbKt749Y3xauqQgwIIGF/xXWz1wMTEBx5O3LK3lXLVuqXPdPxj2BoFHaW9Q==
+js-yaml@^4.1.0, js-yaml@^4.1.1, js-yaml@^4.3.1:
+  version "4.3.1"
+  resolved "https://registry.yarnpkg.com/js-yaml/-/js-yaml-4.3.1.tgz#01216c001d67f48e2cd560d708c7af21090a3848"
+  integrity sha512-CY6crGq313MX8GkwvB7tzgp99vjQxY1++5y10/BKN/GUfHqWaOGQMNZkBvqSzsZKWk/ijwHlWzzkLulsGHhjWQ==
   dependencies:
     argparse "^2.0.1"
 
@@ -8230,10 +8224,10 @@ mute-stream@0.0.8:
   resolved "https://registry.yarnpkg.com/mute-stream/-/mute-stream-0.0.8.tgz#1630c42b2251ff81e2a283de96a5497ea92e5e0d"
   integrity sha512-nnbWWOkoWyUsTjKrhgD0dcz22mdkSnpYqbEjIm2nhwhuxlSkpywJmBo8h0ZqJdkp73mb90SssHkN4rsRaBAfAA==
 
-nanoid@^3.3.12:
-  version "3.3.16"
-  resolved "https://registry.yarnpkg.com/nanoid/-/nanoid-3.3.16.tgz#a04d8ec4b1f10009d2d533947aefe4293737816c"
-  integrity sha512-bzlKTyNJ7+LdGIIwy8ijFpIqEQIvafahV7eYykJ8Cvh42EdJeODoJ6gUJXpQJvej1BddH8OqTXZNE/KfbWAu8Q==
+nanoid@^3.3.16:
+  version "3.3.18"
+  resolved "https://registry.yarnpkg.com/nanoid/-/nanoid-3.3.18.tgz#f66a2de1199ffde0fcf21c8a5f13106b1c081913"
+  integrity sha512-DTg4MJbGMWkfi6VZFdNt2/caMbQy4Ou+Op/hJQvGEWcnVfoA1QA+xzRKAzw9jD6+GVOOeYr/mIcuDSdug6F6+w==
 
 natural-compare@^1.4.0:
   version "1.4.0"
@@ -9151,12 +9145,12 @@ postcss-zindex@^5.1.0:
   resolved "https://registry.yarnpkg.com/postcss-zindex/-/postcss-zindex-5.1.0.tgz#4a5c7e5ff1050bd4c01d95b1847dfdcc58a496ff"
   integrity sha512-fgFMf0OtVSBR1va1JNHYgMxYk73yhn/qb4uQDq1DLGYolz8gHCyr/sesEuGUaYs58E3ZJRcpoGuPVoB7Meiq9A==
 
-postcss@^7.0.14, postcss@^7.0.2, postcss@^7.0.21, postcss@^7.0.26, postcss@^7.0.32, postcss@^7.0.35, postcss@^7.0.6, postcss@^8.3.11, postcss@^8.4.14, postcss@^8.4.17, postcss@^8.4.31, postcss@^8.4.33:
-  version "8.5.19"
-  resolved "https://registry.yarnpkg.com/postcss/-/postcss-8.5.19.tgz#45ad5cfde499408e20147348237551381a922037"
-  integrity sha512-Mz8SaolMd8nB+G13WkORcxQKHZ/NE4xXevtkJHVuG+guo9/wYKlIMTKAqGdEmYOXR2ijPjTYNHssizdaVSUNdQ==
+postcss@^7.0.14, postcss@^7.0.2, postcss@^7.0.21, postcss@^7.0.26, postcss@^7.0.32, postcss@^7.0.35, postcss@^7.0.6, postcss@^8.3.11, postcss@^8.4.14, postcss@^8.4.17, postcss@^8.4.33, postcss@^8.5.23:
+  version "8.5.23"
+  resolved "https://registry.yarnpkg.com/postcss/-/postcss-8.5.23.tgz#3493550116f478487298301d2c2e8dc5a56e6594"
+  integrity sha512-g50586zr4bZmwFiTlflMu8E0bDTb5I5gertgwAKmsdUlTQIhZtunzUlD1WSzwcVWPoAVpsrA6vlfCD7oXvRwgg==
   dependencies:
-    nanoid "^3.3.12"
+    nanoid "^3.3.16"
     picocolors "^1.1.1"
     source-map-js "^1.2.1"
 
@@ -9473,6 +9467,14 @@ react-loadable-ssr-addon-v5-slorber@^1.0.1:
   integrity sha512-GXfh9VLwB5ERaCsU6RULh7tkemeX15aNh6wuMEBtfdyMa7fFG8TXrhXlx1SoEK2Ty/l6XIkzzYIQmyaWW3JgdQ==
   dependencies:
     "@babel/runtime" "^7.10.3"
+
+"react-loadable@npm:@docusaurus/react-loadable@5.5.2":
+  version "5.5.2"
+  resolved "https://registry.yarnpkg.com/@docusaurus/react-loadable/-/react-loadable-5.5.2.tgz#81aae0db81ecafbdaee3651f12804580868fa6ce"
+  integrity sha512-A3dYjdBGuy0IGT+wyLIGIKLRE+sAk1iNk0f1HjNDysO7u8lhL4N3VEm+FAubmJbAztn94F7MxBTPmnixbiyFdQ==
+  dependencies:
+    "@types/react" "*"
+    prop-types "^15.6.2"
 
 react-modal@3.15.1:
   version "3.15.1"
@@ -11157,9 +11159,9 @@ undici-types@~8.3.0:
   integrity sha512-j375ScV60dom+YkPFIfTLcOiPxkN/buHz5GobjLhixFuANaNs3C9l4GmrWqejgXWJ7BbJcFYpTEUkS1Ge8bpZQ==
 
 undici@^7.19.0:
-  version "7.28.0"
-  resolved "https://registry.yarnpkg.com/undici/-/undici-7.28.0.tgz#97d64564198b285bc281f0e8e29597e3d11fe7ec"
-  integrity sha512-cRZYrTDwWznlnRiPjggAGxZXanty6M8RV1ff8Wm4LWXBp7/IG8v5DnOm74DtUBp9OONpK75YlPnIjQqX0dBDtA==
+  version "7.29.0"
+  resolved "https://registry.yarnpkg.com/undici/-/undici-7.29.0.tgz#ae0f6f62e06e057a9cbb7b2b5fde2bb74f791b8f"
+  integrity sha512-IDxfleLmmbSskfWSUATiN1nfn2rDuvnMOqb5CWR92iIfojA0Ud+ulOAAEQ57LPr9rWmsreUyf5lwyao+7GNNVw==
 
 unescape@^1.0.1:
   version "1.0.1"

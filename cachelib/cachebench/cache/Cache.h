@@ -17,6 +17,7 @@
 #pragma once
 
 #include <fmt/core.h>
+#include <folly/Benchmark.h>
 #include <folly/container/F14Map.h>
 #include <folly/hash/Hash.h>
 #include <folly/json/DynamicConverter.h>
@@ -26,8 +27,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <iostream>
+#include <optional>
+#include <stdexcept>
 
 #include "cachelib/allocator/CacheAllocator.h"
 #include "cachelib/allocator/HitsPerSlabStrategy.h"
@@ -35,6 +40,7 @@
 #include "cachelib/allocator/RandomStrategy.h"
 #include "cachelib/allocator/Util.h"
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
+#include "cachelib/allocator/nvmcache/NavySetup.h"
 #include "cachelib/cachebench/cache/CacheStats.h"
 #include "cachelib/cachebench/cache/CacheValue.h"
 #include "cachelib/cachebench/cache/ItemRecords.h"
@@ -44,6 +50,7 @@
 #include "cachelib/cachebench/util/CacheConfig.h"
 #include "cachelib/cachebench/util/NandWrites.h"
 #include "cachelib/common/EventTracker.h"
+#include "cachelib/common/Throttler.h"
 #include "cachelib/navy/block_cache/SparseMapIndex.h"
 
 DECLARE_bool(report_api_latency);
@@ -103,6 +110,12 @@ class Cache {
 
   template <typename U>
   using TypedHandle = LruAllocator::TypedHandle<U>;
+
+  struct DramIteratorSweepResult {
+    uint64_t items{0};
+    uint64_t keyBytes{0};
+    uint64_t valueBytes{0};
+  };
 
   // instantiate a cachelib cache instance.
   //
@@ -329,6 +342,13 @@ class Cache {
   // Get number of bytes written to NVM.
   double getNvmBytesWritten() const;
 
+  DramIteratorSweepResult runRegularDramIteratorSweep(
+      const std::optional<util::Throttler::Config>& throttlerConfig =
+          std::nullopt);
+  DramIteratorSweepResult runLockGroupDramIteratorSweep(
+      const std::optional<util::Throttler::Config>& throttlerConfig =
+          std::nullopt);
+
   // return the stats for the pool.
   PoolStats getPoolStats(PoolId pid) const { return cache_->getPoolStats(pid); }
 
@@ -344,7 +364,7 @@ class Cache {
   uint64_t numPools() const noexcept { return config_.numPools; }
 
   // reports the number of handles held by the thread calling this api.
-  int getHandleCountForThread() const {
+  int64_t getHandleCountForThread() const {
     return cache_->getHandleCountForThread();
   }
 
@@ -400,6 +420,10 @@ class Cache {
 
   // get the nand writes for the SSD device if enabled.
   uint64_t fetchNandWrites() const;
+
+  template <typename Iterator>
+  DramIteratorSweepResult runDramIteratorSweep(Iterator iter,
+                                               const Iterator& end);
 
   // original input config for the cache used to derive the
   // CacheAllocatorConfig.
@@ -710,13 +734,132 @@ Cache<Allocator>::Cache(const CacheConfig& config,
           config_.navyProbabilityReinsertionThreshold);
     }
 
-    // configure BigHash if enabled
-    if (config_.navyBigHashSizePct > 0) {
-      nvmConfig.navyConfig.bigHash()
+    auto& bigHashConfig = nvmConfig.navyConfig.bigHash();
+    if (config_.navyArenas.empty() && config_.navyBigHashSizePct > 0) {
+      bigHashConfig
           .setSizePctAndMaxItemSize(config_.navyBigHashSizePct,
                                     config_.navySmallItemMaxSize)
           .setBucketSize(config_.navyBigHashBucketSize)
           .setBucketBfSize(config_.navyBloomFilterPerBucketSize);
+    }
+
+    const auto numArenas = config_.getNavyNumArenas();
+    if (!config_.navyArenas.empty()) {
+      const auto regionSize = config_.navyRegionSizeMB * MB;
+      if (regionSize == 0) {
+        throw std::invalid_argument(
+            "navyRegionSizeMB must be greater than zero");
+      }
+      const auto [deviceSize, metadataSize] =
+          getNavyCacheSizes(nvmConfig.navyConfig);
+      if (metadataSize >= deviceSize) {
+        throw std::invalid_argument(fmt::format(
+            "NVM metadata size {} must be smaller than device size {}",
+            metadataSize,
+            deviceSize));
+      }
+
+      std::vector<unsigned int> bigHashDeviceSizePcts;
+      std::vector<uint64_t> requestedBlockCacheSizes;
+      std::vector<uint64_t> blockCacheSizes;
+      bigHashDeviceSizePcts.reserve(numArenas);
+      requestedBlockCacheSizes.reserve(numArenas);
+      blockCacheSizes.reserve(numArenas);
+
+      const auto usableSize = deviceSize - metadataSize;
+      uint64_t assignedSize = 0;
+      uint64_t totalBigHashSize = 0;
+      for (size_t i = 0; i < numArenas; ++i) {
+        const auto& arena = config_.navyArenas[i];
+        const auto arenaSize = i + 1 == numArenas
+                                   ? usableSize - assignedSize
+                                   : usableSize * arena.sizePct / 100;
+        assignedSize += arenaSize;
+
+        const auto bigHashDeviceSizePct =
+            arena.getBigHashDeviceSizePct(arenaSize, deviceSize);
+        if (arena.bigHashPct > 0 && bigHashDeviceSizePct == 0) {
+          throw std::invalid_argument(fmt::format(
+              "Navy arena '{}' is too small to configure BigHash", arena.name));
+        }
+
+        const auto bigHashSize = deviceSize * bigHashDeviceSizePct / 100;
+        if (bigHashSize >= arenaSize) {
+          throw std::invalid_argument(fmt::format(
+              "Navy arena '{}' is too small for its requested BigHash split",
+              arena.name));
+        }
+
+        bigHashDeviceSizePcts.push_back(bigHashDeviceSizePct);
+        requestedBlockCacheSizes.push_back(arenaSize - bigHashSize);
+        totalBigHashSize += bigHashSize;
+      }
+
+      const auto totalBlockCacheRegions =
+          (usableSize - totalBigHashSize) / regionSize;
+      if (totalBlockCacheRegions < numArenas) {
+        throw std::invalid_argument(
+            fmt::format("NVM cache has {} BlockCache regions for {} arenas",
+                        totalBlockCacheRegions,
+                        numArenas));
+      }
+
+      // Round each BlockCache down to whole regions, then distribute leftover
+      // regions to arenas with the largest fractional remainders.
+      uint64_t assignedBlockCacheRegions = 0;
+      std::vector<std::pair<uint64_t, size_t>> regionRemainders;
+      regionRemainders.reserve(numArenas);
+      for (size_t i = 0; i < numArenas; ++i) {
+        const auto regions = requestedBlockCacheSizes[i] / regionSize;
+        blockCacheSizes.push_back(regions * regionSize);
+        assignedBlockCacheRegions += regions;
+        regionRemainders.emplace_back(requestedBlockCacheSizes[i] % regionSize,
+                                      i);
+      }
+      std::sort(regionRemainders.begin(),
+                regionRemainders.end(),
+                [](const auto& lhs, const auto& rhs) {
+                  return lhs.first != rhs.first ? lhs.first > rhs.first
+                                                : lhs.second < rhs.second;
+                });
+      for (size_t i = 0; i < totalBlockCacheRegions - assignedBlockCacheRegions;
+           ++i) {
+        blockCacheSizes[regionRemainders[i].second] += regionSize;
+      }
+      for (size_t i = 0; i < numArenas; ++i) {
+        if (blockCacheSizes[i] == 0) {
+          throw std::invalid_argument(
+              fmt::format("Navy arena '{}' is too small for region size {}",
+                          config_.navyArenas[i].name,
+                          regionSize));
+        }
+      }
+
+      auto commonBigHashConfig = bigHashConfig;
+      commonBigHashConfig.setBucketSize(config_.navyBigHashBucketSize)
+          .setBucketBfSize(config_.navyBloomFilterPerBucketSize);
+
+      // NavyConfig owns the first engine pair, so configure it in place.
+      if (bigHashDeviceSizePcts[0] > 0) {
+        bigHashConfig = commonBigHashConfig;
+        bigHashConfig.setSizePctAndMaxItemSize(bigHashDeviceSizePcts[0],
+                                               config_.navySmallItemMaxSize);
+      }
+      const auto commonBlockCacheConfig = bcConfig;
+      bcConfig.setSize(blockCacheSizes[0]);
+      for (size_t i = 1; i < numArenas; ++i) {
+        navy::EnginesConfig enginesConfig;
+        enginesConfig.blockCache() = commonBlockCacheConfig;
+        // A zero size tells Navy's final BlockCache to consume remaining space.
+        enginesConfig.blockCache().setSize(
+            i + 1 == numArenas ? 0 : blockCacheSizes[i]);
+        enginesConfig.bigHash() = commonBigHashConfig;
+        enginesConfig.bigHash().setSizePctAndMaxItemSize(
+            bigHashDeviceSizePcts[i], config_.navySmallItemMaxSize);
+        nvmConfig.navyConfig.addEnginePair(std::move(enginesConfig));
+      }
+      nvmConfig.navyConfig.setEnginesSelector(
+          [numArenas](HashedKey key) { return key.keyHash() % numArenas; });
     }
 
     nvmConfig.navyConfig.setMaxParcelMemoryMB(config_.navyParcelMemoryMB);
@@ -1151,6 +1294,41 @@ double Cache<Allocator>::getNvmBytesWritten() const {
 }
 
 template <typename Allocator>
+typename Cache<Allocator>::DramIteratorSweepResult
+Cache<Allocator>::runRegularDramIteratorSweep(
+    const std::optional<util::Throttler::Config>& throttlerConfig) {
+  if (throttlerConfig) {
+    return runDramIteratorSweep(cache_->begin(*throttlerConfig), cache_->end());
+  }
+  return runDramIteratorSweep(cache_->begin(), cache_->end());
+}
+
+template <typename Allocator>
+typename Cache<Allocator>::DramIteratorSweepResult
+Cache<Allocator>::runLockGroupDramIteratorSweep(
+    const std::optional<util::Throttler::Config>& throttlerConfig) {
+  if (throttlerConfig) {
+    return runDramIteratorSweep(cache_->beginLockGroup(*throttlerConfig),
+                                cache_->endLockGroup());
+  }
+  return runDramIteratorSweep(cache_->beginLockGroup(), cache_->endLockGroup());
+}
+
+template <typename Allocator>
+template <typename Iterator>
+typename Cache<Allocator>::DramIteratorSweepResult
+Cache<Allocator>::runDramIteratorSweep(Iterator iter, const Iterator& end) {
+  DramIteratorSweepResult result;
+  for (; iter != end; ++iter) {
+    const auto& item = *iter;
+    ++result.items;
+    result.keyBytes += item.getKey().size();
+    result.valueBytes += getSize(&item);
+  }
+  return result;
+}
+
+template <typename Allocator>
 std::unique_ptr<StatsBase> Cache<Allocator>::getStats() const {
   auto retPtr = std::make_unique<Stats>();
   auto& ret = *retPtr;
@@ -1261,14 +1439,25 @@ std::unique_ptr<StatsBase> Cache<Allocator>::getStats() const {
                  ? static_cast<uint64_t>(navyStats.at(key))
                  : 0;
     };
-    ret.numNvmItems = lookup("navy_bh_items") + lookup("navy_bc_items");
+    auto lookupEngineTotal = [&](const std::string& key) {
+      if (config_.getNavyNumArenas() == 1) {
+        return lookup(key);
+      }
+      uint64_t total = 0;
+      for (size_t i = 0; i < config_.getNavyNumArenas(); ++i) {
+        total += lookup(fmt::format("{}_{}", key, i));
+      }
+      return total;
+    };
+    ret.numNvmItems =
+        lookupEngineTotal("navy_bh_items") + lookupEngineTotal("navy_bc_items");
     ret.numNvmBytesWritten = lookup("navy_device_bytes_written");
     uint64_t now = fetchNandWrites();
     if (now > nandBytesBegin_) {
       ret.numNvmNandBytesWritten = now - nandBytesBegin_;
     }
-    double bhLogicalBytes = lookup("navy_bh_logical_written");
-    double bcLogicalBytes = lookup("navy_bc_logical_written");
+    double bhLogicalBytes = lookupEngineTotal("navy_bh_logical_written");
+    double bcLogicalBytes = lookupEngineTotal("navy_bc_logical_written");
     ret.numNvmLogicalBytesWritten =
         static_cast<size_t>(bhLogicalBytes + bcLogicalBytes);
     ret.nvmReadLatencyMicrosP50 = lookup("navy_device_read_latency_us_p50");
@@ -1294,36 +1483,8 @@ std::unique_ptr<StatsBase> Cache<Allocator>::getStats() const {
     ret.nvmWriteLatencyMicrosP100 = lookup("navy_device_write_latency_us_max");
     ret.numNvmItemRemovedSetSize = lookup("items_tracked_for_destructor");
 
-    ret.bcInsertLatencyMicrosP50 = lookup("navy_bc_insert_latency_us_p50");
-    ret.bcInsertLatencyMicrosP90 = lookup("navy_bc_insert_latency_us_p90");
-    ret.bcInsertLatencyMicrosP99 = lookup("navy_bc_insert_latency_us_p99");
-    ret.bcInsertLatencyMicrosP999 = lookup("navy_bc_insert_latency_us_p999");
-    ret.bcInsertLatencyMicrosP9999 = lookup("navy_bc_insert_latency_us_p9999");
-    ret.bcInsertLatencyMicrosP99999 =
-        lookup("navy_bc_insert_latency_us_p99999");
-    ret.bcInsertLatencyMicrosP999999 =
-        lookup("navy_bc_insert_latency_us_p999999");
-    ret.bcInsertLatencyMicrosP100 = lookup("navy_bc_insert_latency_us_max");
-    ret.bcLookupLatencyMicrosP50 = lookup("navy_bc_lookup_latency_us_p50");
-    ret.bcLookupLatencyMicrosP90 = lookup("navy_bc_lookup_latency_us_p90");
-    ret.bcLookupLatencyMicrosP99 = lookup("navy_bc_lookup_latency_us_p99");
-    ret.bcLookupLatencyMicrosP999 = lookup("navy_bc_lookup_latency_us_p999");
-    ret.bcLookupLatencyMicrosP9999 = lookup("navy_bc_lookup_latency_us_p9999");
-    ret.bcLookupLatencyMicrosP99999 =
-        lookup("navy_bc_lookup_latency_us_p99999");
-    ret.bcLookupLatencyMicrosP999999 =
-        lookup("navy_bc_lookup_latency_us_p999999");
-    ret.bcLookupLatencyMicrosP100 = lookup("navy_bc_lookup_latency_us_max");
-    ret.bcRemoveLatencyMicrosP50 = lookup("navy_bc_remove_latency_us_p50");
-    ret.bcRemoveLatencyMicrosP90 = lookup("navy_bc_remove_latency_us_p90");
-    ret.bcRemoveLatencyMicrosP99 = lookup("navy_bc_remove_latency_us_p99");
-    ret.bcRemoveLatencyMicrosP999 = lookup("navy_bc_remove_latency_us_p999");
-    ret.bcRemoveLatencyMicrosP9999 = lookup("navy_bc_remove_latency_us_p9999");
-    ret.bcRemoveLatencyMicrosP99999 =
-        lookup("navy_bc_remove_latency_us_p99999");
-    ret.bcRemoveLatencyMicrosP999999 =
-        lookup("navy_bc_remove_latency_us_p999999");
-    ret.bcRemoveLatencyMicrosP100 = lookup("navy_bc_remove_latency_us_max");
+    ret.blockCacheLatencyStats =
+        getBlockCacheLatencyStats(navyStats, config_.getNavyNumArenas());
 
     // track any non-zero check sum errors or io errors
     for (const auto& [k, v] : navyStats) {
@@ -1341,11 +1502,18 @@ template <typename Allocator>
 double Cache<Allocator>::getNvmEvictionRate() const {
   const auto nvmStats = cache_->getNvmCacheStatsMap();
   const auto& ratesMap = nvmStats.getRates();
-  const auto it = ratesMap.find("navy_bc_evictions");
-  if (it == ratesMap.end()) {
-    return 0;
+  if (config_.getNavyNumArenas() == 1) {
+    const auto it = ratesMap.find("navy_bc_evictions");
+    return it == ratesMap.end() ? 0 : it->second;
   }
-  return it->second;
+  double total = 0;
+  for (size_t i = 0; i < config_.getNavyNumArenas(); ++i) {
+    const auto it = ratesMap.find(fmt::format("navy_bc_evictions_{}", i));
+    if (it != ratesMap.end()) {
+      total += it->second;
+    }
+  }
+  return total;
 }
 
 template <typename Allocator>

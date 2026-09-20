@@ -16,6 +16,7 @@
 
 #include "cachelib/allocator/nvmcache/NavySetup.h"
 
+#include <fmt/format.h>
 #include <folly/logging/xlog.h>
 #include <gmock/gmock.h>
 
@@ -49,12 +50,43 @@ uint64_t getRegionSize(const navy::NavyConfig& config) {
   uint64_t regionSize = configs[0].blockCache().getRegionSize();
   for (size_t idx = 1; idx < configs.size(); idx++) {
     if (regionSize != configs[idx].blockCache().getRegionSize()) {
-      throw std::invalid_argument(folly::sformat(
+      throw std::invalid_argument(fmt::format(
           "Blockcache {} region size: {}, not equal to block cache 0: {}", idx,
           configs[idx].blockCache().getRegionSize(), regionSize));
     }
   }
   return regionSize;
+}
+
+uint64_t getDeviceFileSize(const navy::NavyConfig& config) {
+  const auto fileSize = config.getFileSize();
+  if (!config.usesRaidFiles()) {
+    return fileSize;
+  }
+
+  const auto regionSize = getRegionSize(config);
+  if (regionSize == 0) {
+    throw std::invalid_argument("Navy region size must be greater than zero");
+  }
+  return alignDown(fileSize, regionSize);
+}
+
+uint64_t getMetadataSize(const navy::NavyConfig& config,
+                         uint64_t deviceSize,
+                         uint64_t alignment) {
+  if (alignment == 0) {
+    throw std::invalid_argument("Navy block size must be greater than zero");
+  }
+
+  auto metadataSize = config.getDeviceMetadataSize();
+  if (metadataSize == 0) {
+    XDCHECK(folly::isPowTwo(alignment));
+    const auto mask = ~(alignment - 1);
+    metadataSize =
+        static_cast<uint64_t>(kDefaultMetadataPercent * deviceSize / 100) &
+        mask;
+  }
+  return alignUp(metadataSize, alignment);
 }
 
 // Create a bighash that ends at bigHashEndOffset.
@@ -78,8 +110,8 @@ uint64_t setupBigHash(const navy::BigHashConfig& bigHashConfig,
   auto bucketSize = bigHashConfig.getBucketSize();
   if (bucketSize != alignUp(bucketSize, ioAlignSize)) {
     throw std::invalid_argument(
-        folly::sformat("Bucket size: {} is not aligned to ioAlignSize: {}",
-                       bucketSize, ioAlignSize));
+        fmt::format("Bucket size: {} is not aligned to ioAlignSize: {}",
+                    bucketSize, ioAlignSize));
   }
 
   const uint64_t bigHashCacheOffset =
@@ -142,8 +174,8 @@ uint64_t setupBlockCache(const navy::BlockCacheConfig& blockCacheConfig,
   auto regionSize = blockCacheConfig.getRegionSize();
   if (regionSize != alignUp(regionSize, ioAlignSize)) {
     throw std::invalid_argument(
-        folly::sformat("Region size: {} is not aligned to ioAlignSize: {}",
-                       regionSize, ioAlignSize));
+        fmt::format("Region size: {} is not aligned to ioAlignSize: {}",
+                    regionSize, ioAlignSize));
   }
 
   // Adjust starting size of block cache to ensure it is aligned to region
@@ -226,25 +258,16 @@ void setupCacheProtos(const navy::NavyConfig& config,
         "left on device");
   }
 
-  auto getDefaultMetadataSize = [](size_t size, size_t alignment) {
-    XDCHECK(folly::isPowTwo(alignment));
-    auto mask = ~(alignment - 1);
-    return (static_cast<size_t>(kDefaultMetadataPercent * size / 100) & mask);
-  };
-
   auto ioAlignSize = device.getIOAlignmentSize();
   const uint64_t totalCacheSize = device.getSize();
 
-  auto metadataSize = config.getDeviceMetadataSize();
-  if (metadataSize == 0) {
-    metadataSize = getDefaultMetadataSize(totalCacheSize, ioAlignSize);
-  }
-  metadataSize = alignUp(metadataSize, ioAlignSize);
+  const auto metadataSize =
+      getMetadataSize(config, totalCacheSize, ioAlignSize);
   if (metadataSize >= totalCacheSize) {
     throw std::invalid_argument{
-        folly::sformat("Invalid metadata size: {}. Cache size: {}",
-                       metadataSize,
-                       totalCacheSize)};
+        fmt::format("Invalid metadata size: {}. Cache size: {}",
+                    metadataSize,
+                    totalCacheSize)};
   }
   proto.setMetadataSize(metadataSize);
 
@@ -293,10 +316,10 @@ void setupCacheProtos(const navy::NavyConfig& config,
           config.getStackSize(), *enginePairProto);
     }
     if (blockCacheEndOffset > bigHashStartOffset) {
-      throw std::invalid_argument(folly::sformat(
-          "Invalid engine size configurations. block cache ends at "
-          "{}, big hash starts at {}.",
-          blockCacheEndOffset, bigHashStartOffset));
+      throw std::invalid_argument(
+          fmt::format("Invalid engine size configurations. block cache ends at "
+                      "{}, big hash starts at {}.",
+                      blockCacheEndOffset, bigHashStartOffset));
     }
     proto.addEnginePair(std::move(enginePairProto));
     bigHashEndOffset = bigHashStartOffset;
@@ -317,7 +340,7 @@ void setAdmissionPolicy(const cachelib::navy::NavyConfig& config,
     proto.setDynamicRandomAdmissionPolicy(config.dynamicRandomAdmPolicy());
   } else {
     throw std::invalid_argument{
-        folly::sformat("invalid policy name {}", policyName)};
+        fmt::format("invalid policy name {}", policyName)};
   }
 }
 
@@ -346,6 +369,15 @@ std::unique_ptr<cachelib::navy::JobScheduler> createJobScheduler(
 }
 } // namespace
 
+NavyCacheSizes getNavyCacheSizes(const navy::NavyConfig& config) {
+  const auto fileSize = getDeviceFileSize(config);
+  const auto deviceSize = config.usesRaidFiles()
+                              ? fileSize * config.getRaidPaths().size()
+                              : fileSize;
+  return {deviceSize,
+          getMetadataSize(config, deviceSize, config.getBlockSize())};
+}
+
 std::unique_ptr<navy::Device> createDevice(
     const navy::NavyConfig& config,
     std::shared_ptr<navy::DeviceEncryptor> encryptor) {
@@ -353,14 +385,13 @@ std::unique_ptr<navy::Device> createDevice(
   auto maxDeviceWriteSize = config.getDeviceMaxWriteSize();
   if (config.usesRaidFiles() || config.usesSimpleFile()) {
     auto stripeSize = 0;
-    auto fileSize = config.getFileSize();
+    const auto fileSize = getDeviceFileSize(config);
     std::vector<std::string> filePaths;
     if (config.usesSimpleFile()) {
       filePaths.emplace_back(config.getFileName());
     } else {
       stripeSize = getRegionSize(config);
       filePaths = config.getRaidPaths();
-      fileSize = alignDown(fileSize, stripeSize);
     }
 
     return navy::createFileDevice(

@@ -24,10 +24,18 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 
 #include <cstring>
+#include <filesystem>
 
 #include "cachelib/common/Utils.h"
+
+/* On Mac OS / FreeBSD, mmap(2) syscall does not support these flags */
+#ifndef MAP_LOCKED
+#warning "MAP_LOCKED not defined"
+#define MAP_LOCKED 0
+#endif
 
 namespace facebook {
 namespace cachelib {
@@ -71,6 +79,15 @@ int shmOpenImpl(const char* name, int flags) {
     util::throwSystemError(errno, "Invalid errno");
   }
   return kInvalidFD;
+}
+
+int openFileImpl(const char* path, int flags, mode_t mode) {
+  const int fd = open(path, flags, mode);
+  if (fd == -1) {
+    util::throwSystemError(errno,
+                           fmt::format("open() failed for path {}", path));
+  }
+  return fd;
 }
 
 void unlinkImpl(const char* const name) {
@@ -195,13 +212,35 @@ void setMempolicyImpl(int oldMode, const NumaBitMask& memBindNumaNodes) {
   }
 }
 
+int shmOpenForPageSize(const std::string& name,
+                       int flags,
+                       const PageSize& pageSize,
+                       const std::string& hugePageMountDir) {
+  if (!pageSize.isHugePage()) {
+    return detail::shmOpenImpl(name.c_str(), flags);
+  }
+  // HugeTLB segments must use a different mount from /dev/shm (which is
+  // hardcoded by shm_open)
+  if (hugePageMountDir.empty()) {
+    util::throwSystemError(
+        EINVAL,
+        "A hugetlbfs mount dir is required for huge-page POSIX shm segments");
+  }
+  auto path = std::filesystem::path(hugePageMountDir) /
+              std::filesystem::path(name).relative_path();
+  return detail::openFileImpl(path.lexically_normal().c_str(),
+                              flags | O_CLOEXEC, kRWMode);
+}
+
 } // namespace detail
 
 PosixShmSegment::PosixShmSegment(ShmAttachT,
                                  const std::string& name,
-                                 ShmSegmentOpts opts)
+                                 ShmSegmentOpts opts,
+                                 const std::string& hugePageMountDir)
     : ShmBase(std::move(opts), createKeyForName(name)),
-      fd_(getExisting(getName(), opts_)) {
+      hugePageMountDir_(hugePageMountDir),
+      fd_(getExisting(getName(), opts_, hugePageMountDir_)) {
   XDCHECK_NE(fd_, kInvalidFD);
   markActive();
   createReferenceMapping();
@@ -210,9 +249,11 @@ PosixShmSegment::PosixShmSegment(ShmAttachT,
 PosixShmSegment::PosixShmSegment(ShmNewT,
                                  const std::string& name,
                                  size_t size,
-                                 ShmSegmentOpts opts)
+                                 ShmSegmentOpts opts,
+                                 const std::string& hugePageMountDir)
     : ShmBase(std::move(opts), createKeyForName(name)),
-      fd_(createNewSegment(getName())) {
+      hugePageMountDir_(hugePageMountDir),
+      fd_(createNewSegment(getName(), opts_, hugePageMountDir_)) {
   markActive();
   resize(size);
   XDCHECK(isActive());
@@ -226,7 +267,8 @@ PosixShmSegment::~PosixShmSegment() {
     // delete the reference mapping so the segment can be deleted if its
     // marked to be.
     deleteReferenceMapping();
-  } catch (const std::system_error&) {
+  } catch (const std::system_error& e) {
+    XLOG(ERR) << "Error deleting reference mapping: " << e.what();
   }
 
   // need to close the fd without throwing any exceptions. so we call close
@@ -242,15 +284,20 @@ PosixShmSegment::~PosixShmSegment() {
   }
 }
 
-int PosixShmSegment::createNewSegment(const std::string& name) {
+int PosixShmSegment::createNewSegment(const std::string& name,
+                                      const ShmSegmentOpts& opts,
+                                      const std::string& hugePageMountDir) {
   constexpr static int createFlags = O_RDWR | O_CREAT | O_EXCL;
-  return detail::shmOpenImpl(name.c_str(), createFlags);
+  return detail::shmOpenForPageSize(name, createFlags, opts.pageSize,
+                                    hugePageMountDir);
 }
 
 int PosixShmSegment::getExisting(const std::string& name,
-                                 const ShmSegmentOpts& opts) {
+                                 const ShmSegmentOpts& opts,
+                                 const std::string& hugePageMountDir) {
   int flags = opts.readOnly ? O_RDONLY : O_RDWR;
-  return detail::shmOpenImpl(name.c_str(), flags);
+  return detail::shmOpenForPageSize(name, flags, opts.pageSize,
+                                    hugePageMountDir);
 }
 
 void PosixShmSegment::markForRemoval() {
@@ -258,16 +305,21 @@ void PosixShmSegment::markForRemoval() {
     // we still have the fd open. so we can use it to perform ftruncate
     // even after marking for removal through unlink. The fd does not get
     // recycled until we actually destroy this object.
-    removeByName(getName());
+    removeByName(getName(), hugePageMountDir_);
     markForRemove();
   } else {
     XDCHECK(false);
   }
 }
 
-bool PosixShmSegment::removeByName(const std::string& segmentName) {
+bool PosixShmSegment::removeByName(const std::string& segmentName,
+                                   const std::string& hugePageMountDir) {
+  const auto key = createKeyForName(segmentName);
+
+  // A segment is either a tmpfs entry (/dev/shm) or a huge-page file on the
+  // hugetlbfs mount, never both. Try the normal location first: if it was
+  // there, we are done.
   try {
-    auto key = createKeyForName(segmentName);
     detail::unlinkImpl(key.c_str());
     return true;
   } catch (const std::system_error& e) {
@@ -276,8 +328,23 @@ bool PosixShmSegment::removeByName(const std::string& segmentName) {
     if (e.code().value() != ENOENT) {
       throw;
     }
+  }
+
+  // Not in /dev/shm: it may be a huge-page file on the mount.
+  if (hugePageMountDir.empty()) {
     return false;
   }
+  auto path = std::filesystem::path(hugePageMountDir) /
+              std::filesystem::path(key).relative_path();
+  if (::unlink(path.lexically_normal().c_str()) == 0) {
+    return true;
+  }
+  // Mirror the tmpfs path: a missing file is fine, but surface real failures
+  // (e.g. EACCES) instead of silently leaving the segment pinning huge pages.
+  if (errno != ENOENT) {
+    util::throwSystemError(errno);
+  }
+  return false;
 }
 
 size_t PosixShmSegment::getSize() const {
@@ -293,7 +360,7 @@ size_t PosixShmSegment::getSize() const {
 }
 
 void PosixShmSegment::resize(size_t size) const {
-  size = detail::getPageAlignedSize(size, opts_.pageSize);
+  size = opts_.pageSize.getPageAlignedSize(size);
   XDCHECK(isActive() || isMarkedForRemoval());
   if (isActive() || isMarkedForRemoval()) {
     XDCHECK_NE(fd_, kInvalidFD);
@@ -307,25 +374,12 @@ void PosixShmSegment::resize(size_t size) const {
 
 void* PosixShmSegment::mapAddress(void* addr) const {
   size_t size = getSize();
-  if (!detail::isPageAlignedSize(size, opts_.pageSize) ||
-      !detail::isPageAlignedAddr(addr, opts_.pageSize)) {
+  if (!opts_.pageSize.isPageAlignedSize(size) ||
+      !opts_.pageSize.isPageAlignedAddr(addr)) {
     util::throwSystemError(EINVAL, "Address/size not aligned");
   }
 
-#ifndef MAP_HUGE_2MB
-#define MAP_HUGE_2MB (21 << MAP_HUGE_SHIFT)
-#endif
-
-#ifndef MAP_HUGE_1GB
-#define MAP_HUGE_1GB (30 << MAP_HUGE_SHIFT)
-#endif
-
-  int flags = MAP_SHARED;
-  if (opts_.pageSize == PageSizeT::TWO_MB) {
-    flags |= MAP_HUGETLB | MAP_HUGE_2MB;
-  } else if (opts_.pageSize == PageSizeT::ONE_GB) {
-    flags |= MAP_HUGETLB | MAP_HUGE_1GB;
-  }
+  int flags = MAP_SHARED | opts_.pageSize.hugePageMmapFlags();
   // If users pass in an address, they must make sure that address is unused.
   if (addr != nullptr) {
     flags |= MAP_FIXED;
@@ -340,7 +394,7 @@ void* PosixShmSegment::mapAddress(void* addr) const {
     util::throwSystemError(EINVAL, "Address already mapped");
   }
   XDCHECK(retAddr == addr || addr == nullptr);
-  memBind(addr);
+  memBind(retAddr);
   return retAddr;
 }
 
@@ -379,7 +433,7 @@ void PosixShmSegment::memBind(void* addr) const {
   // Set memory bindings
   detail::setMempolicyImpl(MPOL_BIND, opts_.memBindNumaNodes);
 
-  forcePageAllocation(addr, getSize(), detail::getPageSize(opts_.pageSize));
+  forcePageAllocation(addr, getSize(), opts_.pageSize.getPageSize());
 
   // Restore memory policy for the thread
   detail::setMempolicyImpl(oldMode, oldMemBindNumaNodes);
@@ -399,7 +453,7 @@ std::string PosixShmSegment::createKeyForName(
 void PosixShmSegment::createReferenceMapping() {
   // create a mapping that lasts the life of this object. mprotect it to
   // ensure there are no actual accesses.
-  referenceMapping_ = detail::mmapImpl(nullptr, detail::getPageSize(),
+  referenceMapping_ = detail::mmapImpl(nullptr, opts_.pageSize.getPageSize(),
                                        PROT_NONE, MAP_SHARED, fd_, 0);
 
   XDCHECK(referenceMapping_ != nullptr);
@@ -407,7 +461,7 @@ void PosixShmSegment::createReferenceMapping() {
 
 void PosixShmSegment::deleteReferenceMapping() const {
   if (referenceMapping_ != nullptr) {
-    detail::munmapImpl(referenceMapping_, detail::getPageSize());
+    detail::munmapImpl(referenceMapping_, opts_.pageSize.getPageSize());
   }
 }
 } // namespace cachelib

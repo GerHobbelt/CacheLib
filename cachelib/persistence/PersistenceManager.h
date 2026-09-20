@@ -93,7 +93,6 @@ class PersistenceStreamWriter {
  *  - isNvmCacheEncryption
  *  - isNvmCacheTruncateAllocSize
  *  - accessConfig.numBuckets
- *  - accessConfig.pageSize
  *  - chainedItemAccessConfig.numBuckets
  *  - nvmConfig.navyConfig.FileName
  *  - nvmConfig.navyConfig.RaidPaths
@@ -113,8 +112,12 @@ class PersistenceManager {
 
     CACHELIB_CHECK_THROW(config.isUsingPosixShm(),
                          "Only POSIX is supported to persist");
-    CACHELIB_CHECK_THROW(config.accessConfig.getPageSize() == PageSizeT::NORMAL,
-                         "Only default PageSize is supported to persist");
+    // TODO: persistence is currently normal-page only. Supporting huge pages
+    // requires plumbing page sizes: saveShm() would need to attach the source
+    // at its real page size, and restoreCache() would need to create segments
+    // at the destination's configured page size (and hugetlbfs mount).
+    CACHELIB_CHECK_THROW(!config.hugePageSize.isHugePage(),
+                         "Huge pages are not supported to persist");
 
     if (config.nvmConfig.has_value()) {
       const auto& navyConfig = config.nvmConfig->navyConfig;
