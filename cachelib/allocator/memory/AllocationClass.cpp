@@ -91,6 +91,15 @@ void AllocationClass::checkState() const {
         fmt::format("Current allocation slab {} is not in allocated slabs list",
                     fmt::ptr(currSlab_)));
   }
+
+  if (slabAlloc_.isAsanPoisoningEnabled() && (allocationSize_ % 8 != 0)) {
+    XLOGF(WARN,
+          "Slab ASAN poisoning is enabled but allocation class {} has size {}, "
+          "which is not a multiple of 8; freed-allocation poisoning will be "
+          "imprecise at allocation boundaries.",
+          classId_,
+          allocationSize_);
+  }
 }
 
 // TODO(stuclar): Add poolId to the metadata to be serialized when cache shuts
@@ -326,8 +335,10 @@ SlabReleaseContext AllocationClass::startSlabRelease(
   auto results = pruneFreeAllocs(slab, std::move(shouldAbortFn));
   if (results.first) {
     lock_->lock_combine([&]() {
-      header->setMarkedForRelease(false);
+      restoreFreedAllocsLocked(slab);
       slabReleaseAllocMap_.erase(getSlabPtrValue(slab));
+      allocatedSlabs_.push_back(const_cast<Slab*>(slab));
+      header->setMarkedForRelease(false);
     });
     throw exception::SlabReleaseAborted(
         fmt::format("Slab Release aborted "
@@ -521,6 +532,25 @@ void AllocationClass::waitUntilAllFreed(const Slab* slab) {
   }
 }
 
+void AllocationClass::restoreFreedAllocsLocked(const Slab* slab) {
+  // The release alloc map is created unconditionally in startSlabRelease before
+  // pruning and only erased on terminal paths, so it must exist while unwinding
+  // an abort. getSlabReleaseAllocMapLocked throws if it is missing, surfacing a
+  // corrupt release state rather than silently leaking the slab's freed allocs.
+  const auto& allocState = getSlabReleaseAllocMapLocked(slab);
+  bool inserted = false;
+  for (size_t idx = 0; idx < allocState.size(); idx++) {
+    if (allocState[idx]) {
+      auto alloc = getAllocForIdx(slab, idx);
+      freedAllocations_.insert(*reinterpret_cast<FreeAlloc*>(alloc));
+      inserted = true;
+    }
+  }
+  if (inserted) {
+    canAllocate_ = true;
+  }
+}
+
 void AllocationClass::abortSlabRelease(const SlabReleaseContext& context) {
   if (context.isReleased()) {
     throw std::invalid_argument(fmt::format("context is already released"));
@@ -530,21 +560,7 @@ void AllocationClass::abortSlabRelease(const SlabReleaseContext& context) {
   auto header = slabAlloc_.getSlabHeader(slab);
 
   lock_->lock_combine([&]() {
-    const auto it = slabReleaseAllocMap_.find(getSlabPtrValue(slab));
-    bool inserted = false;
-    if (it != slabReleaseAllocMap_.end()) {
-      const auto& allocState = it->second;
-      for (size_t idx = 0; idx < allocState.size(); idx++) {
-        if (allocState[idx]) {
-          auto alloc = getAllocForIdx(slab, idx);
-          freedAllocations_.insert(*reinterpret_cast<FreeAlloc*>(alloc));
-          inserted = true;
-        }
-      }
-    }
-    if (inserted) {
-      canAllocate_ = true;
-    }
+    restoreFreedAllocsLocked(slab);
     slabReleaseAllocMap_.erase(slabPtrVal);
     allocatedSlabs_.push_back(const_cast<Slab*>(slab));
     // restore the classId and allocSize

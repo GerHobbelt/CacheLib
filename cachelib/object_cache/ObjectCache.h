@@ -96,6 +96,26 @@ struct ObjectCacheDestructorData {
   uint32_t lastAccessTime;
 };
 
+// Information about cache memory capacity calculated from configuration
+// parameters. Use ObjectCache::calculateCacheCapacity() to compute this.
+struct CacheCapacityInfo {
+  // Total memory used by the cache (including overhead)
+  size_t totalCacheSize;
+  // Size of each shard/pool in bytes
+  size_t perPoolSize;
+  // Number of slabs allocated per shard/pool
+  size_t slabsPerShard;
+  // Number of allocations that fit in a single slab
+  size_t allocsPerSlab;
+  // Number of allocations per shard (ceiling of l1EntriesLimit / l1NumShards)
+  size_t allocsPerShard;
+  // Allocation size per entry in bytes
+  uint32_t l1AllocSize;
+  // Maximum l1EntriesLimit that results in slabsPerShard=1
+  // (useful for avoiding slab quantization overhead)
+  size_t maxEntriesForOneSlab;
+};
+
 template <typename AllocatorT>
 class ObjectCache : public ObjectCacheBase<AllocatorT> {
  private:
@@ -315,7 +335,7 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
   std::shared_ptr<T> peekToWrite(folly::StringPiece key);
 
   // Insert the object into the cache with given key. If the key exists in the
-  // cache, it will be replaced with new obejct.
+  // cache, it will be replaced with new object.
   //
   // @param key          the key to the object.
   // @param object       unique pointer for the object to be inserted.
@@ -394,7 +414,7 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
     return this->l1Cache_->getAccessContainerNumKeys();
   }
 
-  // Get direct access to the interal CacheAllocator.
+  // Get direct access to the internal CacheAllocator.
   // This is only used in tests.
   AllocatorT& getL1Cache() { return *this->l1Cache_; }
 
@@ -426,6 +446,23 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
   // Get the default l1 allocation size in bytes.
   static uint32_t getL1AllocSize(uint32_t maxKeySizeBytes);
+
+  // Calculate cache capacity information without creating a cache instance.
+  // This is useful for planning memory budgets and understanding slab
+  // quantization effects before actually creating a cache.
+  //
+  // Requires l1EntriesLimit >= l1NumShards > 0.
+  //
+  // @param l1EntriesLimit   Maximum number of entries the cache should hold
+  // @param l1NumShards      Number of shards/pools for the cache
+  // @param maxKeySizeBytes  Maximum key size in bytes (default 255)
+  //
+  // @return CacheCapacityInfo struct containing calculated cache size,
+  //         slabs per shard, and other capacity-related information
+  static CacheCapacityInfo calculateCacheCapacity(
+      size_t l1EntriesLimit,
+      size_t l1NumShards,
+      uint32_t maxKeySizeBytes = 255);
 
   // Get the total size of all cached objects in bytes.
   size_t getTotalObjectSize() const {
@@ -637,7 +674,7 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
   void initWorkers();
 
-  // Allocate an item handle from the interal cache allocator. This item's
+  // Allocate an item handle from the internal cache allocator. This item's
   // storage is used to cache pointer to objects in object-cache.
   typename AllocatorT::WriteHandle allocateFromL1(folly::StringPiece key,
                                                   uint32_t ttl,
@@ -720,17 +757,16 @@ class ObjectCache : public ObjectCacheBase<AllocatorT> {
 
 template <typename AllocatorT>
 void ObjectCache<AllocatorT>::init() {
-  // Compute variables required to size the cache and placeholders
-  DCHECK_GE(config_.l1EntriesLimit, config_.l1NumShards);
-  auto l1AllocSize = getL1AllocSize(config_.maxKeySizeBytes);
-  const size_t allocsPerSlab = Slab::kSize / l1AllocSize;
-  const size_t allocsPerShard =
-      util::getDivCeiling(config_.l1EntriesLimit, config_.l1NumShards);
-  const size_t slabsPerShard =
-      util::getDivCeiling(allocsPerShard, allocsPerSlab);
-  const size_t perPoolSize = slabsPerShard * Slab::kSize;
-  const size_t l1SizeRequired = perPoolSize * config_.l1NumShards;
-  auto cacheSize = l1SizeRequired + Slab::kSize;
+  // Compute variables required to size the cache and placeholders.
+  auto capacityInfo = calculateCacheCapacity(
+      config_.l1EntriesLimit, config_.l1NumShards, config_.maxKeySizeBytes);
+
+  const auto l1AllocSize = capacityInfo.l1AllocSize;
+  const auto allocsPerSlab = capacityInfo.allocsPerSlab;
+  const auto allocsPerShard = capacityInfo.allocsPerShard;
+  const auto slabsPerShard = capacityInfo.slabsPerShard;
+  const auto perPoolSize = capacityInfo.perPoolSize;
+  const auto cacheSize = capacityInfo.totalCacheSize;
 
   typename AllocatorT::Config l1Config;
   l1Config.setCacheName(config_.cacheName)
@@ -865,8 +901,8 @@ void ObjectCache<AllocatorT>::init() {
   XDCHECK_GE(slabsPerShard * allocsPerSlab, allocsPerShard);
   XDCHECK_LT(l1PlaceHoldersPerShard, allocsPerSlab);
 
-  // allocsPerShard is celing of the division by numShards, meaning
-  // additional number (i.e., extraLimit) of placesholders need to be created
+  // allocsPerShard is ceiling of the division by numShards, meaning
+  // additional number (i.e., extraLimit) of placeholders need to be created
   const size_t extraLimit =
       allocsPerShard * config_.l1NumShards - config_.l1EntriesLimit;
   XDCHECK_GE(allocsPerShard * config_.l1NumShards, config_.l1EntriesLimit);
@@ -1023,7 +1059,7 @@ ObjectCache<AllocatorT>::insertOrReplace(folly::StringPiece key,
   if (replaced) {
     replaces_.inc();
     auto itemPtr = getAlignedItemPtr(replaced->getMemory());
-    // Just release the handle. Cache destorys object when all handles
+    // Just release the handle. Cache destroys object when all handles
     // released.
     auto deleter = [h = std::move(replaced)](T*) {};
     replacedPtr = std::shared_ptr<T>(reinterpret_cast<T*>(itemPtr->objectPtr),
@@ -1131,6 +1167,32 @@ uint32_t ObjectCache<AllocatorT>::getL1AllocSize(uint32_t maxKeySizeBytes) {
 }
 
 template <typename AllocatorT>
+CacheCapacityInfo ObjectCache<AllocatorT>::calculateCacheCapacity(
+    size_t l1EntriesLimit, size_t l1NumShards, uint32_t maxKeySizeBytes) {
+  DCHECK_GT(l1EntriesLimit, 0);
+  DCHECK_GT(l1NumShards, 0);
+  DCHECK_GE(l1EntriesLimit, l1NumShards);
+
+  auto l1AllocSize = getL1AllocSize(maxKeySizeBytes);
+  const size_t allocsPerSlab = Slab::kSize / l1AllocSize;
+  const size_t allocsPerShard =
+      util::getDivCeiling(l1EntriesLimit, l1NumShards);
+  const size_t slabsPerShard =
+      util::getDivCeiling(allocsPerShard, allocsPerSlab);
+  const size_t perPoolSize = slabsPerShard * Slab::kSize;
+  const size_t l1SizeRequired = perPoolSize * l1NumShards;
+  const size_t totalCacheSize = l1SizeRequired + Slab::kSize;
+
+  return CacheCapacityInfo{.totalCacheSize = totalCacheSize,
+                           .perPoolSize = perPoolSize,
+                           .slabsPerShard = slabsPerShard,
+                           .allocsPerSlab = allocsPerSlab,
+                           .allocsPerShard = allocsPerShard,
+                           .l1AllocSize = l1AllocSize,
+                           .maxEntriesForOneSlab = allocsPerSlab * l1NumShards};
+}
+
+template <typename AllocatorT>
 ObjectCache<AllocatorT>::~ObjectCache() {
   stopAllWorkers();
 
@@ -1187,6 +1249,7 @@ ObjectCache<AllocatorT>::serializeConfigParams() const {
   auto config = this->l1Cache_->serializeConfigParams();
   config["l1EntriesLimit"] = std::to_string(config_.l1EntriesLimit);
   config["l1NumShards"] = std::to_string(config_.l1NumShards);
+  config["maxKeySizeBytes"] = std::to_string(config_.maxKeySizeBytes);
   config["aggregatePoolStats"] = config_.aggregatePoolStats ? "true" : "false";
   if (config_.objectSizeTrackingEnabled &&
       config_.sizeControllerIntervalMs > 0) {

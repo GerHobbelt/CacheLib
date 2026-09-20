@@ -363,6 +363,14 @@ class SlabAllocator {
 #endif
   }
 
+  // Returns the user-visible slab data region, excluding internal slab headers
+  // at the start of the memory arena.
+  std::pair<const void*, size_t> getSlabMemoryInfo() const noexcept {
+    auto slabStart = reinterpret_cast<uintptr_t>(slabMemoryStart_);
+    auto memStart = reinterpret_cast<uintptr_t>(memoryStart_);
+    return {slabMemoryStart_, memorySize_ - (slabStart - memStart)};
+  }
+
  private:
   // null Slab* presenttation. With 4M Slab size, a valid slab index would never
   // reach 2^16 - 1;
@@ -379,6 +387,9 @@ class SlabAllocator {
   //
   // @throw std::invalid_argument if the state is invalid.
   void checkState() const;
+
+  // Logs whether slab ASAN poisoning is active. No-op in non-ASAN builds.
+  void logAsanPoisoningStatus() const;
 
   // returns first byte after the end of memory region we own.
   const Slab* getSlabMemoryEnd() const noexcept {
