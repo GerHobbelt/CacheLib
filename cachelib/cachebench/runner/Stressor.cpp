@@ -22,6 +22,7 @@
 #include "cachelib/cachebench/runner/CacheStressor.h"
 #include "cachelib/cachebench/runner/FastShutdown.h"
 #include "cachelib/cachebench/runner/IntegrationStressor.h"
+#include "cachelib/cachebench/runner/ObjectCacheStressor.h"
 #include "cachelib/cachebench/workload/BinaryKVReplayGenerator.h"
 #include "cachelib/cachebench/workload/BlockChunkReplayGenerator.h"
 #include "cachelib/cachebench/workload/KVReplayGenerator.h"
@@ -85,13 +86,13 @@ void ThroughputStats::render(uint64_t elapsedTimeNs, std::ostream& out) const {
           : 100.0 * (couldExistOp - couldExistOpFalse) / couldExistOp;
 
   out << std::fixed;
-  out << folly::sformat("{:10}: {:.2f} million", "Total Ops", ops / 1e6)
+  out << fmt::format("{:10}: {:.2f} million", "Total Ops", ops / 1e6)
       << std::endl;
-  out << folly::sformat("{:10}: {:,}", "Total sets", set) << std::endl;
+  out << fmt::format("{:10}: {}", "Total sets", set) << std::endl;
 
   auto outFn = [&out](folly::StringPiece k1, uint64_t v1, folly::StringPiece k2,
                       double v2) {
-    out << folly::sformat("{:10}: {:9,}/s, {:10}: {:6.2f}%", k1, v1, k2, v2)
+    out << fmt::format("{:10}: {:9}/s, {:10}: {:6.2f}%", k1, v1, k2, v2)
         << std::endl;
   };
   outFn("get", getPerSec, "success", getSuccessRate);
@@ -172,11 +173,10 @@ std::unique_ptr<Stressor> Stressor::makeStressor(
     return std::make_unique<HighRefcountStressor>(cacheConfig,
                                                   stressorConfig.numOps);
   } else if (stressorConfig.name == "cachelib_map") {
-    return std::make_unique<CachelibMapStressor>(cacheConfig,
-                                                 stressorConfig.numOps);
+    return std::make_unique<CachelibMapStressor>(cacheConfig, stressorConfig);
   } else if (stressorConfig.name == "cachelib_range_map") {
     return std::make_unique<CachelibRangeMapStressor>(cacheConfig,
-                                                      stressorConfig.numOps);
+                                                      stressorConfig);
   } else if (stressorConfig.name == "fast_shutdown") {
     return std::make_unique<FastShutdownStressor>(cacheConfig,
                                                   stressorConfig.numOps);
@@ -184,7 +184,7 @@ std::unique_ptr<Stressor> Stressor::makeStressor(
     if (stressorConfig.generator != "workload" &&
         !stressorConfig.generator.empty()) {
       // async model has not been tested with other generators
-      throw std::invalid_argument(folly::sformat(
+      throw std::invalid_argument(fmt::format(
           "Async cache stressor only works with workload generator currently. "
           "generator: {}",
           stressorConfig.generator));
@@ -208,6 +208,25 @@ std::unique_ptr<Stressor> Stressor::makeStressor(
   } else if (stressorConfig.name == "cache_component") {
     return std::make_unique<CacheComponentStressor>(
         cacheConfig, stressorConfig, makeGenerator(stressorConfig));
+  } else if (stressorConfig.name == "object_cache") {
+    auto generator = makeGenerator(stressorConfig);
+    if (cacheConfig.allocator == "LRU") {
+      return std::make_unique<ObjectCacheStressor<LruAllocator>>(
+          cacheConfig, stressorConfig, std::move(generator));
+    } else if (cacheConfig.allocator == "LRU2Q") {
+      return std::make_unique<ObjectCacheStressor<Lru2QAllocator>>(
+          cacheConfig, stressorConfig, std::move(generator));
+    } else if (cacheConfig.allocator == "LRU5B") {
+      return std::make_unique<ObjectCacheStressor<Lru5BAllocator>>(
+          cacheConfig, stressorConfig, std::move(generator));
+    } else if (cacheConfig.allocator == "LRU5B2Q") {
+      return std::make_unique<ObjectCacheStressor<Lru5B2QAllocator>>(
+          cacheConfig, stressorConfig, std::move(generator));
+    }
+    throw std::invalid_argument(folly::sformat(
+        "object_cache stressor does not support allocator '{}'. Supported: "
+        "LRU, LRU2Q, LRU5B, LRU5B2Q.",
+        cacheConfig.allocator));
   } else {
     auto generator = makeGenerator(stressorConfig);
     if (cacheConfig.allocator == "LRU") {

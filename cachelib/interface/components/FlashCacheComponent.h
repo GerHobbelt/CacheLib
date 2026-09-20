@@ -97,6 +97,7 @@ class FlashCacheComponent : public CacheComponentWithStats {
   folly::coro::Task<Result<std::optional<ReadHandle>>> find(Key key) override;
   folly::coro::Task<Result<std::optional<WriteHandle>>> findToWrite(
       Key key) override;
+  folly::coro::AsyncGenerator<ReadHandle> iterator() override;
   folly::coro::Task<Result<bool>> remove(Key key) override;
   folly::coro::Task<UnitResult> remove(ReadHandle&& handle) override;
   UnitResult shutdown() override;
@@ -133,7 +134,7 @@ class FlashCacheComponent : public CacheComponentWithStats {
   // Runs func() on a worker fiber
   template <typename FuncT,
             typename ReturnT = std::invoke_result_t<FuncT>,
-            typename CleanupFuncT = std::function<void(ReturnT)>>
+            typename CleanupFuncT = utils::detail::DefaultCleanupT>
   folly::coro::Task<ReturnT> onWorkerThread(FuncT&& func,
                                             CleanupFuncT&& cleanup = {});
 

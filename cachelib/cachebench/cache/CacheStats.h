@@ -166,6 +166,8 @@ class Stats : public StatsBase {
   // cachebench.
   std::unordered_map<std::string, double> nvmCounters;
 
+  std::unordered_map<std::string, uint64_t> eventTrackerCounters;
+
   std::map<PoolId, std::map<ClassId, uint64_t>> backgroundEvictionClasses;
   std::map<PoolId, std::map<ClassId, uint64_t>> backgroundPromotionClasses;
 
@@ -245,6 +247,7 @@ class Stats : public StatsBase {
     };
     accumulateMap(nvmCounters, other.nvmCounters);
     accumulateMap(nvmErrors, other.nvmErrors);
+    accumulateMap(eventTrackerCounters, other.eventTrackerCounters);
 
     return *this;
   }
@@ -580,6 +583,13 @@ class Stats : public StatsBase {
       }
     }
 
+    if (!eventTrackerCounters.empty()) {
+      out << "== Event Tracker Counters Map ==" << std::endl;
+      for (const auto& it : eventTrackerCounters) {
+        out << it.first << "  :  " << it.second << std::endl;
+      }
+    }
+
     if (numRamDestructorCalls > 0 || numNvmDestructorCalls > 0) {
       out << fmt::format("Destructor executed from RAM {}, from NVM {}",
                          numRamDestructorCalls, numNvmDestructorCalls)
@@ -732,6 +742,59 @@ class Stats : public StatsBase {
 
   static double invertPctFn(uint64_t ops, uint64_t total) {
     return 100 - pctFn(ops, total);
+  }
+};
+
+class ObjectCacheStats : public Stats {
+ public:
+  std::unordered_map<std::string, double> objectCacheCounters;
+
+  ObjectCacheStats& operator+=(const StatsBase& otherBase) override {
+    Stats::operator+=(otherBase);
+    const auto& other = otherBase.as<ObjectCacheStats>();
+    for (const auto& [key, value] : other.objectCacheCounters) {
+      objectCacheCounters[key] += value;
+    }
+    return *this;
+  }
+
+  void render(std::ostream& out) const override {
+    Stats::render(out);
+    renderObjectCacheCounters(out, objectCacheCounters,
+                              "== Object Cache Counters ==");
+  }
+
+  void render(const StatsBase& prevStatsBase,
+              std::ostream& out) const override {
+    Stats::render(prevStatsBase, out);
+
+    const auto& prevStats = prevStatsBase.as<ObjectCacheStats>();
+    std::unordered_map<std::string, double> deltas;
+    for (const auto& [key, value] : objectCacheCounters) {
+      double delta = value;
+      if (const auto it = prevStats.objectCacheCounters.find(key);
+          it != prevStats.objectCacheCounters.end()) {
+        delta -= it->second;
+      }
+      if (delta != 0) {
+        deltas[key] = delta;
+      }
+    }
+    renderObjectCacheCounters(out, deltas, "== Object Cache Counters Delta ==");
+  }
+
+ private:
+  static void renderObjectCacheCounters(
+      std::ostream& out,
+      const std::unordered_map<std::string, double>& counters,
+      const char* header) {
+    if (counters.empty()) {
+      return;
+    }
+    out << header << std::endl;
+    for (const auto& [key, value] : counters) {
+      out << key << "  :  " << value << std::endl;
+    }
   }
 };
 

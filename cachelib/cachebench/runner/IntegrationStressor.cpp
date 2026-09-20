@@ -16,6 +16,7 @@
 
 #include "cachelib/cachebench/runner/IntegrationStressor.h"
 
+#include <fmt/core.h>
 #include <folly/logging/xlog.h>
 #include <folly/system/HardwareConcurrency.h>
 
@@ -24,6 +25,12 @@
 namespace facebook {
 namespace cachelib {
 namespace cachebench {
+namespace {
+uint64_t getNumThreads(const StressorConfig& config) {
+  return config.numThreads > 0 ? config.numThreads
+                               : folly::available_concurrency();
+}
+} // namespace
 
 const uint32_t HighRefcountStressor::kNumThreads;
 
@@ -35,11 +42,12 @@ HighRefcountStressor::HighRefcountStressor(const CacheConfig& cacheConfig,
 void HighRefcountStressor::start() {
   startTime_ = std::chrono::system_clock::now();
   testThread_ = std::thread([this] {
-    std::cout << folly::sformat("Total {:.2f}M ops to be run",
-                                kNumThreads * numOpsPerThread_ / 1e6)
+    std::cout << fmt::format("Total {:.2f}M ops to be run",
+                             kNumThreads * numOpsPerThread_ / 1e6)
               << std::endl;
 
     std::vector<std::thread> workers;
+    workers.reserve(kNumThreads);
     for (size_t i = 0; i < kNumThreads; i++) {
       workers.emplace_back([this] {
         for (uint64_t j = 0; j < numOpsPerThread_; j++) {
@@ -75,7 +83,7 @@ void HighRefcountStressor::testLoop() {
     uint32_t delay = 1 + folly::Random::rand32(10);
     std::this_thread::sleep_for(std::chrono::milliseconds{delay});
   } catch (const exception::RefcountOverflow& e) {
-    XLOG_EVERY_MS(INFO, 600'000) << folly::sformat(
+    XLOG_EVERY_MS(INFO, 600'000) << fmt::format(
         "Detected refcount overflow in the last 10 minutes: {}", e.what());
   }
 }
@@ -89,8 +97,9 @@ const uint32_t CachelibMapStressor::kMapInsertionBatchMin;
 const uint32_t CachelibMapStressor::kMapInsertionBatchMax;
 
 CachelibMapStressor::CachelibMapStressor(const CacheConfig& cacheConfig,
-                                         uint64_t numOps)
-    : numOpsPerThread_{numOps} {
+                                         const StressorConfig& stressorConfig)
+    : numThreads_{getNumThreads(stressorConfig)},
+      numOpsPerThread_{stressorConfig.numOps} {
   struct CachelibMapTestCaseSync : public CacheType::SyncObj {
     CachelibMapStressor& stressor;
     std::string key;
@@ -112,17 +121,18 @@ void CachelibMapStressor::start() {
   startTime_ = std::chrono::system_clock::now();
 
   for (size_t i = 0; i < keys_.size(); i++) {
-    keys_[i] = folly::sformat("map_key_{}", i);
+    keys_[i] = fmt::format("map_key_{}", i);
   }
 
   testThread_ = std::thread([this] {
-    const size_t numThreads = folly::available_concurrency();
-    std::cout << folly::sformat("Total {:.2f}M ops to be run",
-                                numThreads * numOpsPerThread_ / 1e6)
+    std::cout << fmt::format("Total {:.2f}M ops to be run, using {} threads",
+                             numThreads_ * numOpsPerThread_ / 1e6,
+                             numThreads_)
               << std::endl;
 
     std::vector<std::thread> workers;
-    for (size_t i = 0; i < numThreads; i++) {
+    workers.reserve(numThreads_);
+    for (size_t i = 0; i < numThreads_; i++) {
       workers.emplace_back([this] {
         for (uint64_t j = 0; j < numOpsPerThread_; j++) {
           testLoop();
@@ -170,7 +180,7 @@ void CachelibMapStressor::testLoop() {
     populate(map);
     cache_->insertOrReplace(map.viewWriteHandle());
   } catch (const std::bad_alloc& e) {
-    XLOG_EVERY_MS(INFO, 600'000) << folly::sformat(
+    XLOG_EVERY_MS(INFO, 600'000) << fmt::format(
         "Detected allocation failure in the last 10 minutes: {}", e.what());
   }
 }
@@ -199,7 +209,7 @@ void CachelibMapStressor::pokeHoles(TestMap& map) {
   for (auto k : keys) {
     if (!map.erase(k)) {
       throw std::runtime_error(
-          folly::sformat("Bug: Key '{}' couldn't be removed from map", k));
+          fmt::format("Bug: Key '{}' couldn't be removed from map", k));
     }
   }
   map.compact();
@@ -214,7 +224,7 @@ void CachelibMapStressor::readEntries(TestMap& map) {
   for (auto k : keys) {
     if (map.find(k) == nullptr) {
       throw std::runtime_error(
-          folly::sformat("Bug: Key '{}' disappeared from map", k));
+          fmt::format("Bug: Key '{}' disappeared from map", k));
     }
   }
 }
@@ -228,8 +238,9 @@ const uint32_t CachelibRangeMapStressor::kMapInsertionBatchMin;
 const uint32_t CachelibRangeMapStressor::kMapInsertionBatchMax;
 
 CachelibRangeMapStressor::CachelibRangeMapStressor(
-    const CacheConfig& cacheConfig, uint64_t numOps)
-    : numOpsPerThread_{numOps} {
+    const CacheConfig& cacheConfig, const StressorConfig& stressorConfig)
+    : numThreads_{getNumThreads(stressorConfig)},
+      numOpsPerThread_{stressorConfig.numOps} {
   struct CachelibMapTestCaseSync : public CacheType::SyncObj {
     CachelibRangeMapStressor& stressor;
     std::string key;
@@ -251,17 +262,18 @@ void CachelibRangeMapStressor::start() {
   startTime_ = std::chrono::system_clock::now();
 
   for (size_t i = 0; i < keys_.size(); i++) {
-    keys_[i] = folly::sformat("map_key_{}", i);
+    keys_[i] = fmt::format("map_key_{}", i);
   }
 
   testThread_ = std::thread([this] {
-    const size_t numThreads = folly::available_concurrency();
-    std::cout << folly::sformat("Total {:.2f}M ops to be run",
-                                numThreads * numOpsPerThread_ / 1e6)
+    std::cout << fmt::format("Total {:.2f}M ops to be run, using {} threads",
+                             numThreads_ * numOpsPerThread_ / 1e6,
+                             numThreads_)
               << std::endl;
 
     std::vector<std::thread> workers;
-    for (size_t i = 0; i < numThreads; i++) {
+    workers.reserve(numThreads_);
+    for (size_t i = 0; i < numThreads_; i++) {
       workers.emplace_back([this] {
         for (uint64_t j = 0; j < numOpsPerThread_; j++) {
           testLoop();
@@ -309,7 +321,7 @@ void CachelibRangeMapStressor::testLoop() {
     populate(map);
     cache_->insertOrReplace(map.viewWriteHandle());
   } catch (const std::bad_alloc& e) {
-    XLOG_EVERY_MS(INFO, 600'000) << folly::sformat(
+    XLOG_EVERY_MS(INFO, 600'000) << fmt::format(
         "Detected allocation failure in the last 10 minutes: {}", e.what());
   }
 }
@@ -338,7 +350,7 @@ void CachelibRangeMapStressor::pokeHoles(TestMap& map) {
   for (auto k : keys) {
     if (!map.remove(k)) {
       throw std::runtime_error(
-          folly::sformat("Bug: Key '{}' couldn't be removed from map", k));
+          fmt::format("Bug: Key '{}' couldn't be removed from map", k));
     }
   }
   map.compact();
@@ -353,7 +365,7 @@ void CachelibRangeMapStressor::readEntries(TestMap& map) {
   for (auto k : keys) {
     if (map.lookup(k) == map.end()) {
       throw std::runtime_error(
-          folly::sformat("Bug: Key '{}' disappeared from map", k));
+          fmt::format("Bug: Key '{}' disappeared from map", k));
     }
   }
 
@@ -363,8 +375,8 @@ void CachelibRangeMapStressor::readEntries(TestMap& map) {
   for (const auto& kv : range) {
     auto res = map.lookup(kv.key);
     if (res == map.end()) {
-      throw std::runtime_error(folly::sformat(
-          "Bug: Key '{}' in a range disappeared from map", kv.key));
+      throw std::runtime_error(
+          fmt::format("Bug: Key '{}' in a range disappeared from map", kv.key));
     }
   }
 }

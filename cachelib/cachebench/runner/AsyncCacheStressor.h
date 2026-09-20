@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <fmt/core.h>
 #include <folly/Random.h>
 #include <folly/TokenBucket.h>
 #include <folly/futures/Future.h>
@@ -102,13 +103,13 @@ class AsyncCacheStressor : public Stressor {
     cache_ = std::make_unique<CacheT>(cacheConfig, movingSync, "",
                                       config_.touchValue);
     if (config_.opPoolDistribution.size() > cache_->numPools()) {
-      throw std::invalid_argument(folly::sformat(
-          "more pools specified in the test than in the cache. "
-          "test: {}, cache: {}",
-          config_.opPoolDistribution.size(), cache_->numPools()));
+      throw std::invalid_argument(
+          fmt::format("more pools specified in the test than in the cache. "
+                      "test: {}, cache: {}",
+                      config_.opPoolDistribution.size(), cache_->numPools()));
     }
     if (config_.keyPoolDistribution.size() != cache_->numPools()) {
-      throw std::invalid_argument(folly::sformat(
+      throw std::invalid_argument(fmt::format(
           "different number of pools in the test from in the cache. "
           "test: {}, cache: {}",
           config_.keyPoolDistribution.size(), cache_->numPools()));
@@ -132,8 +133,8 @@ class AsyncCacheStressor : public Stressor {
       std::lock_guard<std::mutex> l(timeMutex_);
       startTime_ = std::chrono::system_clock::now();
     }
-    std::cout << folly::sformat("Total {:.2f}M ops to be run",
-                                config_.numThreads * config_.numOps / 1e6)
+    std::cout << fmt::format("Total {:.2f}M ops to be run",
+                             config_.numThreads * config_.numOps / 1e6)
               << std::endl;
 
     stressWorker_ = std::thread([this] {
@@ -250,7 +251,7 @@ class AsyncCacheStressor : public Stressor {
           l.unlock();
           auto xlock = chainedItemAcquireUniqueLock(key);
           setKey(pid, stats, key, *(req->sizeBegin), req->ttlSecs,
-                 req->admFeatureMap);
+                 req->getAdmFeatureMap());
         }
       } else {
         result = OpResultType::kGetHit;
@@ -448,7 +449,7 @@ class AsyncCacheStressor : public Stressor {
 #ifndef NDEBUG
         auto checkCnt = [](int cnt) {
           if (cnt != 0) {
-            throw std::runtime_error(folly::sformat("Refcount leak {}", cnt));
+            throw std::runtime_error(fmt::format("Refcount leak {}", cnt));
           }
         };
         checkCnt(cache_->getHandleCountForThread());
@@ -472,7 +473,7 @@ class AsyncCacheStressor : public Stressor {
         case OpType::kSet: {
           auto lock = chainedItemAcquireUniqueLock(key);
           result = setKey(pid, stats, key, *(req.sizeBegin), req.ttlSecs,
-                          req.admFeatureMap);
+                          req.getAdmFeatureMap());
 
           break;
         }
@@ -500,7 +501,7 @@ class AsyncCacheStressor : public Stressor {
         }
         default:
           throw std::runtime_error(
-              folly::sformat("invalid operation generated: {}", (int)op));
+              fmt::format("invalid operation generated: {}", (int)op));
           break;
         }
 

@@ -2678,6 +2678,7 @@ class CacheAllocator : public CacheBase {
 
   // interface
   friend class interface::RAMCacheComponent;
+  friend class interface::RAMCacheItem;
 };
 
 template <typename CacheTrait>
@@ -6106,6 +6107,8 @@ GlobalCacheStats CacheAllocator<CacheTrait>::getGlobalCacheStats() const {
   ret.isNewNvmCache =
       (nvmCacheState_.getCreationTime() == cacheInstanceCreationTime_) ||
       nvmCacheState_.shouldStartFresh();
+
+  ret.numShmOldHashAttaches = ShmManager::getNumOldHashAttaches();
 
   return ret;
 }

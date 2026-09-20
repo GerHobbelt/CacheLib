@@ -16,6 +16,7 @@
 
 #include "cachelib/cachebench/runner/CacheComponentStressor.h"
 
+#include <fmt/core.h>
 #include <folly/Random.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/logging/xlog.h>
@@ -133,7 +134,7 @@ folly::coro::Task<OpResultType> CacheComponentStressor::executeOperation(
 
   size_t size = *(req.sizeBegin);
   uint32_t ttlSecs = req.ttlSecs;
-  auto admFeatureMap = req.admFeatureMap;
+  auto admFeatureMap = req.getAdmFeatureMap();
   auto itemValue = req.itemValue;
 
   switch (op) {
@@ -164,7 +165,7 @@ folly::coro::Task<OpResultType> CacheComponentStressor::executeOperation(
   case OpType::kCouldExist:
   default:
     throw std::runtime_error(
-        folly::sformat("invalid operation generated: {}", (int)op));
+        fmt::format("invalid operation generated: {}", (int)op));
   }
 }
 

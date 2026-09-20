@@ -16,6 +16,8 @@
 
 #include "cachelib/cachebench/workload/WorkloadGenerator.h"
 
+#include <fmt/core.h>
+
 #include <algorithm>
 #include <chrono>
 #include <iostream>
@@ -35,7 +37,7 @@ WorkloadGenerator::WorkloadGenerator(const StressorConfig& config)
   }
 
   if (config_.numKeys > std::numeric_limits<uint32_t>::max()) {
-    throw std::invalid_argument(folly::sformat(
+    throw std::invalid_argument(fmt::format(
         "Too many keys specified: {}. Maximum allowed is 4 Billion.",
         config_.numKeys));
   }
@@ -102,15 +104,18 @@ void WorkloadGenerator::generateKeys() {
   auto sortDuration = std::chrono::duration_cast<std::chrono::seconds>(
       std::chrono::steady_clock::now() - startTime);
 
-  std::cout << folly::sformat("Created {:,} keys in {:.2f} mins",
-                              totalKeys,
-                              (keyGenDuration + sortDuration).count() / 60.)
+  std::cout << fmt::format("Created {} keys in {:.2f} mins",
+                           totalKeys,
+                           (keyGenDuration + sortDuration).count() / 60.)
             << std::endl;
 }
 
 void WorkloadGenerator::generateReqs() {
   generateFirstKeyIndexForPool();
   generateKeys();
+  const size_t totalKeys = firstKeyIndexForPool_.back();
+  reqs_.reserve(totalKeys);
+  sizes_.reserve(totalKeys);
   std::mt19937_64 gen(folly::Random::rand64());
   for (size_t i = 0; i < config_.keyPoolDistribution.size(); i++) {
     size_t idx = workloadIdx(i);
@@ -128,6 +133,9 @@ void WorkloadGenerator::generateReqs() {
       sizes_.emplace_back(chainSizes);
       auto reqSizes = sizes_.end() - 1;
       reqs_.emplace_back(keys_[j], reqSizes->begin(), reqSizes->end());
+      if (workloadDist_[idx].hasTtl()) {
+        reqs_.back().ttlSecs = workloadDist_[idx].sampleTtlSecs(gen);
+      }
     }
   }
 }
@@ -159,8 +167,8 @@ void WorkloadGenerator::generateKeyDistributions() {
         util::narrow_cast<size_t>(config_.numOps * config_.numThreads *
                                   config_.opPoolDistribution[i]),
         std::numeric_limits<uint32_t>::max());
-    std::cout << folly::sformat("Generating {:.2f}M sampled accesses",
-                                numOpsForPool / 1e6)
+    std::cout << fmt::format("Generating {:.2f}M sampled accesses",
+                             numOpsForPool / 1e6)
               << std::endl;
     keyGenForPool_.emplace_back(0,
                                 util::narrow_cast<uint32_t>(numOpsForPool) - 1);
@@ -178,8 +186,8 @@ void WorkloadGenerator::generateKeyDistributions() {
         config_.numThreads, numOpsForPool);
   }
 
-  std::cout << folly::sformat("Generated access patterns in {:.2f} mins",
-                              duration.count() / 60.)
+  std::cout << fmt::format("Generated access patterns in {:.2f} mins",
+                           duration.count() / 60.)
             << std::endl;
 }
 
