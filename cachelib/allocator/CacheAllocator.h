@@ -2669,6 +2669,17 @@ class CacheAllocator : public CacheBase {
   class DummyTlsActiveItemRingTag {};
   folly::ThreadLocal<TlsActiveItemRing, DummyTlsActiveItemRingTag> ring_;
 
+  enum class StartTruncateReason : uint8_t {
+    kNone = 0,
+    kNoCacheDir = 1,
+    // shouldStartFresh(): covers unclean shutdown, ice roll, nvm version or
+    // encryption change, corrupt metadata, and first boot. Not the same as
+    // "the previous shutdown crashed".
+    kNoUsableState = 2,
+    kDramCacheNew = 3,
+  };
+  StartTruncateReason startTruncateReason_{StartTruncateReason::kNone};
+
   // state for the nvmcache
   NvmCacheState nvmCacheState_;
 
@@ -2952,6 +2963,16 @@ void CacheAllocator<CacheTrait>::initNvmCache(bool dramCacheAttached) {
   // if we are dealing with persistency, cache directory should be enabled
   const bool truncate = config_.cacheDir.empty() ||
                         nvmCacheState_.shouldStartFresh() || shouldDrop;
+  // Recorded before markTruncated(), which clears wasCleanShutDown_.
+  if (!truncate) {
+    startTruncateReason_ = StartTruncateReason::kNone;
+  } else if (config_.cacheDir.empty()) {
+    startTruncateReason_ = StartTruncateReason::kNoCacheDir;
+  } else if (nvmCacheState_.shouldStartFresh()) {
+    startTruncateReason_ = StartTruncateReason::kNoUsableState;
+  } else {
+    startTruncateReason_ = StartTruncateReason::kDramCacheNew;
+  }
   if (truncate) {
     nvmCacheState_.markTruncated();
   }
@@ -3913,7 +3934,6 @@ CacheAllocator<CacheTrait>::insertOrReplace(const WriteHandle& handle) {
   // Remove from LRU as well if we do have a handle of old item
   if (replaced) {
     stats_.numInsertOrReplaceReplaced.inc();
-    replaced->markRemovedByReplacement();
     removeFromMMContainer(*replaced);
   } else {
     stats_.numInsertOrReplaceInserted.inc();
@@ -6024,7 +6044,7 @@ std::optional<bool> CacheAllocator<CacheTrait>::saveNvmCache() {
     return false;
   }
 
-  nvmCacheState_.markSafeShutDown();
+  nvmCacheState_.markSafeShutDown(nvmCache_->getLastPersistTimeMs());
   return true;
 }
 
@@ -6574,6 +6594,23 @@ util::StatsMap CacheAllocator<CacheTrait>::getNvmCacheStatsMap() const {
   auto ret = nvmCache_ ? nvmCache_->getStatsMap() : util::StatsMap{};
   if (nvmAdmissionPolicy_) {
     nvmAdmissionPolicy_->getCounters(ret.createCountVisitor());
+  }
+  if (nvmCache_) {
+    auto reasonCount = [this](StartTruncateReason reason) {
+      return startTruncateReason_ == reason ? 1 : 0;
+    };
+    ret.insertCount("start_truncated",
+                    reasonCount(StartTruncateReason::kNone) ? 0 : 1);
+    ret.insertCount("start_truncated_no_cache_dir",
+                    reasonCount(StartTruncateReason::kNoCacheDir));
+    ret.insertCount("start_truncated_no_usable_state",
+                    reasonCount(StartTruncateReason::kNoUsableState));
+    ret.insertCount("start_truncated_dram_cache_new",
+                    reasonCount(StartTruncateReason::kDramCacheNew));
+    // The previous shutdown's value: the stats exporters are gone by the time
+    // persist runs.
+    ret.insertCount("navy_persist_time_ms",
+                    nvmCacheState_.getLastPersistTimeMs());
   }
   return ret;
 }

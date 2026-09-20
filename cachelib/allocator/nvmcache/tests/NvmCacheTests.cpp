@@ -1587,6 +1587,17 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_concurrent_inserts"));
   EXPECT_TRUE(cs("navy_accepted"));
   EXPECT_TRUE(cs("navy_accepted_bytes"));
+  EXPECT_TRUE(cs("navy_metadata_size_bytes"));
+  EXPECT_TRUE(cs("navy_metadata_estimated_bytes"));
+  EXPECT_TRUE(cs("navy_recover_time_ms"));
+  EXPECT_TRUE(cs("navy_metadata_recovered_bytes"));
+
+  // CacheAllocator
+  EXPECT_TRUE(cs("start_truncated"));
+  EXPECT_TRUE(cs("start_truncated_no_cache_dir"));
+  EXPECT_TRUE(cs("start_truncated_no_usable_state"));
+  EXPECT_TRUE(cs("start_truncated_dram_cache_new"));
+  EXPECT_TRUE(cs("navy_persist_time_ms"));
 
   // navy::OrderedThreadPoolJobScheduler
   EXPECT_TRUE(cs("navy_reader_pool_max_queue_len"));
@@ -1621,6 +1632,7 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bc_item_hits_p999999"));
   EXPECT_TRUE(cs("navy_bc_item_hits_max"));
   EXPECT_TRUE(cs("navy_bc_items"));
+  EXPECT_TRUE(cs("navy_bc_metadata_est_bytes"));
   EXPECT_TRUE(cs("navy_bc_inserts"));
   EXPECT_TRUE(cs("navy_bc_insert_hash_collisions"));
   EXPECT_TRUE(cs("navy_bc_succ_inserts"));
@@ -1794,6 +1806,7 @@ TEST_F(NvmCacheTest, NavyStats) {
   EXPECT_TRUE(cs("navy_bh_bf_rebuilds"));
   EXPECT_TRUE(cs("navy_bh_checksum_errors"));
   EXPECT_TRUE(cs("navy_bh_used_size_bytes"));
+  EXPECT_TRUE(cs("navy_bh_metadata_est_bytes"));
   EXPECT_TRUE(cs("navy_bh_expired_loop_x100_avg"));
   EXPECT_TRUE(cs("navy_bh_expired_loop_x100_min"));
   EXPECT_TRUE(cs("navy_bh_expired_loop_x100_max"));
