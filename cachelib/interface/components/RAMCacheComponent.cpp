@@ -35,13 +35,11 @@ using LruCacheItem = cachelib::CacheItem<LruCacheTrait>;
  *   -------------------------------------------------
  *           ( double bars represent LruCacheItem's value memory)
  *
- * RAMCacheItem maintains two pointers - an implicit vtable ref and a pointer to
- * the containing LruCacheItem for access to standard APIs.  RAMCacheItem
+ * RAMCacheItem stores its offset from the containing LruCacheItem (offset is
+ * variable because of the key). This makes it safe across slab moves (where
+ * data is copied to a new allocation with the same layout) and warm rolls
+ * (where shared memory may be mapped at a different address).  RAMCacheItem
  * accounts for itself in everything exposed to the user.
- *
- * Note: RAMCacheItem needs to keep the pointer to the containing LruCacheItem
- * because we can't automatically calculate the address of the containing item
- * due to the variable-sized key.
  *
  * TODO(rlyerly) remove this shim and have LruCacheItem directly implement
  * interface::CacheItem
@@ -63,42 +61,66 @@ class RAMCacheItem : public interface::CacheItem {
    * Get the containing LruCacheItem.
    * @return the containing cache item
    */
-  LruCacheItem* item() const noexcept { return item_; }
+  LruCacheItem* item() const noexcept {
+    auto* base = reinterpret_cast<std::byte*>(const_cast<RAMCacheItem*>(this));
+    return reinterpret_cast<LruCacheItem*>(base - offset_);
+  }
 
   // ------------------------------ Interface ------------------------------ //
 
   uint32_t getCreationTime() const noexcept override {
-    return item_->getCreationTime();
+    return item()->getCreationTime();
   }
   uint32_t getExpiryTime() const noexcept override {
-    return item_->getExpiryTime();
+    return item()->getExpiryTime();
   }
-  // TODO return error result if this fails
-  void incrementRefCount() noexcept override { item_->incRef(); }
-  bool decrementRefCount() noexcept override { return item_->decRef() == 0; }
-  Key getKey() const noexcept override { return item_->getKey(); }
+  UnitResult incrementRefCount() noexcept override {
+    try {
+      switch (item()->incRef()) {
+      case RefcountWithFlags::IncResult::kIncOk:
+        return folly::unit;
+      case RefcountWithFlags::IncResult::kIncFailedMoving:
+        return makeError(Error::Code::INC_REF_FAILED, "item is being moved");
+      case RefcountWithFlags::IncResult::kIncFailedEviction:
+        return makeError(Error::Code::INC_REF_FAILED, "item is being evicted");
+      default:
+        XLOG(DFATAL) << "unhandled refcount increment result";
+        return makeError(Error::Code::INC_REF_FAILED,
+                         "unhandled refcount increment result");
+      }
+    } catch (const exception::RefcountOverflow& e) {
+      return makeError(Error::Code::INC_REF_FAILED, e.what());
+    }
+  }
+  bool decrementRefCount() noexcept override { return item()->decRef() == 0; }
+  Key getKey() const noexcept override { return item()->getKey(); }
   void* getMemory() const noexcept override {
-    return static_cast<char*>(item_->getMemory()) + sizeof(RAMCacheItem);
+    return const_cast<RAMCacheItem*>(this) + 1;
   }
   uint32_t getMemorySize() const noexcept override {
-    return item_->getSize() - sizeof(RAMCacheItem);
+    return item()->getSize() - sizeof(RAMCacheItem);
   }
   uint32_t getTotalSize() const noexcept override {
-    return item_->getTotalSize();
+    return item()->getTotalSize();
   }
 
  private:
-  LruCacheItem* item_;
+  ptrdiff_t offset_;
 
-  explicit RAMCacheItem(LruCacheItem* item) : item_(item) {}
+  explicit RAMCacheItem(LruCacheItem* item)
+      : offset_(reinterpret_cast<std::byte*>(this) -
+                reinterpret_cast<std::byte*>(item)) {
+    XDCHECK_GT(reinterpret_cast<uintptr_t>(this),
+               reinterpret_cast<uintptr_t>(item));
+  }
 
   void move(void* /* dest */) noexcept override {
     // We don't use the inline Handle buffer, move() should never be called
     XLOG(FATAL) << "Should not use RAMCacheItem::move()";
   }
 };
-// RAMCacheItem should only contain vtable and LruCacheItem pointers
-static_assert(sizeof(RAMCacheItem) == (2 * sizeof(void*)));
+// RAMCacheItem should only contain vtable pointer and offset
+static_assert(sizeof(RAMCacheItem) == sizeof(void*) + sizeof(ptrdiff_t));
 
 namespace {
 
@@ -129,11 +151,11 @@ LruCacheItem* getImplItemFromHandle(HandleT& handle) {
 }
 
 template <typename HandleT, typename ImplHandleT>
-HandleT toGenericHandle(RAMCacheComponent& cache,
-                        const ImplHandleT& implHandle) {
+Result<HandleT> toGenericHandle(RAMCacheComponent& cache,
+                                const ImplHandleT& implHandle) {
   auto* implItem = const_cast<LruCacheItem*>(implHandle.get());
-  auto* embeddedItem = RAMCacheItem::init(implItem);
-  return HandleT(cache, *embeddedItem);
+  return tryCreateHandle<HandleT>(cache,
+                                  *implItem->getMemoryAs<RAMCacheItem>());
 }
 
 } // namespace
@@ -221,7 +243,13 @@ folly::coro::Task<Result<AllocatedHandle>> RAMCacheComponent::allocate(
           fmt::format("could not find room in cache for {}", key));
     }
     stats_->allocate_.throughput_.successes_.inc();
-    co_return toGenericHandle<AllocatedHandle>(*this, implHandle);
+    co_return tryCreateHandle<AllocatedHandle>(
+        *this, *RAMCacheItem::init(implHandle.get()));
+  } catch (const exception::RefcountOverflow& ro) {
+    XLOG(DFATAL) << "ERROR: refcount overflow in allocate which shouldn't be "
+                    "possible (nobody else can access the item)";
+    stats_->allocate_.throughput_.errors_.inc();
+    co_return makeError(Error::Code::INC_REF_FAILED, ro.what());
   } catch (const std::exception& e) {
     stats_->allocate_.throughput_.errors_.inc();
     co_return makeError(Error::Code::INVALID_ARGUMENTS, e.what());
@@ -300,11 +328,17 @@ RAMCacheComponent::insertOrReplace(AllocatedHandle&& handle) {
     co_return makeError(Error::Code::INSERT_FAILED, e.what());
   }
 
-  stats_->insertOrReplace_.throughput_.successes_.inc();
   auto _ = std::move(handle);
   if (replacedHandle) {
-    co_return toGenericHandle<AllocatedHandle>(*this, replacedHandle);
+    auto result = toGenericHandle<AllocatedHandle>(*this, replacedHandle);
+    if (result.hasError()) {
+      stats_->insertOrReplace_.throughput_.errors_.inc();
+      co_return folly::makeUnexpected(std::move(result).error());
+    }
+    stats_->insertOrReplace_.throughput_.successes_.inc();
+    co_return std::move(result).value();
   } else {
+    stats_->insertOrReplace_.throughput_.successes_.inc();
     co_return std::nullopt;
   }
 }
@@ -315,9 +349,14 @@ folly::coro::Task<Result<std::optional<ReadHandle>>> RAMCacheComponent::find(
   auto latencyGuard = stats_->find_.latency_.start();
 
   if (auto handle = cache_->find(key)) {
+    auto result = toGenericHandle<ReadHandle>(*this, handle);
+    if (result.hasError()) {
+      stats_->find_.throughput_.errors_.inc();
+      co_return folly::makeUnexpected(std::move(result).error());
+    }
     stats_->find_.throughput_.hits_.inc();
     stats_->find_.throughput_.successes_.inc();
-    co_return toGenericHandle<ReadHandle>(*this, handle);
+    co_return std::move(result).value();
   }
   stats_->find_.throughput_.misses_.inc();
   stats_->find_.throughput_.successes_.inc();
@@ -330,9 +369,14 @@ RAMCacheComponent::findToWrite(Key key) {
   auto latencyGuard = stats_->findToWrite_.latency_.start();
 
   if (auto handle = cache_->findToWrite(key)) {
+    auto result = toGenericHandle<WriteHandle>(*this, handle);
+    if (result.hasError()) {
+      stats_->findToWrite_.throughput_.errors_.inc();
+      co_return folly::makeUnexpected(std::move(result).error());
+    }
     stats_->findToWrite_.throughput_.hits_.inc();
     stats_->findToWrite_.throughput_.successes_.inc();
-    co_return toGenericHandle<WriteHandle>(*this, handle);
+    co_return std::move(result).value();
   }
   stats_->findToWrite_.throughput_.misses_.inc();
   stats_->findToWrite_.throughput_.successes_.inc();

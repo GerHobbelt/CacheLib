@@ -48,7 +48,13 @@ AllocationClass::AllocationClass(ClassId classId,
       allocationSize_(allocSize),
       slabAlloc_(s),
       freedAllocations_{
-          slabAlloc_.createPtrCompressor<FreeAlloc, CompressedPtr5B>()} {
+          slabAlloc_.createPtrCompressor<FreeAlloc, CompressedPtr5B>()
+#if FOLLY_SANITIZE_ADDRESS
+              ,
+          // Only enable ASAN poisoning in the free list if configured
+          slabAlloc_.isAsanPoisoningEnabled() ? allocationSize_ : 0
+#endif
+      } {
   checkState();
 }
 
@@ -101,7 +107,13 @@ AllocationClass::AllocationClass(
       slabAlloc_(s),
       freedAllocations_(
           *object.freedAllocationsObject(),
-          slabAlloc_.createPtrCompressor<FreeAlloc, CompressedPtr5B>()),
+          slabAlloc_.createPtrCompressor<FreeAlloc, CompressedPtr5B>()
+#if FOLLY_SANITIZE_ADDRESS
+              ,
+          // Only enable ASAN poisoning in the free list if configured
+          slabAlloc_.isAsanPoisoningEnabled() ? allocationSize_ : 0
+#endif
+          ),
       canAllocate_(*object.canAllocate()) {
   if (!slabAlloc_.isRestorable()) {
     throw std::logic_error("The allocation class cannot be restored.");
@@ -116,6 +128,29 @@ AllocationClass::AllocationClass(
   }
 
   checkState();
+
+  // Poison slab regions that are not allocated. Tests depend on this running
+  // after checkState().
+
+  // Free slabs are entirely unused
+  for (auto* slab : freeSlabs_) {
+    slabAlloc_.asanPoisonMemoryRegion(slab->memoryAtOffset(0), Slab::kSize);
+  }
+
+  // Poison the internal fragmentation at the tail of fully allocated slabs
+  const uint32_t usableSize = getAllocsPerSlab() * allocationSize_;
+  if (usableSize < Slab::kSize) {
+    for (auto* slab : allocatedSlabs_) {
+      slabAlloc_.asanPoisonMemoryRegion(slab->memoryAtOffset(usableSize),
+                                        Slab::kSize - usableSize);
+    }
+  }
+
+  // Poison the uncarved region of currSlab_
+  if (currSlab_ != nullptr && currOffset_ < Slab::kSize) {
+    slabAlloc_.asanPoisonMemoryRegion(currSlab_->memoryAtOffset(currOffset_),
+                                      Slab::kSize - currOffset_);
+  }
 }
 
 void AllocationClass::addSlabLocked(Slab* slab) {
@@ -143,6 +178,7 @@ void* AllocationClass::allocateFromCurrentSlabLocked() noexcept {
   XDCHECK(canAllocateFromCurrentSlabLocked());
   void* ret = currSlab_->memoryAtOffset(currOffset_);
   currOffset_ += allocationSize_;
+  slabAlloc_.asanUnpoisonMemoryRegion(ret, allocationSize_);
   return ret;
 }
 
@@ -173,6 +209,7 @@ void* AllocationClass::allocateLocked() {
     FreeAlloc* ret = freedAllocations_.getHead();
     XDCHECK(ret != nullptr);
     freedAllocations_.pop();
+    slabAlloc_.asanUnpoisonMemoryRegion(ret, allocationSize_);
     return reinterpret_cast<void*>(ret);
   }
 
@@ -651,6 +688,7 @@ void AllocationClass::free(void* memory) {
         throw std::invalid_argument(
             folly::sformat("Allocation {} is already marked as free", memory));
       }
+      slabAlloc_.asanPoisonMemoryRegion(memory, allocationSize_);
       allocState[idx] = true;
       return;
     }

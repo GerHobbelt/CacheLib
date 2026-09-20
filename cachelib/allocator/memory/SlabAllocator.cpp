@@ -41,6 +41,12 @@ namespace {
 static inline size_t roundDownToSlabSize(size_t size) {
   return size - (size % sizeof(Slab));
 }
+
+FOLLY_DISABLE_ADDRESS_SANITIZER void touchAddr(const uint8_t* addr) {
+  // Use volatile to fool the compiler to not optimize this away in opt mode.
+  volatile const uint8_t val = *addr; // NOLINT(facebook-hte-Volatile)
+  (void)val;
+}
 } // namespace
 
 void SlabAllocator::checkState() const {
@@ -111,7 +117,12 @@ SlabAllocator::SlabAllocator(void* memoryStart,
       memorySize_(roundDownToSlabSize(memorySize)),
       slabMemoryStart_(computeSlabMemoryStart(memoryStart_, memorySize_)),
       nextSlabAllocation_(slabMemoryStart_),
-      ownsMemory_(ownsMemory) {
+      ownsMemory_(ownsMemory)
+#if FOLLY_SANITIZE_ADDRESS
+      ,
+      asanPoisoningEnabled_(config.enableAsanPoisoning)
+#endif
+{
   checkState();
 
   static_assert(!(sizeof(Slab) & (sizeof(Slab) - 1)),
@@ -124,6 +135,11 @@ SlabAllocator::SlabAllocator(void* memoryStart,
   if (config.lockMemory) {
     memoryLocker_ = std::thread{[this]() { lockMemoryAsync(); }};
   }
+
+  asanPoisonMemoryRegion(
+      slabMemoryStart_,
+      reinterpret_cast<const uint8_t*>(getSlabMemoryEnd()) -
+          reinterpret_cast<const uint8_t*>(slabMemoryStart_));
 
   XDCHECK_EQ(0u, reinterpret_cast<uintptr_t>(memoryStart_) % sizeof(Slab));
   XDCHECK_EQ(0u, memorySize_ % sizeof(Slab));
@@ -141,7 +157,12 @@ SlabAllocator::SlabAllocator(const serialization::SlabAllocatorObject& object,
       slabMemoryStart_(computeSlabMemoryStart(memoryStart_, memorySize_)),
       nextSlabAllocation_(getSlabForIdx(*object.nextSlabIdx())),
       canAllocate_(*object.canAllocate()),
-      ownsMemory_(false) {
+      ownsMemory_(false)
+#if FOLLY_SANITIZE_ADDRESS
+      ,
+      asanPoisoningEnabled_(config.enableAsanPoisoning)
+#endif
+{
   if (Slab::kSize != *object.slabSize()) {
     throw std::invalid_argument(folly::sformat(
         "current slab size {} does not match the previous one {}",
@@ -201,6 +222,22 @@ SlabAllocator::SlabAllocator(const serialization::SlabAllocatorObject& object,
   }
 
   checkState();
+
+  // Poison slabs that are not allocated. Tests depend on this running after
+  // checkState().
+
+  asanPoisonMemoryRegion(
+      nextSlabAllocation_,
+      reinterpret_cast<const uint8_t*>(getSlabMemoryEnd()) -
+          reinterpret_cast<const uint8_t*>(nextSlabAllocation_));
+
+  for (const auto* slab : freeSlabs_) {
+    asanPoisonMemoryRegion(slab, Slab::kSize);
+  }
+
+  for (const auto* slab : advisedSlabs_) {
+    asanPoisonMemoryRegion(slab, Slab::kSize);
+  }
 }
 
 void SlabAllocator::lockMemoryAsync() noexcept {
@@ -230,10 +267,8 @@ void SlabAllocator::lockMemoryAsync() noexcept {
         // shared memory pages. For memory that is not shared, touching the
         // memory won't page them in until the page gets written to. We default
         // to mlock for that and require the caller to set the appropriate
-        // rlimits. Use volatile to fool the compiler to not optimize this away
-        // in opt mode.
-        volatile const uint8_t val = *pageAddr; // NOLINT(facebook-hte-Volatile)
-        (void)val;
+        // rlimits.
+        touchAddr(pageAddr);
       }
 
       ++pageOffset;
@@ -415,11 +450,7 @@ Slab* FOLLY_NULLABLE SlabAllocator::reclaimSlab(PoolId id) {
   XDCHECK(util::isPageAlignedAddr(mem));
 
   for (size_t pageOffset = 0; pageOffset < numPages; pageOffset++) {
-    // Use volatile to fool the compiler to not optimize this away in opt
-    // mode.
-    volatile const uint8_t val =
-        *(mem + pageOffset * pageSize); // NOLINT(facebook-hte-Volatile)
-    (void)val;
+    touchAddr(mem + pageOffset * pageSize);
   }
   memoryPoolSize_[id] += sizeof(Slab);
   // initialize the header for the slab.
@@ -472,6 +503,12 @@ std::tuple<uint32_t, const void*> SlabAllocator::getRandomAlloc()
   XDCHECK_GE(reinterpret_cast<uintptr_t>(memory),
              reinterpret_cast<uintptr_t>(slab));
 
+  // getRandomAlloc() is best-effort sampling. Slab headers can concurrently
+  // transition between allocation classes while slab release/rebalance is in
+  // progress; callers validate the sampled item before using it. A racing
+  // allocSize read may at worst produce an invalid sample, which is reported as
+  // nullptr below or rejected by the caller's lookup validation.
+  folly::annotate_ignore_thread_sanitizer_guard g(__FILE__, __LINE__);
   const auto allocSize = header->allocSize;
   if (allocSize == 0) {
     return std::make_tuple(0, nullptr);

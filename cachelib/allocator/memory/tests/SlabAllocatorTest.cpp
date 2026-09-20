@@ -38,7 +38,8 @@ constexpr size_t SerializationBufferSize = 100 * 1024;
 
 namespace {
 SlabAllocator::Config getDefaultConfig() {
-  return {true /* disableFullCoredump */, false /* lockMemory */};
+  return {true /* disableFullCoredump */, false /* lockMemory */,
+          true /* enableAsanPoisoning */};
 }
 } // namespace
 
@@ -310,6 +311,7 @@ TEST_F(SlabAllocatorTest, Serialization) {
   // Attach to a different address
   void* memory2 = allocate(size);
   ASSERT_NE(memory, memory2);
+  ASAN_UNPOISON_MEMORY_REGION(memory, size);
   memcpy(memory2, memory, size);
 
   Deserializer deserializer(begin, end);
@@ -363,6 +365,7 @@ TEST_F(SlabAllocatorTest, InvalidDeSerialization) {
   // Attach to a different address
   void* memory2 = allocate(size);
   ASSERT_NE(memory, memory2);
+  ASAN_UNPOISON_MEMORY_REGION(memory, size);
   memcpy(memory2, memory, size);
 
   Deserializer deserializer(begin, end);
@@ -475,6 +478,7 @@ TEST_F(SlabAllocatorTest, Restorable) {
     // Attach to a different address
     void* memory2 = allocate(size);
     ASSERT_NE(memory, memory2);
+    ASAN_UNPOISON_MEMORY_REGION(memory, size);
     memcpy(memory2, memory, size);
 
     Deserializer deserializer(begin, end);

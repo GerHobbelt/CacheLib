@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <fmt/core.h>
 #include <folly/Benchmark.h>
 #include <folly/Random.h>
 #include <gtest/gtest.h>
@@ -231,7 +232,7 @@ class ObjectCacheTest : public ::testing::Test {
 
     // add one more object to trigger eviction
     auto res = objcache->insertOrReplace(
-        folly::sformat("Foo_{}", numEntriesLimit + 1), std::make_unique<Foo>());
+        fmt::format("Foo_{}", numEntriesLimit + 1), std::make_unique<Foo>());
     ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, std::get<0>(res));
 
     {
@@ -247,8 +248,8 @@ class ObjectCacheTest : public ::testing::Test {
     }
 
     // add one more object to trigger eviction
-    res = objcache->insertOrReplace(
-        folly::sformat("Foo_{}", numEntriesLimit + 2), std::make_unique<Foo>());
+    res = objcache->insertOrReplace(fmt::format("Foo_{}", numEntriesLimit + 2),
+                                    std::make_unique<Foo>());
     ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, std::get<0>(res));
 
     {
@@ -367,11 +368,11 @@ class ObjectCacheTest : public ::testing::Test {
         [&](ObjectCacheDestructorData data) { data.deleteObject<Foo3>(); });
     auto objcache = ObjectCache::create(config);
     for (int i = 0; i < 10; i++) {
-      objcache->insertOrReplace(folly::sformat("key_{}", i),
+      objcache->insertOrReplace(fmt::format("key_{}", i),
                                 std::make_unique<Foo3>(numDtors));
     }
     for (int i = 0; i < 10; i++) {
-      ASSERT_TRUE(objcache->remove(folly::sformat("key_{}", i)));
+      ASSERT_TRUE(objcache->remove(fmt::format("key_{}", i)));
     }
     ASSERT_EQ(10, numDtors);
   }
@@ -855,6 +856,26 @@ class ObjectCacheTest : public ::testing::Test {
     EXPECT_GT(stats.getCounts().at("objcache.key_padding_bytes"), 0);
   }
 
+  void testRuntimeTotalObjectSizeLimitVisibility() {
+    ObjectCacheConfig config;
+    config.setCacheName("runtime_resize_visibility_test");
+    config.setItemDestructor(
+        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+    config.setCacheCapacity(10 /* l1EntriesLimit */,
+                            200 /* totalObjectSizeLimit */,
+                            60'000 /* sizeControllerIntervalMs */);
+
+    auto objcache = ObjectCache::create(config);
+    ASSERT_TRUE(objcache->setTotalObjectSizeLimit(100));
+
+    EXPECT_EQ(objcache->serializeConfigParams().at("totalObjectSizeLimit"),
+              "100");
+
+    util::StatsMap stats;
+    objcache->getObjectCacheCounters(stats.createCountVisitor());
+    EXPECT_EQ(stats.getCounts().at("objcache.total_object_size_limit"), 100);
+  }
+
   void testMultithreadObjectSizeTrackingWithMutation() {
     if (!folly::usingJEMalloc()) {
       return;
@@ -884,7 +905,7 @@ class ObjectCacheTest : public ::testing::Test {
       auto found = objcache->template findToWrite<ObjectType>("cacheKey");
       ASSERT_NE(nullptr, found);
       objcache->mutateObject(found, [&found, i]() {
-        (*found)[folly::sformat("key_{}", i)] = folly::sformat("value_{}", i);
+        (*found)[fmt::format("key_{}", i)] = fmt::format("value_{}", i);
       });
     };
 
@@ -1255,11 +1276,11 @@ class ObjectCacheTest : public ::testing::Test {
       while (evictItr) {
         auto* itemPtr = ObjectCache::getAlignedItemPtr(evictItr->getMemory());
         auto* objectPtr = reinterpret_cast<ThriftFoo*>(itemPtr->objectPtr);
-        content.push_back(folly::sformat("{}: a {} b {} c {}",
-                                         evictItr->getKey(),
-                                         folly::copy(objectPtr->a().value()),
-                                         folly::copy(objectPtr->b().value()),
-                                         folly::copy(objectPtr->c().value())));
+        content.push_back(fmt::format("{}: a {} b {} c {}",
+                                      evictItr->getKey(),
+                                      folly::copy(objectPtr->a().value()),
+                                      folly::copy(objectPtr->b().value()),
+                                      folly::copy(objectPtr->c().value())));
         ++evictItr;
       }
       return content;
@@ -1277,7 +1298,7 @@ class ObjectCacheTest : public ::testing::Test {
         object->a().value() = i;
         object->b().value() = i + 1;
         object->c().value() = i + 2;
-        auto key = folly::sformat("key_{}", i);
+        auto key = fmt::format("key_{}", i);
         objcache->insertOrReplace(key, std::move(object));
       }
 
@@ -1285,7 +1306,7 @@ class ObjectCacheTest : public ::testing::Test {
       int objectNum = objcache->getNumEntries();
       for (int i = 0; i < objectNum / 2; i++) {
         auto found = objcache->template find<ThriftFoo>(
-            folly::sformat("key_{}", folly::Random::rand32(0, objectNum)));
+            fmt::format("key_{}", folly::Random::rand32(0, objectNum)));
         ASSERT_NE(nullptr, found);
       }
 
@@ -1406,10 +1427,9 @@ class ObjectCacheTest : public ::testing::Test {
       auto objcache = ObjectCache::create(config);
       for (int i = 0; i < objectNum; i++) {
         int objectSize = i + 10;
-        auto object =
-            std::make_unique<std::string>(folly::sformat("value_{}", i));
-        objcache->insertOrReplace(folly::sformat("key_{}", i),
-                                  std::move(object), objectSize);
+        auto object = std::make_unique<std::string>(fmt::format("value_{}", i));
+        objcache->insertOrReplace(fmt::format("key_{}", i), std::move(object),
+                                  objectSize);
         totalObjectSize += objectSize;
       }
       ASSERT_EQ(objcache->getNumEntries(), objectNum);
@@ -1422,9 +1442,9 @@ class ObjectCacheTest : public ::testing::Test {
       ASSERT_EQ(objcache->recover(), true);
       for (int i = 0; i < objectNum; i++) {
         auto found =
-            objcache->template find<std::string>(folly::sformat("key_{}", i));
+            objcache->template find<std::string>(fmt::format("key_{}", i));
         EXPECT_NE(nullptr, found);
-        EXPECT_EQ(folly::sformat("value_{}", i), *found);
+        EXPECT_EQ(fmt::format("value_{}", i), *found);
       }
       EXPECT_EQ(objcache->getNumEntries(), objectNum);
       EXPECT_EQ(objcache->getTotalObjectSize(), totalObjectSize);
@@ -1624,7 +1644,7 @@ class ObjectCacheTest : public ::testing::Test {
     auto runReplaceOps = [&] {
       for (int i = 0; i < 2000; i++) {
         // Rotate through 5 different keys
-        auto key = folly::sformat("key_{}", i % 5);
+        auto key = fmt::format("key_{}", i % 5);
         auto foo2 = std::make_unique<Foo>();
         objcache->insertOrReplace(key, std::move(foo2));
       }
@@ -1650,7 +1670,7 @@ class ObjectCacheTest : public ::testing::Test {
 
     auto runInsertOps = [&](int id) {
       for (int i = 0; i < 2000; i++) {
-        auto key = folly::sformat("key_{}_{}", id, i);
+        auto key = fmt::format("key_{}_{}", id, i);
         auto foo2 = std::make_unique<Foo>();
         objcache->insertOrReplace(key, std::move(foo2));
       }
@@ -1679,7 +1699,7 @@ class ObjectCacheTest : public ::testing::Test {
 
     auto runInsertOps = [&](int id) {
       for (int i = 0; i < 2000; i++) {
-        auto key = folly::sformat("key_{}_{}", id, i);
+        auto key = fmt::format("key_{}_{}", id, i);
         auto foo2 = std::make_unique<Foo>();
         objcache->insertOrReplace(key, std::move(foo2), 1000);
       }
@@ -1785,7 +1805,7 @@ class ObjectCacheTest : public ::testing::Test {
     auto runReplaceOps = [&] {
       for (int i = 0; i < 2000; i++) {
         // Rotate through 5 different keys
-        auto key = folly::sformat("key_{}", i % 5);
+        auto key = fmt::format("key_{}", i % 5);
         auto foo2 = std::make_unique<Foo>();
         objcache->insertOrReplace(key, std::move(foo2));
       }
@@ -1794,7 +1814,7 @@ class ObjectCacheTest : public ::testing::Test {
     auto runFindOps = [&] {
       for (int i = 0; i < 2000; i++) {
         // Rotate through 5 different keys
-        auto key = folly::sformat("key_{}", i % 5);
+        auto key = fmt::format("key_{}", i % 5);
         auto res = objcache->template find<Foo>(key);
       }
     };
@@ -1837,6 +1857,118 @@ class ObjectCacheTest : public ::testing::Test {
       ts[i].join();
     }
   }
+
+  std::unique_ptr<ObjectCache> makeFooCache() {
+    ObjectCacheConfig config;
+    config.setCacheName("test").setCacheCapacity(10'000);
+    config.setItemDestructor(
+        [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+    return ObjectCache::create(config);
+  }
+
+  std::map<std::string, Foo> populateFooCache(ObjectCache& objcache, int n) {
+    std::map<std::string, Foo> expected;
+    for (int i = 0; i < n; i++) {
+      auto key = fmt::format("Foo_{}", i);
+      auto foo = std::make_unique<Foo>();
+      foo->a = i;
+      foo->b = i * 2;
+      foo->c = i * 3;
+      expected[key] = *foo;
+      auto [allocRes, _, __] = objcache.insertOrReplace(key, std::move(foo));
+      EXPECT_EQ(ObjectCache::AllocStatus::kSuccess, allocRes);
+    }
+    return expected;
+  }
+
+  template <typename Iter>
+  void verifyVisitsAllFoos(Iter begin,
+                           const Iter& end,
+                           const std::map<std::string, Foo>& expected) {
+    std::map<std::string, Foo> visited;
+    for (auto it = std::move(begin); it != end; ++it) {
+      ASSERT_TRUE(static_cast<bool>(it));
+      visited[it.getKey().str()] = *it.template getObjectPtrAs<Foo>();
+    }
+    EXPECT_EQ(expected.size(), visited.size());
+    for (const auto& [k, v] : expected) {
+      auto vIt = visited.find(k);
+      ASSERT_NE(visited.end(), vIt);
+      EXPECT_EQ(v.a, vIt->second.a);
+      EXPECT_EQ(v.b, vIt->second.b);
+      EXPECT_EQ(v.c, vIt->second.c);
+    }
+  }
+
+  void testAccessIteratorVisitsAll() {
+    auto objcache = makeFooCache();
+    auto expected = populateFooCache(*objcache, 50);
+    verifyVisitsAllFoos(objcache->begin(), objcache->end(), expected);
+  }
+
+  void testAccessIteratorEmpty() {
+    auto objcache = makeFooCache();
+    EXPECT_EQ(objcache->begin(), objcache->end());
+  }
+
+  void testLockGroupAccessIteratorVisitsAll() {
+    auto objcache = makeFooCache();
+    auto expected = populateFooCache(*objcache, 50);
+    verifyVisitsAllFoos(objcache->beginLockGroup(), objcache->endLockGroup(),
+                        expected);
+  }
+
+  void testLockGroupAccessIteratorEmpty() {
+    auto objcache = makeFooCache();
+    EXPECT_EQ(objcache->beginLockGroup(), objcache->endLockGroup());
+  }
+
+  void testLockGroupAccessIteratorFilter() {
+    auto objcache = makeFooCache();
+    populateFooCache(*objcache, 50);
+
+    auto filter = [](folly::StringPiece key) {
+      return key == "Foo_0" || key == "Foo_1" || key == "Foo_2";
+    };
+    std::set<std::string> filteredVisited;
+    for (auto it = objcache->beginLockGroup(filter);
+         it != objcache->endLockGroup();
+         ++it) {
+      filteredVisited.insert(it.getKey().str());
+    }
+    const std::set<std::string> filteredExpected{"Foo_0", "Foo_1", "Foo_2"};
+    EXPECT_EQ(filteredExpected, filteredVisited);
+  }
+
+  void testLockGroupAccessIteratorPrefixScan() {
+    auto objcache = makeFooCache();
+    std::set<std::string> expectedAlpha;
+    std::set<std::string> expectedBeta;
+    for (int i = 0; i < 500; i++) {
+      auto alpha = fmt::format("alpha_{}", i);
+      auto beta = fmt::format("beta_{}", i);
+      expectedAlpha.insert(alpha);
+      expectedBeta.insert(beta);
+      auto [r1, _1, __1] =
+          objcache->insertOrReplace(alpha, std::make_unique<Foo>());
+      auto [r2, _2, __2] =
+          objcache->insertOrReplace(beta, std::make_unique<Foo>());
+      ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, r1);
+      ASSERT_EQ(ObjectCache::AllocStatus::kSuccess, r2);
+    }
+
+    auto prefixFilter =
+        [prefix = folly::StringPiece{"alpha_"}](folly::StringPiece key) {
+          return key.startsWith(prefix);
+        };
+    std::set<std::string> visited;
+    for (auto it = objcache->beginLockGroup(prefixFilter);
+         it != objcache->endLockGroup();
+         ++it) {
+      visited.insert(it.getKey().str());
+    }
+    EXPECT_EQ(expectedAlpha, visited);
+  }
 };
 
 using AllocatorTypes = ::testing::Types<LruAllocator,
@@ -1853,6 +1985,24 @@ TYPED_TEST(ObjectCacheTest, SetEvictionPolicyConfig) {
   }
 }
 TYPED_TEST(ObjectCacheTest, Simple) { this->testSimple(); }
+TYPED_TEST(ObjectCacheTest, AccessIteratorVisitsAll) {
+  this->testAccessIteratorVisitsAll();
+}
+TYPED_TEST(ObjectCacheTest, AccessIteratorEmpty) {
+  this->testAccessIteratorEmpty();
+}
+TYPED_TEST(ObjectCacheTest, LockGroupAccessIteratorVisitsAll) {
+  this->testLockGroupAccessIteratorVisitsAll();
+}
+TYPED_TEST(ObjectCacheTest, LockGroupAccessIteratorEmpty) {
+  this->testLockGroupAccessIteratorEmpty();
+}
+TYPED_TEST(ObjectCacheTest, LockGroupAccessIteratorFilter) {
+  this->testLockGroupAccessIteratorFilter();
+}
+TYPED_TEST(ObjectCacheTest, LockGroupAccessIteratorPrefixScan) {
+  this->testLockGroupAccessIteratorPrefixScan();
+}
 TYPED_TEST(ObjectCacheTest, MultiType) { this->testMultiType(); }
 TYPED_TEST(ObjectCacheTest, testMultiTypePolymorphism) {
   this->testMultiTypePolymorphism();
@@ -1877,6 +2027,9 @@ TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingWithMutation) {
 }
 TYPED_TEST(ObjectCacheTest, ObjectSizeTrackingWithSizeUpdate) {
   this->testObjectSizeTrackingWithSizeUpdate();
+}
+TYPED_TEST(ObjectCacheTest, RuntimeTotalObjectSizeLimitVisibility) {
+  this->testRuntimeTotalObjectSizeLimitVisibility();
 }
 TYPED_TEST(ObjectCacheTest, MultithreadObjectSizeTrackingWithMutation) {
   this->testMultithreadObjectSizeTrackingWithMutation();
@@ -1943,7 +2096,7 @@ TEST(ObjectCacheTest, LruEviction) {
   for (int i = 0; i < 1025; i++) {
     auto foo = std::make_unique<Foo>();
     foo->a = i;
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcache->insertOrReplace(key, std::move(foo));
     auto found = objcache->find<Foo>(key);
     ASSERT_NE(nullptr, found);
@@ -1965,7 +2118,7 @@ TEST(ObjectCacheTest, LruEvictionWithSizeControl) {
   {
     auto objcache = ObjectCache::create(config);
     for (size_t i = 0; i < 5; i++) {
-      auto key = folly::sformat("key_{}", i);
+      auto key = fmt::format("key_{}", i);
       objcache->insertOrReplace(key, std::make_unique<Foo>(), 25);
     }
     ASSERT_EQ(objcache->getTotalObjectSize(), 125);
@@ -1988,7 +2141,7 @@ TEST(ObjectCacheTest, LruEvictionWithSizeControl) {
   {
     auto objcache = ObjectCache::create(config);
     for (size_t i = 0; i < 10; i++) {
-      auto key = folly::sformat("key_{}", i);
+      auto key = fmt::format("key_{}", i);
       objcache->insertOrReplace(key, std::make_unique<Foo>(), 25);
     }
     // access key_0 ~ key_3 from the tail
@@ -2021,7 +2174,7 @@ TEST(ObjectCacheTest, LruEvictionWithSizeControl) {
   {
     auto objcache = ObjectCache::create(config);
     for (size_t i = 0; i < 10; i++) {
-      auto key = folly::sformat("key_{}", i);
+      auto key = fmt::format("key_{}", i);
       objcache->insertOrReplace(key, std::make_unique<Foo>(), 25 + i);
     }
     ASSERT_EQ(objcache->getTotalObjectSize(), 295);
@@ -2044,6 +2197,88 @@ TEST(ObjectCacheTest, LruEvictionWithSizeControl) {
     EXPECT_NE(nullptr, objcache->find<Foo>("key_8"));
     EXPECT_NE(nullptr, objcache->find<Foo>("key_9"));
   }
+}
+
+TEST(ObjectCacheTest, RuntimeTotalObjectSizeLimitResize) {
+  constexpr size_t kEntriesLimit = 20;
+  constexpr int kSizeControllerIntervalMs = 10;
+
+  ObjectCache::Config config;
+  config.setCacheName("runtime_resize_test");
+  config.setItemDestructor(
+      [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+  config.setCacheCapacity(kEntriesLimit, 200 /* totalObjectSizeLimit */,
+                          kSizeControllerIntervalMs);
+
+  auto objcache = ObjectCache::create(config);
+  for (size_t i = 0; i < 8; i++) {
+    objcache->insertOrReplace(fmt::format("key_{}", i), std::make_unique<Foo>(),
+                              25);
+  }
+
+  ASSERT_EQ(objcache->getTotalObjectSizeLimit(), 200);
+  ASSERT_EQ(objcache->getTotalObjectSize(), 200);
+
+  ASSERT_TRUE(objcache->setTotalObjectSizeLimit(100));
+  EXPECT_EQ(objcache->getTotalObjectSizeLimit(), 100);
+  ASSERT_TRUE(test_util::eventuallyTrue(
+      [&]() {
+        return objcache->getTotalObjectSize() <= 100 &&
+               objcache->getCurrentEntriesLimit() == 4;
+      },
+      3 /* timeoutSecs */));
+  EXPECT_LE(objcache->getTotalObjectSize(), 100);
+  EXPECT_EQ(objcache->getCurrentEntriesLimit(), 4);
+
+  ASSERT_TRUE(objcache->setTotalObjectSizeLimit(200));
+  EXPECT_EQ(objcache->getTotalObjectSizeLimit(), 200);
+  ASSERT_TRUE(test_util::eventuallyTrue(
+      [&]() { return objcache->getCurrentEntriesLimit() > 4; },
+      3 /* timeoutSecs */));
+  EXPECT_GT(objcache->getCurrentEntriesLimit(), 4);
+  EXPECT_LE(objcache->getCurrentEntriesLimit(), kEntriesLimit);
+
+  for (size_t i = 8; i < 12; i++) {
+    objcache->insertOrReplace(fmt::format("key_{}", i), std::make_unique<Foo>(),
+                              25);
+  }
+  EXPECT_LE(objcache->getTotalObjectSize(), 200);
+}
+
+TEST(ObjectCacheTest, RuntimeTotalObjectSizeLimitRejectsZero) {
+  ObjectCache::Config config;
+  config.setCacheName("runtime_resize_zero_test");
+  config.setItemDestructor(
+      [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+  config.setCacheCapacity(10 /* l1EntriesLimit */,
+                          100 /* totalObjectSizeLimit */,
+                          60'000 /* sizeControllerIntervalMs */);
+
+  auto objcache = ObjectCache::create(config);
+  for (size_t i = 0; i < 4; i++) {
+    objcache->insertOrReplace(folly::sformat("key_{}", i),
+                              std::make_unique<Foo>(), 25);
+  }
+
+  ASSERT_EQ(objcache->getTotalObjectSize(), 100);
+  EXPECT_FALSE(objcache->setTotalObjectSizeLimit(0));
+  EXPECT_EQ(objcache->getTotalObjectSizeLimit(), 100);
+  EXPECT_EQ(objcache->getTotalObjectSize(), 100);
+  EXPECT_EQ(objcache->getNumEntries(), 4);
+}
+
+TEST(ObjectCacheTest, RuntimeTotalObjectSizeLimitUnsupported) {
+  ObjectCache::Config config;
+  config.setCacheName("runtime_resize_unsupported_test");
+  config.setItemDestructor(
+      [&](ObjectCacheDestructorData data) { data.deleteObject<Foo>(); });
+  config.setCacheCapacity(10);
+
+  auto objcache = ObjectCache::create(config);
+  // Entry-count-only ObjectCache instances do not have a size controller, so
+  // runtime object-size-limit updates are unsupported and must fail cleanly.
+  EXPECT_EQ(objcache->getTotalObjectSizeLimit(), 0);
+  EXPECT_FALSE(objcache->setTotalObjectSizeLimit(100));
 }
 
 TEST(ObjectCacheTest, ExportStats) {
@@ -2309,7 +2544,7 @@ TEST(ObjectCacheTest, AggregatePoolStatsWithTwoShards) {
 
   // Insert some items to generate stats
   for (int i = 0; i < 10; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcache->insertOrReplace(key, std::make_unique<Foo>());
   }
 
@@ -2409,7 +2644,7 @@ TEST(ObjectCacheTest, DynamicFreeMemorySizeControlTest) {
   EXPECT_EQ(objcache->getNumEntries(), 0);
 
   for (size_t i = 0; i < maxNumEntries; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcache->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                               itemSize);
   }
@@ -2437,7 +2672,7 @@ TEST(ObjectCacheTest, DynamicFreeMemorySizeControlTest) {
   currentFreeMem.store(20 * kMB);
 
   for (size_t i = 0; i < 10; i++) {
-    auto key = folly::sformat("new_key_{}", i);
+    auto key = fmt::format("new_key_{}", i);
     objcache->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                               itemSize);
   }
@@ -2480,7 +2715,7 @@ TEST(ObjectCacheTest, ExpandNeverExceedsL1EntriesLimit) {
 
   // Fill cache
   for (size_t i = 0; i < maxNumEntries; i++) {
-    auto key = folly::sformat("key_{}", i);
+    auto key = fmt::format("key_{}", i);
     objcache->insertOrReplace(key, std::make_unique<MemoryConsumer>(itemSize),
                               itemSize);
   }

@@ -83,7 +83,9 @@ MemoryPool::MemoryPool(const serialization::MemoryPoolObject& object,
   }
 
   for (auto freeSlabIdx : *object.freeSlabIdxs()) {
-    freeSlabs_.push_back(slabAllocator_.getSlabForIdx(freeSlabIdx));
+    auto* slab = slabAllocator_.getSlabForIdx(freeSlabIdx);
+    slabAllocator_.asanPoisonMemoryRegion(slab->memoryAtOffset(0), Slab::kSize);
+    freeSlabs_.push_back(slab);
   }
   checkState();
 }
@@ -388,12 +390,28 @@ serialization::MemoryPoolObject MemoryPool::saveState() const {
   return object;
 }
 
+FOLLY_DISABLE_ADDRESS_SANITIZER void memsetNoAsan(void* ptr,
+                                                  uint8_t c,
+                                                  size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    reinterpret_cast<uint8_t*>(ptr)[i] = c;
+  }
+}
+
 void MemoryPool::releaseSlab(SlabReleaseMode mode,
                              const Slab* slab,
                              bool zeroOnRelease,
                              ClassId receiverClassId) {
   if (zeroOnRelease) {
+#if FOLLY_SANITIZE_ADDRESS
+    if (slabAllocator_.isAsanPoisoningEnabled()) {
+      memsetNoAsan(slab->memoryAtOffset(0), 0, Slab::kSize);
+    } else {
+      memset(slab->memoryAtOffset(0), 0, Slab::kSize);
+    }
+#else
     memset(slab->memoryAtOffset(0), 0, Slab::kSize);
+#endif
   }
 
   // If we are doing a resize, we need to release the slab back to the
