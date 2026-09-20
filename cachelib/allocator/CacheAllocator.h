@@ -661,18 +661,24 @@ class CacheAllocator : public CacheBase {
   //     buckets. All items across those buckets are snapshotted as Handles
   //     at once, blocking eviction until the caller advances past them.
   //     AccessIterator snapshots one bucket at a time.
+  // Optional key filter is applied under the lock before handle creation,
+  // avoiding handle overhead for items that don't match.
   using LockGroupAccessIterator = typename AccessContainer::LockGroupIterator;
+  using LockGroupFilterFn = typename LockGroupAccessIterator::FilterFn;
 
-  LockGroupAccessIterator beginLockGroup() {
-    return accessContainer_->beginLockGroup(
-        [this](Item* it) { return tryAcquire(it); },
-        [this](Key key) -> WriteHandle { return findInternal(key); });
-  }
-
-  LockGroupAccessIterator beginLockGroup(util::Throttler::Config config) {
+  LockGroupAccessIterator beginLockGroup(LockGroupFilterFn filter = {}) {
     return accessContainer_->beginLockGroup(
         [this](Item* it) { return tryAcquire(it); },
         [this](Key key) -> WriteHandle { return findInternal(key); },
+        std::move(filter));
+  }
+
+  LockGroupAccessIterator beginLockGroup(util::Throttler::Config config,
+                                         LockGroupFilterFn filter = {}) {
+    return accessContainer_->beginLockGroup(
+        [this](Item* it) { return tryAcquire(it); },
+        [this](Key key) -> WriteHandle { return findInternal(key); },
+        std::move(filter),
         config);
   }
 
@@ -1876,32 +1882,45 @@ class CacheAllocator : public CacheBase {
                    AllocatorApiResult result,
                    EventRecordParams params = {}) const {
     if (auto* eventTracker = getEventTracker()) {
-      if (eventTracker->sampleKey(key)) {
-        EventInfo eventInfo;
-        eventInfo.eventTimestamp = util::getCurrentTimeSec();
-        eventInfo.event = event;
-        eventInfo.result = result;
-        eventInfo.key = key;
-        if (params.size) {
-          eventInfo.size = *params.size;
-        }
-        if (params.expiryTime) {
-          eventInfo.expiryTime = *params.expiryTime;
-          eventInfo.timeToExpire = calculateTimeToExpire(
-              *params.expiryTime, eventInfo.eventTimestamp);
-        }
-        if (params.ttlSecs && *params.ttlSecs > 0) {
-          eventInfo.ttlSecs = *params.ttlSecs;
-        }
-        if (params.allocSize) {
-          eventInfo.allocSize = *params.allocSize;
-        }
-        if (params.poolId) {
-          eventInfo.poolId = *params.poolId;
-        }
-
-        eventTracker->recordWithoutSampling(eventInfo);
+      if (!eventTracker->sampleKey(key)) {
+        return;
       }
+    }
+    recordEventWithoutSampling(event, key, result, std::move(params));
+  }
+
+  // Record event without calling sampleKey(). Use when the caller has already
+  // determined that the key should be sampled (e.g., NvmCache::recordEvent()
+  // calls sampleKey() once and then uses this to avoid double-sampling).
+  void recordEventWithoutSampling(AllocatorApiEvent event,
+                                  Key key,
+                                  AllocatorApiResult result,
+                                  EventRecordParams params = {}) const {
+    if (auto* eventTracker = getEventTracker()) {
+      EventInfo eventInfo;
+      eventInfo.eventTimestamp = util::getCurrentTimeSec();
+      eventInfo.event = event;
+      eventInfo.result = result;
+      eventInfo.key = key;
+      if (params.size) {
+        eventInfo.size = *params.size;
+      }
+      if (params.expiryTime) {
+        eventInfo.expiryTime = *params.expiryTime;
+        eventInfo.timeToExpire =
+            calculateTimeToExpire(*params.expiryTime, eventInfo.eventTimestamp);
+      }
+      if (params.ttlSecs && *params.ttlSecs > 0) {
+        eventInfo.ttlSecs = *params.ttlSecs;
+      }
+      if (params.allocSize) {
+        eventInfo.allocSize = *params.allocSize;
+      }
+      if (params.poolId) {
+        eventInfo.poolId = *params.poolId;
+      }
+
+      eventTracker->recordWithoutSampling(eventInfo);
     } else if (auto legacyEventTracker = getLegacyEventTracker()) {
       folly::Optional<uint32_t> size =
           params.size
@@ -4234,7 +4253,8 @@ CacheAllocator<CacheTrait>::remove(AccessIterator& it) {
   HashedKey hk{it->getKey()};
   auto tombstone =
       nvmCache_ ? nvmCache_->createDeleteTombStone(hk) : DeleteTombStoneGuard{};
-  return removeImpl(hk, *it, std::move(tombstone));
+  return removeImpl(hk, *it, std::move(tombstone), true /* removeFromNvm */,
+                    false /* recordApiEvent */);
 }
 
 template <typename CacheTrait>
@@ -5580,7 +5600,7 @@ CCacheT* CacheAllocator<CacheTrait>::attachCompactCache(folly::StringPiece name,
   // if a compact cache with this name already exists, return without creating
   // new instance
   std::unique_lock lock(compactCachePoolsLock_);
-  if (compactCaches_.find(poolId) != compactCaches_.end()) {
+  if (compactCaches_.contains(poolId)) {
     return static_cast<CCacheT*>(compactCaches_[poolId].get());
   }
 

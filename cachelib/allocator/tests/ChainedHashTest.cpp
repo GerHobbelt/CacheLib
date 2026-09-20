@@ -63,7 +63,7 @@ TEST_F(ChainedHashTest, Chaining) {
   const unsigned int locksPower = 3;
   HashConfig config{bucketsPower, locksPower};
 
-  Container c{std::move(config), typename Node::PtrCompressor()};
+  Container c{config, typename Node::PtrCompressor()};
   std::vector<std::unique_ptr<Node>> nodes;
 
   // try to insert elements far more than the number of buckets.
@@ -111,7 +111,7 @@ TEST_F(ChainedHashTest, InsertOrReplaceDeadlock) {
     return Handle{n};
   };
 
-  Container c{std::move(config), typename Node::PtrCompressor(), failReplace};
+  Container c{config, typename Node::PtrCompressor(), failReplace};
   std::vector<std::unique_ptr<Node>> nodes;
   nodes.reserve(3);
 
@@ -161,7 +161,7 @@ TEST_F(ChainedHashTest, Stats) {
   const unsigned int locksPower = 3;
   HashConfig config{bucketsPower, locksPower};
 
-  Container c{std::move(config), typename Node::PtrCompressor()};
+  Container c{config, typename Node::PtrCompressor()};
   std::vector<std::unique_ptr<Node>> nodes;
 
   // try to insert elements far more than the number of buckets.
@@ -435,6 +435,45 @@ TEST_F(ChainedHashTest, LockGroupIteratorRetriesMovingItem) {
   ASSERT_EQ(1u, numFindRetries);
 }
 
+TEST_F(ChainedHashTest, LockGroupIteratorStatsSurviveMove) {
+  using Handle = Node::Handle;
+  using TryAcquireResult = Container::TryAcquireResult;
+  using HashConfig = ChainedHashTable::Config;
+
+  HashConfig config{0, 0};
+  Container c{config, typename Node::PtrCompressor()};
+
+  Node movingNode(std::string{"moving"});
+  Node stableNode(std::string{"stable"});
+  ASSERT_TRUE(c.insert(movingNode));
+  ASSERT_TRUE(c.insert(stableNode));
+
+  auto tryHandleMaker =
+      [&movingNode](Node* n) -> std::pair<Handle, TryAcquireResult> {
+    if (!n) {
+      return {Handle{nullptr}, TryAcquireResult::kSkip};
+    }
+    if (n == &movingNode) {
+      return {Handle{nullptr}, TryAcquireResult::kMoving};
+    }
+    n->incRef();
+    return {Handle{n}, TryAcquireResult::kSuccess};
+  };
+
+  auto it = c.beginLockGroup(tryHandleMaker, makeFindByKey(c));
+  const auto statsBeforeMove = it.getStats();
+  ASSERT_EQ(2u, statsBeforeMove.visited);
+  ASSERT_EQ(0u, statsBeforeMove.skipped);
+  ASSERT_EQ(1u, statsBeforeMove.retried);
+
+  auto moved = std::move(it);
+  const auto statsAfterMove = moved.getStats();
+  ASSERT_EQ(statsBeforeMove.visited, statsAfterMove.visited);
+  ASSERT_EQ(statsBeforeMove.skipped, statsAfterMove.skipped);
+  ASSERT_EQ(statsBeforeMove.retried, statsAfterMove.retried);
+  ASSERT_NE(moved, c.endLockGroup());
+}
+
 TEST_F(ChainedHashTest, LockGroupIteratorSkipsTryHandleMakerExceptions) {
   using Handle = Node::Handle;
   using TryAcquireResult = Container::TryAcquireResult;
@@ -517,6 +556,39 @@ TEST_F(ChainedHashTest, LockGroupIteratorSkipsFindByKeyExceptions) {
 
   const std::set<std::string> expectedKeys{"stable"};
   ASSERT_EQ(expectedKeys, visitedKeys);
+}
+
+TEST_F(ChainedHashTest, LockGroupIteratorFilter) {
+  Container c;
+  auto nodes = createSimpleContainer(c);
+
+  // Pick a character that some keys contain — use the first char of the
+  // first key so we're guaranteed at least one match.
+  const char target = nodes.front()->getKey().data()[0];
+
+  auto filter = [target](folly::StringPiece key) {
+    return key.size() > 0 && key.data()[0] == target;
+  };
+
+  // Collect expected keys by scanning all nodes with the same predicate.
+  std::set<std::string> expectedKeys;
+  for (const auto& node : nodes) {
+    if (filter(node->getKey())) {
+      expectedKeys.insert(node->getKey().str());
+    }
+  }
+  ASSERT_FALSE(expectedKeys.empty());
+
+  // Iterate with the filter — only matching items should appear.
+  std::set<std::string> filteredKeys;
+  for (auto it =
+           c.beginLockGroup(makeTryHandleMaker(), makeFindByKey(c), filter);
+       it != c.endLockGroup();
+       ++it) {
+    filteredKeys.insert(it->getKey().str());
+  }
+
+  ASSERT_EQ(expectedKeys, filteredKeys);
 }
 
 } // namespace tests
