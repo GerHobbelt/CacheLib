@@ -19,7 +19,6 @@
 #include <folly/CPortability.h>
 #include <folly/logging/xlog.h>
 
-#include <concepts>
 #include <cstdint>
 #include <utility>
 #include <variant>
@@ -28,6 +27,8 @@
 #include "cachelib/interface/Handle.h"
 
 namespace facebook::cachelib::interface {
+
+class Cache;
 
 /**
  * Source side of a transfer: hands a cache item's bytes to a connector, the way
@@ -106,9 +107,9 @@ class ReadDescriptor {
     return std::holds_alternative<ReadHandle>(owner_);
   }
 
-  // For component.remove(std::move(descriptor).release()).
+  // Only valid for a handle-backed descriptor.
   ReadHandle release() && noexcept {
-    XDCHECK(isHandleBacked());
+    XCHECK(isHandleBacked());
     auto handle = std::move(std::get<ReadHandle>(owner_));
     owner_.emplace<Empty>();
     return handle;
@@ -130,19 +131,14 @@ class ReadDescriptor {
 
 /**
  * Destination side of an in-place update: wraps the WriteHandle from
- * findToWrite(). The item is already inserted, so there is nothing to hand
- * back -- ~WriteHandle() flushes once mutableData() has marked it dirty.
+ * findToWrite(). The item is already inserted, so a connector has nothing to
+ * hand back -- ~WriteHandle() flushes once mutableData() has marked it dirty.
+ * Only Cache reclaims the handle, to build the user-facing WriteHandle.
  */
 class WriteDescriptor {
  public:
-  // same_as constrains the *deduced* type. A plain WriteHandle&& would accept
-  // an AllocatedHandle rvalue -- it IS-A WriteHandle and adds no members --
-  // yielding a WriteHandle with inserted_ == false, which ~WriteHandle() writes
-  // back while release() charges the same bytes as a hole. It also rejects
-  // lvalues, preserving explicit ownership transfer.
-  template <std::same_as<WriteHandle> H>
-  explicit WriteDescriptor(H&& handle) noexcept
-      : handle_(std::forward<H>(handle)) {}
+  explicit WriteDescriptor(WriteHandle&& handle) noexcept
+      : handle_(std::move(handle)) {}
 
   ~WriteDescriptor() noexcept = default;
 
@@ -153,6 +149,21 @@ class WriteDescriptor {
 
   FOLLY_ALWAYS_INLINE explicit operator bool() const noexcept {
     return static_cast<bool>(handle_);
+  }
+
+  FOLLY_ALWAYS_INLINE Key key() const noexcept {
+    checkNotEmpty();
+    return handle_->getKey();
+  }
+
+  FOLLY_ALWAYS_INLINE uint32_t creationTime() const noexcept {
+    checkNotEmpty();
+    return handle_->getCreationTime();
+  }
+
+  FOLLY_ALWAYS_INLINE uint32_t expiryTime() const noexcept {
+    checkNotEmpty();
+    return handle_->getExpiryTime();
   }
 
   // Reading does not mark the handle dirty; mutableData() does.
@@ -175,12 +186,13 @@ class WriteDescriptor {
 
   // Destination-side spelling of size(); an in-place update writes exactly the
   // bytes already there.
-  FOLLY_ALWAYS_INLINE uint32_t capacity() const noexcept {
-    checkNotEmpty();
-    return handle_->getMemorySize();
-  }
+  FOLLY_ALWAYS_INLINE uint32_t capacity() const noexcept { return size(); }
 
  private:
+  // Cache-only, unlike the sibling descriptors' public release(): handing the
+  // handle out drops the guarantee that mutable access marks it dirty.
+  WriteHandle release() && noexcept { return std::move(handle_); }
+
   // Moving leaves the handle empty, so its operator-> would dereference null.
   FOLLY_ALWAYS_INLINE void checkNotEmpty() const noexcept {
     XDCHECK(static_cast<bool>(handle_))
@@ -188,6 +200,8 @@ class WriteDescriptor {
   }
 
   WriteHandle handle_;
+
+  friend class Cache;
 };
 
 /**
@@ -209,6 +223,21 @@ class AllocatedDescriptor {
 
   FOLLY_ALWAYS_INLINE explicit operator bool() const noexcept {
     return static_cast<bool>(handle_);
+  }
+
+  FOLLY_ALWAYS_INLINE Key key() const noexcept {
+    checkNotEmpty();
+    return handle_->getKey();
+  }
+
+  FOLLY_ALWAYS_INLINE uint32_t creationTime() const noexcept {
+    checkNotEmpty();
+    return handle_->getCreationTime();
+  }
+
+  FOLLY_ALWAYS_INLINE uint32_t expiryTime() const noexcept {
+    checkNotEmpty();
+    return handle_->getExpiryTime();
   }
 
   // Must NOT mark the handle dirty, unlike WriteDescriptor: the item is not

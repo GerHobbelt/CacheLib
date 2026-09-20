@@ -19,8 +19,10 @@
 #include <fmt/core.h>
 
 #include <algorithm>
+#include <boost/sort/block_indirect_sort/block_indirect_sort.hpp>
 #include <chrono>
 #include <iostream>
+#include <utility>
 namespace facebook {
 namespace cachelib {
 namespace cachebench {
@@ -92,7 +94,10 @@ void WorkloadGenerator::generateKeys() {
     auto poolKeyBegin = keys_.begin() + firstKeyIndexForPool_[i];
     // past the end iterator
     auto poolKeyEnd = keys_.begin() + (firstKeyIndexForPool_[i + 1]);
-    std::sort(poolKeyBegin, poolKeyEnd);
+    boost::sort::block_indirect_sort(
+        poolKeyBegin,
+        poolKeyEnd,
+        util::narrow_cast<uint32_t>(std::max<uint64_t>(config_.numThreads, 1)));
     auto newEnd = std::unique(poolKeyBegin, poolKeyEnd);
     // update pool key boundary before invalidating iterators
     for (size_t j = i + 1; j < firstKeyIndexForPool_.size(); j++) {
@@ -130,7 +135,7 @@ void WorkloadGenerator::generateReqs() {
         chainSizes.push_back(util::narrow_cast<size_t>(
             workloadDist_[idx].sampleChainedValDist(gen)));
       }
-      sizes_.emplace_back(chainSizes);
+      sizes_.emplace_back(std::move(chainSizes));
       auto reqSizes = sizes_.end() - 1;
       reqs_.emplace_back(keys_[j], reqSizes->begin(), reqSizes->end());
       if (workloadDist_[idx].hasTtl()) {
@@ -172,7 +177,10 @@ void WorkloadGenerator::generateKeyDistributions() {
               << std::endl;
     keyGenForPool_.emplace_back(0,
                                 util::narrow_cast<uint32_t>(numOpsForPool) - 1);
-    keyIndicesForPool_.emplace_back(numOpsForPool);
+    // The parallel generation below initializes every entry before any
+    // request can access this table.
+    keyIndicesForPool_.emplace_back(
+        std::make_unique_for_overwrite<uint32_t[]>(numOpsForPool));
 
     duration += detail::executeParallel(
         [&, this](size_t start, size_t end) {
