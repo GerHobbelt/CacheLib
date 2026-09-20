@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <fmt/core.h>
 #include <folly/Random.h>
 #include <folly/Singleton.h>
 #include <folly/synchronization/Latch.h>
@@ -3467,7 +3468,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
       // slab rebalancer to free up a slab, but it would not succeed
       // because all items have references
       for (int i = 0; i < 10; i++) {
-        util::allocateAccessible(alloc, poolId, folly::sformat("foo{}", i),
+        util::allocateAccessible(alloc, poolId, fmt::format("foo{}", i),
                                  900 * 1024);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
       }
@@ -3576,6 +3577,56 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
 
     const auto poolStats = alloc.getPoolStats(poolId);
     ASSERT_LT(0, poolStats.numItems());
+  }
+
+  void testEvictionPredicate() {
+    std::string evictedKey;
+    auto removeCb =
+        [&evictedKey](const typename AllocatorT::RemoveCbData& data) {
+          if (data.context == RemoveContext::kEviction) {
+            const auto k = data.item.getKey();
+            evictedKey.assign(k.data(), k.size());
+          }
+        };
+
+    auto predicate = [](const typename AllocatorT::Item& item) {
+      return !*reinterpret_cast<const bool*>(item.getMemory());
+    };
+
+    typename AllocatorT::Config config{};
+    config.setRemoveCallback(removeCb);
+    config.setEvictionPredicate(predicate);
+    config.setCacheSize(2 * Slab::kSize);
+
+    AllocatorT alloc(config);
+    const size_t kAllocSize = 1024;
+    const size_t kValueSize = 64;
+    const auto poolId = alloc.addPool("foobar", Slab::kSize, {kAllocSize});
+    const size_t itemsPerSlab = Slab::kSize / kAllocSize;
+
+    const std::string keyPrefix = "key_";
+
+    // Fill the slab exactly. key_0 is inserted first so it sits at the
+    // LRU tail.  Mark key_0 as "dirty" so the predicate will skip it.
+    for (size_t i = 0; i < itemsPerSlab; ++i) {
+      const auto key = keyPrefix + folly::to<std::string>(i);
+      auto handle = alloc.allocate(poolId, key, kValueSize);
+      ASSERT_NE(nullptr, handle);
+      *reinterpret_cast<bool*>(handle->getMemory()) = (i == 0);
+      alloc.insertOrReplace(handle);
+    }
+
+    // One more allocation forces an eviction.  The predicate should skip
+    // key_0 (dirty) and evict key_1 instead.
+    auto handle =
+        util::allocateAccessible(alloc, poolId, "trigger_eviction", kValueSize);
+    ASSERT_NE(nullptr, handle);
+    ASSERT_EQ("key_1", evictedKey);
+
+    // key_0 should still be in the cache (dirty, skipped by predicate).
+    ASSERT_NE(nullptr, alloc.peek("key_0"));
+    // key_1 should have been evicted.
+    ASSERT_EQ(nullptr, alloc.peek("key_1"));
   }
 
   void testInsertAndFind(AllocatorT& alloc) {
@@ -6201,7 +6252,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     std::vector<typename AllocatorT::WriteHandle> handles;
     for (int i = 0;; i++) {
       auto handle = util::allocateAccessible(
-          alloc, poolId, folly::sformat("small_{}", i), smallSize);
+          alloc, poolId, fmt::format("small_{}", i), smallSize);
       if (handle == nullptr) {
         break;
       }
@@ -6241,7 +6292,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
     std::vector<typename AllocatorT::WriteHandle> handles;
     for (int i = 0;; i++) {
       auto handle = util::allocateAccessible(
-          alloc, poolId, folly::sformat("small_{}", i), smallSize);
+          alloc, poolId, fmt::format("small_{}", i), smallSize);
       if (handle == nullptr) {
         break;
       }
@@ -6604,7 +6655,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
           if (name == "stat1") {
             EXPECT_EQ(11, value);
             seen++;
-          } else if (name == folly::sformat("stat2.60")) {
+          } else if (name == "stat2.60") {
             EXPECT_EQ(22, value);
             seen++;
           }
@@ -6618,7 +6669,7 @@ class BaseAllocatorTest : public AllocatorTest<AllocatorT> {
           if (name == "stat1") {
             EXPECT_EQ(11, value);
             seen++;
-          } else if (name == folly::sformat("stat2.60")) {
+          } else if (name == "stat2.60") {
             EXPECT_EQ(44, value);
             seen++;
           }

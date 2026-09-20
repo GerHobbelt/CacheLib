@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <fmt/core.h>
 #include <folly/File.h>
 #include <folly/io/IOBuf.h>
 
@@ -105,21 +106,22 @@ class Device {
         encryptor_{std::move(encryptor)} {
     if (ioAlignSize == 0) {
       throw std::invalid_argument(
-          folly::sformat("Invalid ioAlignSize {}", ioAlignSize, size));
+          fmt::format("Invalid ioAlignSize {}", ioAlignSize));
     }
     if (encryptor_ && encryptor_->encryptionBlockSize() != ioAlignSize) {
       throw std::invalid_argument(
-          folly::sformat("Invalid ioAlignSize {} encryption block size {}",
-                         ioAlignSize, encryptor_->encryptionBlockSize()));
+          fmt::format("Invalid ioAlignSize {} encryption block size {}",
+                      ioAlignSize, encryptor_->encryptionBlockSize()));
     }
     if (maxWriteSize_ % ioAlignmentSize_ != 0) {
-      throw std::invalid_argument(folly::sformat(
-          "Invalid max write size {} ioAlignSize {}", maxWriteSize_, size));
+      throw std::invalid_argument(
+          fmt::format("Invalid max write size {} ioAlignSize {}", maxWriteSize_,
+                      ioAlignmentSize_));
     }
     if (maxIOSize_ % ioAlignmentSize_ != 0) {
       throw std::invalid_argument(
-          folly::sformat("Invalid max io size {} ioAlignSize {}", maxIOSize_,
-                         ioAlignmentSize_));
+          fmt::format("Invalid max io size {} ioAlignSize {}", maxIOSize_,
+                      ioAlignmentSize_));
     }
   }
   virtual ~Device() = default;

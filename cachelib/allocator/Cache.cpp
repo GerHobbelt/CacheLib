@@ -191,7 +191,7 @@ void CacheBase::updateLegacyEventTrackerStats(
 void CacheBase::updateEventTrackerStats(const std::string& statPrefix) const {
   const std::string prefix = statPrefix + "event_tracker.";
   for (const auto& kv : getEventTrackerStatsMap()) {
-    counters_.updateCount(prefix + kv.first, kv.second);
+    counters_.updateDelta(prefix + kv.first, kv.second);
   }
 }
 
@@ -384,6 +384,8 @@ void CacheBase::updateGlobalCacheStats(const std::string& statPrefix) const {
   counters_.updateCount(statPrefix + "slabs.release_stuck",
                         slabReleaseStats.numSlabReleaseStuck);
 
+  counters_.updateDelta(statPrefix + "evictions.filtered",
+                        stats.numEvictionsFiltered);
   counters_.updateDelta(statPrefix + "evictions.concurrent_fill_failure",
                         stats.numEvictionFailureFromConcurrentFill);
   counters_.updateDelta(statPrefix + "evictions.concurrent_access_failure",
@@ -406,7 +408,7 @@ void CacheBase::updateGlobalCacheStats(const std::string& statPrefix) const {
   counters_.updateCount(statPrefix + "ram.new_cache", stats.isNewRamCache);
   counters_.updateCount(statPrefix + "nvm.new_cache", stats.isNewNvmCache);
   counters_.updateCount(statPrefix + "cache.new_cache",
-                        stats.isNewRamCache || stats.isNewRamCache);
+                        stats.isNewRamCache || stats.isNewNvmCache);
 
   counters_.updateCount(statPrefix + "nvm.enabled", stats.nvmCacheEnabled);
 

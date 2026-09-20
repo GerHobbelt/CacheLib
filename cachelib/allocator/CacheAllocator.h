@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <fmt/format.h>
 #include <folly/CPortability.h>
 #include <folly/Likely.h>
 #include <folly/Random.h>
@@ -36,7 +37,6 @@
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
-#include <folly/Format.h>
 #include <folly/Range.h>
 #pragma GCC diagnostic pop
 
@@ -350,6 +350,25 @@ class CacheAllocator : public CacheBase {
   // and NVM), only items inserted into cache (not nascent) successfully are
   // tracked.
   using ItemDestructor = std::function<void(const DestructorData& data)>;
+
+  // Predicate called during eviction to decide whether a candidate may be
+  // evicted.  Return true to allow eviction, false to skip the candidate and
+  // try the next item in the LRU.
+  //
+  // Caveats:
+  //  - The predicate is called while the MMContainer lock is held, so it must
+  //    be fast and must not call back into the cache.
+  //  - The item has NOT been marked for eviction yet; its memory may be
+  //    concurrently mutated by writers holding a WriteHandle.  Use std::atomic
+  //    or tolerate benign races.
+  //  - If too many candidates are skipped, the eviction search will exhaust
+  //    evictionSearchTries and the allocation will fail.  Ensure skipped items
+  //    are eventually made evictable.
+  //  - For chained items the predicate receives the parent item, not the
+  //    chained child.
+  //  - This only applies to evictions caused by new allocations, not
+  //    evictions from slab releases.
+  using EvictionPredicate = std::function<bool(const Item&)>;
 
   using NvmCacheT = NvmCache<CacheT>;
   using NvmCacheConfig = typename NvmCacheT::Config;
@@ -1938,6 +1957,17 @@ class CacheAllocator : public CacheBase {
     return 0;
   }
 
+  // Returns true iff a configured tracker would consume this event. Hot-path
+  // gate that lets callers skip both the sampling-related work and any
+  // EventRecordParams construction (e.g., getAllocInfo) when no tracker is
+  // configured or sampling rejects the key.
+  FOLLY_ALWAYS_INLINE bool shouldRecordEvent(Key key) const {
+    if (auto* eventTracker = getEventTracker()) {
+      return eventTracker->sampleKey(key);
+    }
+    return getLegacyEventTracker() != nullptr;
+  }
+
   /**
    * Record event, key, result and info from a struct of type EventRecordParams.
    *
@@ -1957,12 +1987,9 @@ class CacheAllocator : public CacheBase {
                    Key key,
                    AllocatorApiResult result,
                    EventRecordParams params = {}) const {
-    if (auto* eventTracker = getEventTracker()) {
-      if (!eventTracker->sampleKey(key)) {
-        return;
-      }
+    if (shouldRecordEvent(key)) {
+      recordEventWithoutSampling(event, key, result, std::move(params));
     }
-    recordEventWithoutSampling(event, key, result, std::move(params));
   }
 
   // Record event without calling sampleKey(). Use when the caller has already
@@ -1996,7 +2023,7 @@ class CacheAllocator : public CacheBase {
         eventInfo.poolId = *params.poolId;
       }
 
-      eventTracker->recordWithoutSampling(eventInfo);
+      eventTracker->recordWithoutSampling(std::move(eventInfo));
     } else if (auto legacyEventTracker = getLegacyEventTracker()) {
       folly::Optional<uint32_t> size =
           params.size
@@ -2005,6 +2032,17 @@ class CacheAllocator : public CacheBase {
       uint32_t ttl = params.ttlSecs ? *params.ttlSecs : 0;
       legacyEventTracker->record(event, key, result, size, ttl);
     }
+  }
+
+  template <typename HandleT>
+  EventRecordParams makeEventRecordParams(const HandleT& handle) const {
+    const auto allocInfo = allocator_->getAllocInfo(handle->getMemory());
+    return EventRecordParams{
+        .size = handle->getSize(),
+        .ttlSecs = static_cast<uint32_t>(handle->getConfiguredTTL().count()),
+        .expiryTime = handle->getExpiryTime(),
+        .allocSize = allocInfo.allocSize,
+        .poolId = allocInfo.poolId};
   }
 
   /**
@@ -2023,19 +2061,15 @@ class CacheAllocator : public CacheBase {
                    Key key,
                    AllocatorApiResult result,
                    const HandleT& handle) const {
-    if (!handle) {
-      recordEvent(event, key, result);
+    if (!shouldRecordEvent(key)) {
       return;
     }
-
-    const auto allocInfo = allocator_->getAllocInfo(handle->getMemory());
-    recordEvent(event, key, result,
-                EventRecordParams{.size = handle->getSize(),
-                                  .ttlSecs = static_cast<uint32_t>(
-                                      handle->getConfiguredTTL().count()),
-                                  .expiryTime = handle->getExpiryTime(),
-                                  .allocSize = allocInfo.allocSize,
-                                  .poolId = allocInfo.poolId});
+    if (handle) {
+      recordEventWithoutSampling(event, key, result,
+                                 makeEventRecordParams(handle));
+    } else {
+      recordEventWithoutSampling(event, key, result);
+    }
   }
 
  public:
@@ -2931,7 +2965,7 @@ std::unique_ptr<MemoryAllocator> CacheAllocator<CacheTrait>::initAllocator(
   }
 
   // Invalid type
-  throw std::runtime_error(folly::sformat(
+  throw std::runtime_error(fmt::format(
       "Cannot initialize memory allocator, unknown InitMemType: {}.",
       static_cast<int>(type)));
 }
@@ -2967,7 +3001,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
   }
 
   // Invalid type
-  throw std::runtime_error(folly::sformat(
+  throw std::runtime_error(fmt::format(
       "Cannot initialize access container, unknown InitMemType: {}.",
       static_cast<int>(type)));
 }
@@ -3041,7 +3075,7 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
     if (!config_.allowLargeKeys && key.size() > KAllocation::kKeyMaxLenSmall) {
       auto badKey =
           (key.start()) ? std::string(key.start(), key.size()) : std::string{};
-      throw std::invalid_argument{folly::sformat(
+      throw std::invalid_argument{fmt::format(
           "Invalid cache key - large key (> {} bytes) but large keys not "
           "enabled : {} (size = {})",
           KAllocation::kKeyMaxLenSmall, folly::humanify(badKey), key.size())};
@@ -3062,21 +3096,21 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
     }
   }
 
-  const auto result =
-      handle ? AllocatorApiResult::ALLOCATED : AllocatorApiResult::FAILED;
-  uint32_t ttl =
-      handle ? static_cast<uint32_t>(handle->getConfiguredTTL().count())
-             : (expiryTime > creationTime ? (expiryTime - creationTime) : 0);
-
-  // Get allocInfo when handle is available to log poolId and allocSize
-  EventRecordParams eventParams{
-      .size = size, .ttlSecs = ttl, .expiryTime = expiryTime};
-  if (handle) {
-    const auto allocInfo = allocator_->getAllocInfo(handle->getMemory());
-    eventParams.allocSize = allocInfo.allocSize;
-    eventParams.poolId = allocInfo.poolId;
+  if (shouldRecordEvent(key)) {
+    if (handle) {
+      auto eventParams = makeEventRecordParams(handle);
+      eventParams.size = size;
+      recordEventWithoutSampling(AllocatorApiEvent::ALLOCATE, key,
+                                 AllocatorApiResult::ALLOCATED, eventParams);
+    } else {
+      const uint32_t ttl =
+          expiryTime > creationTime ? (expiryTime - creationTime) : 0;
+      recordEventWithoutSampling(
+          AllocatorApiEvent::ALLOCATE, key, AllocatorApiResult::FAILED,
+          EventRecordParams{
+              .size = size, .ttlSecs = ttl, .expiryTime = expiryTime});
+    }
   }
-  recordEvent(AllocatorApiEvent::ALLOCATE, key, result, eventParams);
 
   return handle;
 }
@@ -3143,9 +3177,9 @@ void CacheAllocator<CacheTrait>::addChainedItem(WriteHandle& parent,
                                                 WriteHandle child) {
   if (!parent || !child || !child->isChainedItem()) {
     throw std::invalid_argument(
-        folly::sformat("Invalid parent or child. parent: {}, child: {}",
-                       parent ? parent->toString() : "nullptr",
-                       child ? child->toString() : "nullptr"));
+        fmt::format("Invalid parent or child. parent: {}, child: {}",
+                    parent ? parent->toString() : "nullptr",
+                    child ? child->toString() : "nullptr"));
   }
 
   auto l = chainedItemLocks_.lockExclusive(parent->getKey());
@@ -3188,8 +3222,8 @@ template <typename CacheTrait>
 typename CacheAllocator<CacheTrait>::WriteHandle
 CacheAllocator<CacheTrait>::popChainedItem(WriteHandle& parent) {
   if (!parent || !parent->hasChainedItem()) {
-    throw std::invalid_argument(folly::sformat(
-        "Invalid parent {}", parent ? parent->toString() : "null"));
+    throw std::invalid_argument(
+        fmt::format("Invalid parent {}", parent ? parent->toString() : "null"));
   }
 
   WriteHandle head;
@@ -3226,7 +3260,7 @@ typename CacheAllocator<CacheTrait>::Key
 CacheAllocator<CacheTrait>::getParentKey(const Item& chainedItem) {
   XDCHECK(chainedItem.isChainedItem());
   if (!chainedItem.isChainedItem()) {
-    throw std::invalid_argument(folly::sformat(
+    throw std::invalid_argument(fmt::format(
         "Item must be chained item! Item: {}", chainedItem.toString()));
   }
   return reinterpret_cast<const ChainedItem&>(chainedItem)
@@ -3243,8 +3277,8 @@ void CacheAllocator<CacheTrait>::transferChainLocked(Item& parent,
   XDCHECK(parent.hasChainedItem());
 
   if (newParent.hasChainedItem()) {
-    throw std::invalid_argument(folly::sformat(
-        "New Parent {} has invalid state", newParent.toString()));
+    throw std::invalid_argument(
+        fmt::format("New Parent {} has invalid state", newParent.toString()));
   }
 
   auto headHandle = findChainedItem(parent);
@@ -3268,8 +3302,8 @@ void CacheAllocator<CacheTrait>::transferChainLocked(Item& parent,
   auto oldHead = chainedItemAccessContainer_->insertOrReplace(*headHandle);
   if (oldHead) {
     throw std::logic_error(
-        folly::sformat("Did not expect to find an existing chain for {}",
-                       newParent.toString(), oldHead->toString()));
+        fmt::format("Did not expect to find an existing chain for {}",
+                    newParent.toString(), oldHead->toString()));
   }
   parent.unmarkHasChainedItem();
 }
@@ -3336,7 +3370,7 @@ CacheAllocator<CacheTrait>::replaceChainedItem(Item& oldItem,
           &newItemHandle->asChainedItem().getParentItem(compressor_) ||
       &oldItem.asChainedItem().getParentItem(compressor_) != &parent ||
       newItemHandle->isInMMContainer() || !oldItem.isInMMContainer()) {
-    throw std::invalid_argument(folly::sformat(
+    throw std::invalid_argument(fmt::format(
         "Invalid args for replaceChainedItem. oldItem={}, newItem={}, "
         "parent={}",
         oldItem.toString(), newItemHandle->toString(), parent.toString()));
@@ -3427,7 +3461,7 @@ CacheAllocator<CacheTrait>::replaceChainedItemLocked(Item& oldItem,
   if (!replaceChainedItemInMMContainer(oldItem, *newItemHdl)) {
     // This should never happen since we currently hold an valid
     // parent handle. None of its chained items can be removed
-    throw std::runtime_error(folly::sformat(
+    throw std::runtime_error(fmt::format(
         "chained item cannot be replaced in MM container, oldItem={}, "
         "newItem={}, parent={}",
         oldItem.toString(), newItemHdl->toString(), parent.toString()));
@@ -3449,7 +3483,7 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
                                                    const Item* toRecycle) {
   if (!it.isDrained()) {
     throw std::runtime_error(
-        folly::sformat("cannot release this item: {}", it.toString()));
+        fmt::format("cannot release this item: {}", it.toString()));
   }
 
   const auto allocInfo = allocator_->getAllocInfo(it.getMemory());
@@ -3473,8 +3507,8 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
   if (it.isChainedItem()) {
     if (toRecycle) {
       throw std::runtime_error(
-          folly::sformat("Can not recycle a chained item {}, toRecycle {}",
-                         it.toString(), toRecycle->toString()));
+          fmt::format("Can not recycle a chained item {}, toRecycle {}",
+                      it.toString(), toRecycle->toString()));
     }
 
     allocator_->free(&it);
@@ -3530,13 +3564,13 @@ CacheAllocator<CacheTrait>::releaseBackToAllocator(Item& it,
     headHandle.reset();
 
     if (head == nullptr || &head->getParentItem(compressor_) != &it) {
-      throw exception::ChainedItemInvalid(folly::sformat(
+      throw exception::ChainedItemInvalid(fmt::format(
           "Mismatch parent pointer. This should not happen. Key: {}",
           it.getKey()));
     }
 
     if (!chainedItemAccessContainer_->remove(*head)) {
-      throw exception::ChainedItemInvalid(folly::sformat(
+      throw exception::ChainedItemInvalid(fmt::format(
           "Chained item associated with {} cannot be removed from hash table "
           "This should not happen here.",
           it.getKey()));
@@ -3706,8 +3740,9 @@ void CacheAllocator<CacheTrait>::insertInMMContainer(Item& item) {
   XDCHECK(!item.isInMMContainer());
   auto& mmContainer = getMMContainer(item);
   if (!mmContainer.add(item)) {
-    throw std::runtime_error(folly::sformat(
-        "Invalid state. Node {} was already in the container.", &item));
+    throw std::runtime_error(
+        fmt::format("Invalid state. Node {} was already in the container.",
+                    fmt::ptr(&item)));
   }
 }
 
@@ -4030,6 +4065,13 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
           toRecycle_->isChainedItem()
               ? &toRecycle_->asChainedItem().getParentItem(compressor_)
               : toRecycle_;
+
+      if (config_.evictionPredicate &&
+          !config_.evictionPredicate(*candidate_)) {
+        ++itr;
+        stats_.evictFiltered.inc();
+        continue;
+      }
 
       typename NvmCacheT::PutToken putToken{};
       const bool evictToNvmCache = shouldWriteToNvmCache(*candidate_);
@@ -4704,7 +4746,7 @@ std::vector<std::string> CacheAllocator<CacheTrait>::dumpEvictionIterator(
   if (static_cast<size_t>(pid) >= mmContainers_.size() ||
       static_cast<size_t>(cid) >= mmContainers_[pid].size()) {
     throw std::invalid_argument(
-        folly::sformat("Invalid PoolId: {} and ClassId: {}.", pid, cid));
+        fmt::format("Invalid PoolId: {} and ClassId: {}.", pid, cid));
   }
 
   std::vector<std::string> content;
@@ -4971,7 +5013,7 @@ template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::overridePoolRebalanceStrategy(
     PoolId pid, std::shared_ptr<RebalanceStrategy> rebalanceStrategy) {
   if (static_cast<size_t>(pid) >= mmContainers_.size()) {
-    throw std::invalid_argument(folly::sformat(
+    throw std::invalid_argument(fmt::format(
         "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_.size()));
   }
   setRebalanceStrategy(pid, std::move(rebalanceStrategy));
@@ -4981,7 +5023,7 @@ template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::overridePoolResizeStrategy(
     PoolId pid, std::shared_ptr<RebalanceStrategy> resizeStrategy) {
   if (static_cast<size_t>(pid) >= mmContainers_.size()) {
-    throw std::invalid_argument(folly::sformat(
+    throw std::invalid_argument(fmt::format(
         "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_.size()));
   }
   setResizeStrategy(pid, std::move(resizeStrategy));
@@ -4997,7 +5039,7 @@ template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::overridePoolConfig(PoolId pid,
                                                     const MMConfig& config) {
   if (static_cast<size_t>(pid) >= mmContainers_.size()) {
-    throw std::invalid_argument(folly::sformat(
+    throw std::invalid_argument(fmt::format(
         "Invalid PoolId: {}, size of pools: {}", pid, mmContainers_.size()));
   }
 
@@ -5135,7 +5177,7 @@ PoolStats CacheAllocator<CacheTrait>::getPoolStats(PoolId poolId) const {
     for (const ClassId cid : classIds) {
       uint64_t classHits = (*stats_.cacheHits)[poolId][cid].get();
       XDCHECK(mmContainers_[poolId][cid],
-              folly::sformat("Pid {}, Cid {} not initialized.", poolId, cid));
+              fmt::format("Pid {}, Cid {} not initialized.", poolId, cid));
       cacheStats.insert(
           {cid,
            {allocSizes[cid], (*stats_.allocAttempts)[poolId][cid].get(),
@@ -5239,16 +5281,16 @@ void CacheAllocator<CacheTrait>::releaseSlab(PoolId pid,
     releaseSlabImpl(releaseContext);
     if (!allocator_->allAllocsFreed(releaseContext)) {
       throw std::runtime_error(
-          folly::sformat("Was not able to free all allocs. PoolId: {}, AC: {}",
-                         releaseContext.getPoolId(),
-                         releaseContext.getClassId()));
+          fmt::format("Was not able to free all allocs. PoolId: {}, AC: {}",
+                      releaseContext.getPoolId(),
+                      releaseContext.getClassId()));
     }
 
     allocator_->completeSlabRelease(releaseContext);
     incReleaseStats();
   } catch (const exception::SlabReleaseAborted& e) {
     incrementAbortedSlabReleases();
-    throw exception::SlabReleaseAborted(folly::sformat(
+    throw exception::SlabReleaseAborted(fmt::format(
         "Slab release aborted while releasing "
         "a slab in pool {} victim {} receiver {}. Original ex msg: {}",
         pid, static_cast<int>(victim), static_cast<int>(receiver), e.what()));
@@ -5590,8 +5632,7 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
         itemStr = static_cast<Item*>(memory)->toString();
       });
     } catch (const std::exception& e) {
-      itemStr =
-          folly::sformat("<failed to capture item for abort: {}>", e.what());
+      itemStr = fmt::format("<failed to capture item for abort: {}>", e.what());
     }
     return itemStr;
   };
@@ -5600,9 +5641,9 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     auto itemStr = captureItemStringForAbort();
     allocator_->abortSlabRelease(ctx);
     throw exception::SlabReleaseAborted(
-        folly::sformat("Slab Release aborted {} while still trying to mark"
-                       " as moving for Item: {}. Pool: {}, Class: {}.",
-                       reason, itemStr, ctx.getPoolId(), ctx.getClassId()));
+        fmt::format("Slab Release aborted {} while still trying to mark"
+                    " as moving for Item: {}. Pool: {}, Class: {}.",
+                    reason, itemStr, ctx.getPoolId(), ctx.getClassId()));
   };
 
   auto startTime = util::getCurrentTimeMs();
@@ -5629,7 +5670,7 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
       auto elapsedTime = util::getCurrentTimeMs() - startTime;
       if (elapsedTime >
           static_cast<uint64_t>(config_.slabRebalanceTimeout.count())) {
-        abortWithMessage(folly::sformat("after {} ms", elapsedTime));
+        abortWithMessage(fmt::format("after {} ms", elapsedTime));
       }
     }
 
@@ -5691,13 +5732,13 @@ const ICompactCache& CacheAllocator<CacheTrait>::getCompactCache(
   std::shared_lock lock(compactCachePoolsLock_);
   if (!isCompactCachePool_[pid]) {
     throw std::invalid_argument(
-        folly::sformat("PoolId {} is not a compact cache", pid));
+        fmt::format("PoolId {} is not a compact cache", pid));
   }
 
   auto it = compactCaches_.find(pid);
   if (it == compactCaches_.end()) {
-    throw std::invalid_argument(folly::sformat(
-        "PoolId {} belongs to an un-attached compact cache", pid));
+    throw std::invalid_argument(
+        fmt::format("PoolId {} belongs to an un-attached compact cache", pid));
   }
   return *it->second;
 }
@@ -5935,19 +5976,19 @@ CacheAllocator<CacheTrait>::deserializeCacheAllocatorMetadata(
 
   if (*meta.ramFormatVersion() != kCacheRamFormatVersion) {
     throw std::runtime_error(
-        folly::sformat("Expected cache ram format version {}. But found {}.",
-                       kCacheRamFormatVersion, *meta.ramFormatVersion()));
+        fmt::format("Expected cache ram format version {}. But found {}.",
+                    kCacheRamFormatVersion, *meta.ramFormatVersion()));
   }
 
   if (*meta.accessType() != AccessType::kId) {
     throw std::invalid_argument(
-        folly::sformat("Expected {}, got {} for AccessType", *meta.accessType(),
-                       AccessType::kId));
+        fmt::format("Expected {}, got {} for AccessType", *meta.accessType(),
+                    AccessType::kId));
   }
 
   if (*meta.mmType() != MMType::kId) {
-    throw std::invalid_argument(folly::sformat("Expected {}, got {} for MMType",
-                                               *meta.mmType(), MMType::kId));
+    throw std::invalid_argument(fmt::format("Expected {}, got {} for MMType",
+                                            *meta.mmType(), MMType::kId));
   }
   return meta;
 }
@@ -6029,9 +6070,9 @@ CacheAllocator<CacheTrait>::viewAsChainedAllocsT(const Handle& parent) {
 
   if (!handle->hasChainedItem()) {
     throw std::invalid_argument(
-        folly::sformat("Failed to materialize chain. Parent does not have "
-                       "chained items. Parent: {}",
-                       parent->toString()));
+        fmt::format("Failed to materialize chain. Parent does not have "
+                    "chained items. Parent: {}",
+                    parent->toString()));
   }
 
   auto l = chainedItemLocks_.lockShared(handle->getKey());
