@@ -2031,6 +2031,10 @@ class CacheAllocator : public CacheBase {
   // returns true if nvmcache is enabled and we should write this item.
   bool shouldWriteToNvmCacheExclusive(const Item& item);
 
+  // Returns true if the item has an unmodified copy in BlockCache whose
+  // access time should be updated in the Access Time Map on eviction.
+  bool shouldUpdateAccessTimeMap(const Item& item) const;
+
   // Serialize the metadata for the cache into an IOBUf. The caller can now
   // use this to serialize into a serializer by estimating the size and
   // calling writeToBuffer.
@@ -3951,6 +3955,13 @@ CacheAllocator<CacheTrait>::getNextCandidate(PoolId pid,
   } else {
     recordEvent(AllocatorApiEvent::DRAM_EVICT, candidate->getKey(),
                 AllocatorApiResult::EVICTED, candidate);
+    // When this item has an unmodified copy still present in BlockCache
+    // (large items only), record its latest DRAM access time in the Access
+    // Time Map as the value in the copy in BlockCache can be stale.
+    if (shouldUpdateAccessTimeMap(*candidate)) {
+      HashedKey hk{candidate->getKey()};
+      nvmCache_->updateAccessTime(hk, candidate->getLastAccessTime());
+    }
   }
   return {candidate, toRecycle};
 }
@@ -4041,6 +4052,13 @@ bool CacheAllocator<CacheTrait>::shouldWriteToNvmCacheExclusive(
   }
 
   return true;
+}
+
+template <typename CacheTrait>
+bool CacheAllocator<CacheTrait>::shouldUpdateAccessTimeMap(
+    const Item& item) const {
+  return nvmCache_ && item.isNvmClean() && !item.isNvmEvicted() &&
+         item.isNvmLargeItem();
 }
 
 template <typename CacheTrait>
@@ -4342,6 +4360,10 @@ CacheAllocator<CacheTrait>::findInternalWithExpiration(
 
   if (needToBumpStats) {
     recordEvent(event, key, AllocatorApiResult::FOUND, handle);
+  }
+  auto lastAccess = handle->getLastAccessTime();
+  if (lastAccess > 0) {
+    handle.setTTASecs(util::getCurrentTimeSec() - lastAccess);
   }
   return handle;
 }
@@ -5188,7 +5210,7 @@ bool CacheAllocator<CacheTrait>::moveForSlabRelease(Item& oldItem) {
   }
   WriteHandle newItemHdl = allocateNewItemForOldItem(oldItem);
 
-  // if we have a valid handle, try to move, if not, we attemp to evict.
+  // if we have a valid handle, try to move, if not, we attempt to evict.
   if (newItemHdl) {
     // move can fail if another thread calls insertOrReplace
     // in this case oldItem is no longer valid (not accessible,
@@ -5208,18 +5230,23 @@ bool CacheAllocator<CacheTrait>::moveForSlabRelease(Item& oldItem) {
   const auto allocInfo = allocator_->getAllocInfo(oldItem.getMemory());
   if (chainedItem) {
     newItemHdl.reset();
-    auto parentKey = parentItem->getKey();
+    // Copy the parent key before unmarkMoving because once we unmark,
+    // another thread is free to remove/evict and free the parent item,
+    // which would make parentItem->getKey() a dangling StringPiece.
+    std::string parentKey(parentItem->getKey().data(),
+                          parentItem->getKey().size());
+    const auto parentKeyView = Key{folly::StringPiece{parentKey}};
     parentItem->unmarkMoving();
     // We do another lookup here because once we unmark moving, another thread
     // is free to remove/evict the parent item. So its unsafe to increment
     // refcount on the parent item's memory. Instead we rely on a proper lookup.
-    auto parentHdl = findInternal(parentKey);
+    auto parentHdl = findInternal(parentKeyView);
     if (!parentHdl) {
       // Parent is gone, so we wake up waiting threads with a null handle.
-      wakeUpWaiters(parentItem->getKey(), {});
+      wakeUpWaiters(parentKeyView, {});
     } else {
       if (!parentHdl.isReady()) {
-        // Parnet handle isn't ready. This can be due to the parent got evicted
+        // Parent handle isn't ready. This can be due to the parent got evicted
         // into NvmCache, or another thread is moving the slab that the parent
         // handle is on (e.g. the parent got replaced and the new parent's slab
         // is being moved). In this case, we must wait synchronously and block
@@ -5227,16 +5254,15 @@ bool CacheAllocator<CacheTrait>::moveForSlabRelease(Item& oldItem) {
         // expected to be very rare.
         parentHdl.wait();
       }
-      wakeUpWaiters(parentItem->getKey(), std::move(parentHdl));
+      wakeUpWaiters(parentKeyView, std::move(parentHdl));
     }
   } else {
     auto ref = unmarkMovingAndWakeUpWaiters(oldItem, std::move(newItemHdl));
     XDCHECK_EQ(0u, ref);
   }
-  allocator_->free(&oldItem);
-
   (*stats_.fragmentationSize)[allocInfo.poolId][allocInfo.classId].sub(
       util::getFragmentation(*this, oldItem));
+  allocator_->free(&oldItem);
   stats_.numMoveSuccesses.inc();
   return true;
 }
@@ -5306,6 +5332,9 @@ void CacheAllocator<CacheTrait>::evictForSlabRelease(Item& item) {
 
   if (token.isValid() && shouldWriteToNvmCacheExclusive(*evicted)) {
     nvmCache_->put(*evicted, std::move(token));
+  } else if (shouldUpdateAccessTimeMap(*evicted)) {
+    HashedKey hk{evicted->getKey()};
+    nvmCache_->updateAccessTime(hk, evicted->getLastAccessTime());
   }
 
   const auto allocInfo =
