@@ -652,6 +652,34 @@ class CacheAllocator : public CacheBase {
 
   AccessIterator end() { return accessContainer_->end(); }
 
+  // Alternative iterator that batches by hash table lock group instead of
+  // per-bucket.
+  //
+  // Differences from AccessIterator:
+  //   - Fewer lock acquisitions: O(numLocks) vs O(numBuckets).
+  //   - Larger pinning window: each lock group covers numBuckets/numLocks
+  //     buckets. All items across those buckets are snapshotted as Handles
+  //     at once, blocking eviction until the caller advances past them.
+  //     AccessIterator snapshots one bucket at a time.
+  using LockGroupAccessIterator = typename AccessContainer::LockGroupIterator;
+
+  LockGroupAccessIterator beginLockGroup() {
+    return accessContainer_->beginLockGroup(
+        [this](Item* it) { return tryAcquire(it); },
+        [this](Key key) -> WriteHandle { return findInternal(key); });
+  }
+
+  LockGroupAccessIterator beginLockGroup(util::Throttler::Config config) {
+    return accessContainer_->beginLockGroup(
+        [this](Item* it) { return tryAcquire(it); },
+        [this](Key key) -> WriteHandle { return findInternal(key); },
+        config);
+  }
+
+  LockGroupAccessIterator endLockGroup() {
+    return accessContainer_->endLockGroup();
+  }
+
   enum class RemoveRes : uint8_t {
     kSuccess,
     kNotFoundInRam,
@@ -1246,7 +1274,7 @@ class CacheAllocator : public CacheBase {
   folly::F14FastMap<std::string, uint64_t> getEventTrackerStatsMap()
       const override {
     folly::F14FastMap<std::string, uint64_t> eventTrackerStats;
-    if (auto eventTracker = getEventTracker()) {
+    if (auto* eventTracker = getEventTracker()) {
       eventTracker->getStats(eventTrackerStats);
     }
     return eventTrackerStats;
@@ -1261,8 +1289,8 @@ class CacheAllocator : public CacheBase {
 
     // If NVM cache is enabled, also set the event tracker there
     if (nvmCache_ && nvmCache_->isEnabled()) {
-      if (auto eventTracker = getEventTracker()) {
-        nvmCache_->setEventTracker(eventTracker);
+      if (auto* et = getEventTracker()) {
+        nvmCache_->setEventTracker(et);
       }
     }
   }
@@ -1446,6 +1474,13 @@ class CacheAllocator : public CacheBase {
   // @throw std::overflow_error is the maximum item refcount is execeeded by
   //        creating this item handle.
   WriteHandle acquire(Item* it);
+
+  using TryAcquireResult = typename AccessContainer::TryAcquireResult;
+
+  // Non-blocking variant of acquire. Returns a handle and a TryAcquireResult
+  // indicating success, eviction, or moving.
+  // Safe to call while holding hash table bucket locks.
+  std::pair<WriteHandle, TryAcquireResult> tryAcquire(Item* it);
 
   // creates an item handle with wait context.
   WriteHandle createNvmCacheFillHandle() { return WriteHandle{*this}; }
@@ -1840,7 +1875,7 @@ class CacheAllocator : public CacheBase {
                    Key key,
                    AllocatorApiResult result,
                    EventRecordParams params = {}) const {
-    if (auto eventTracker = getEventTracker()) {
+    if (auto* eventTracker = getEventTracker()) {
       if (eventTracker->sampleKey(key)) {
         EventInfo eventInfo;
         eventInfo.eventTimestamp = util::getCurrentTimeSec();
@@ -1865,7 +1900,7 @@ class CacheAllocator : public CacheBase {
           eventInfo.poolId = *params.poolId;
         }
 
-        eventTracker->record(eventInfo);
+        eventTracker->recordWithoutSampling(eventInfo);
       }
     } else if (auto legacyEventTracker = getLegacyEventTracker()) {
       folly::Optional<uint32_t> size =
@@ -1908,6 +1943,7 @@ class CacheAllocator : public CacheBase {
                                   .poolId = allocInfo.poolId});
   }
 
+ public:
   // Releases a slab from a pool into its corresponding memory pool
   // or back to the slab allocator, depending on SlabReleaseMode.
   //  SlabReleaseMode::kRebalance -> back to the pool
@@ -1959,6 +1995,7 @@ class CacheAllocator : public CacheBase {
                    SlabReleaseMode mode,
                    const void* hint = nullptr) final;
 
+ private:
   // @param releaseContext  slab release context
   void releaseSlabImpl(const SlabReleaseContext& releaseContext);
 
@@ -2673,6 +2710,9 @@ void CacheAllocator<CacheTrait>::initCommon(bool dramCacheAttached) {
   }
   initStats();
   initNvmCache(dramCacheAttached);
+  if (config_.eventTrackerConfigFactory) {
+    setEventTracker(config_.eventTrackerConfigFactory());
+  }
 
   if (!config_.delayCacheWorkersStart) {
     initWorkers();
@@ -2714,9 +2754,9 @@ void CacheAllocator<CacheTrait>::initNvmCache(bool dramCacheAttached) {
                                           config_.itemDestructor, persistParam);
 
   // Set EventTracker dynamically after NvmCache creation
-  if (auto eventTracker = getEventTracker()) {
+  if (auto* et = getEventTracker()) {
     XLOG(INFO) << "Setting event tracker in NVM cache engines.";
-    nvmCache_->setEventTracker(eventTracker);
+    nvmCache_->setEventTracker(et);
   }
   if (!config_.cacheDir.empty()) {
     nvmCacheState_.clearPrevState();
@@ -3484,6 +3524,24 @@ CacheAllocator<CacheTrait>::acquire(Item* it) {
       }
     }
   }
+}
+
+template <typename CacheTrait>
+std::pair<typename CacheAllocator<CacheTrait>::WriteHandle,
+          typename CacheAllocator<CacheTrait>::TryAcquireResult>
+CacheAllocator<CacheTrait>::tryAcquire(Item* it) {
+  XDCHECK(it);
+
+  SCOPE_FAIL { stats_.numRefcountOverflow.inc(); };
+
+  auto incRes = incRef(*it);
+  if (LIKELY(incRes == RefcountWithFlags::IncResult::kIncOk)) {
+    return {WriteHandle{it, *this}, TryAcquireResult::kSuccess};
+  }
+  if (incRes == RefcountWithFlags::IncResult::kIncFailedMoving) {
+    return {WriteHandle{}, TryAcquireResult::kMoving};
+  }
+  return {WriteHandle{}, TryAcquireResult::kSkip};
 }
 
 template <typename CacheTrait>
@@ -5427,6 +5485,31 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     });
   };
 
+  // Snapshot the item string under processAllocForRelease() protection.
+  // Reading alloc directly here races with concurrent free(), while doing it
+  // after abortSlabRelease() can race with the slab being advised away.
+  auto captureItemStringForAbort = [&]() {
+    std::string itemStr = "item <already freed before abort>";
+    try {
+      allocator_->processAllocForRelease(ctx, alloc, [&](void* memory) {
+        itemStr = static_cast<Item*>(memory)->toString();
+      });
+    } catch (const std::exception& e) {
+      itemStr =
+          folly::sformat("<failed to capture item for abort: {}>", e.what());
+    }
+    return itemStr;
+  };
+
+  auto abortWithMessage = [&](const std::string& reason) {
+    auto itemStr = captureItemStringForAbort();
+    allocator_->abortSlabRelease(ctx);
+    throw exception::SlabReleaseAborted(
+        folly::sformat("Slab Release aborted {} while still trying to mark"
+                       " as moving for Item: {}. Pool: {}, Class: {}.",
+                       reason, itemStr, ctx.getPoolId(), ctx.getClassId()));
+  };
+
   auto startTime = util::getCurrentTimeMs();
   while (true) {
     allocator_->processAllocForRelease(ctx, alloc, fn);
@@ -5444,25 +5527,14 @@ bool CacheAllocator<CacheTrait>::markMovingForSlabRelease(
     itemFreed = true;
 
     if (isShutdownInProgress()) {
-      allocator_->abortSlabRelease(ctx);
-      throw exception::SlabReleaseAborted(
-          folly::sformat("Slab Release aborted while still trying to mark"
-                         " as moving for Item: {}. Pool: {}, Class: {}.",
-                         static_cast<Item*>(alloc)->toString(), ctx.getPoolId(),
-                         ctx.getClassId()));
+      abortWithMessage("due to shutdown");
     }
 
     if (config_.slabRebalanceTimeout.count() > 0) {
       auto elapsedTime = util::getCurrentTimeMs() - startTime;
       if (elapsedTime >
           static_cast<uint64_t>(config_.slabRebalanceTimeout.count())) {
-        allocator_->abortSlabRelease(ctx);
-        throw exception::SlabReleaseAborted(
-            folly::sformat("Slab Release aborted after {} ms while still"
-                           " trying to mark as moving for Item: {}. Pool: {},"
-                           " Class: {}.",
-                           elapsedTime, static_cast<Item*>(alloc)->toString(),
-                           ctx.getPoolId(), ctx.getClassId()));
+        abortWithMessage(folly::sformat("after {} ms", elapsedTime));
       }
     }
 

@@ -274,9 +274,9 @@ class NvmCache {
   }
 
   // Set the EventTracker for all underlying NVM engines
-  void setEventTracker(std::shared_ptr<EventTracker> tracker) {
+  void setEventTracker(EventTracker* tracker) {
     if (navyCache_) {
-      navyCache_->setEventTracker(std::move(tracker));
+      navyCache_->setEventTracker(tracker);
     }
   }
 
@@ -410,7 +410,7 @@ class NvmCache {
   // returns true if there is tombstone entry for the key.
   bool hasTombStone(HashedKey hk);
 
-  std::unique_ptr<NvmItem> makeNvmItem(const Item& item);
+  std::unique_ptr<NvmItem> makeNvmItem(const Item& item, uint8_t poolId);
 
   // wrap an item into a blob for writing into navy.
   Blob makeBlob(const Item& it);
@@ -713,7 +713,6 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::find(HashedKey hk) {
     return WriteHandle{};
   }
 
-  util::LatencyTracker tracker(stats().nvmLookupLatency_);
   stats().numNvmGets.inc();
 
   auto shard = getShardForKey(hk);
@@ -815,7 +814,9 @@ typename NvmCache<C>::WriteHandle NvmCache<C>::find(HashedKey hk) {
       return hdl;
     }
 
-    // create a context
+    // create a context — start latency tracking here so bloom filter
+    // fast-path misses and coalesced lookups are excluded
+    util::LatencyTracker tracker(stats().nvmLookupLatency_);
     auto newCtx = std::make_unique<GetCtx>(
         *this, hk.key(), std::move(waitContext), std::move(tracker));
     auto res =
@@ -1149,9 +1150,8 @@ uint32_t NvmCache<C>::getStorageSizeInNvm(const Item& it) {
 }
 
 template <typename C>
-std::unique_ptr<NvmItem> NvmCache<C>::makeNvmItem(const Item& item) {
-  auto poolId = cache_.getAllocInfo((void*)(&item)).poolId;
-
+std::unique_ptr<NvmItem> NvmCache<C>::makeNvmItem(const Item& item,
+                                                  uint8_t poolId) {
   if (item.isChainedItem()) {
     throw std::invalid_argument(folly::sformat(
         "Chained item can not be flushed separately {}", item.toString()));
@@ -1211,7 +1211,6 @@ std::unique_ptr<NvmItem> NvmCache<C>::makeNvmItem(const Item& item) {
 
 template <typename C>
 void NvmCache<C>::put(Item& item, PutToken token) {
-  util::LatencyTracker tracker(stats().nvmInsertLatency_);
   HashedKey hk{item.getKey()};
 
   // for regular items that can only write to nvmcache upon eviction, we
@@ -1244,7 +1243,10 @@ void NvmCache<C>::put(Item& item, PutToken token) {
     return;
   }
 
-  auto nvmItem = makeNvmItem(item);
+  auto poolId =
+      static_cast<uint8_t>(cache_.getAllocInfo((void*)(&item)).poolId);
+  auto expiryTime = item.getExpiryTime();
+  auto nvmItem = makeNvmItem(item, poolId);
   if (!nvmItem) {
     stats().numNvmPutEncodeFailure.inc();
     recordEvent(AllocatorApiEvent::NVM_INSERT, item.getKey(),
@@ -1261,6 +1263,9 @@ void NvmCache<C>::put(Item& item, PutToken token) {
   auto val = folly::ByteRange{iobuf.data(), iobuf.length()};
 
   auto shard = getShardForKey(hk);
+  // start latency tracking here so early-exit paths (disabled, expired,
+  // tombstone, encode failure) are excluded from the latency stats
+  util::LatencyTracker tracker(stats().nvmInsertLatency_);
   auto& putContexts = putContexts_[shard];
   auto& ctx = putContexts.createContext(item.getKey(), std::move(iobuf),
                                         std::move(tracker));
@@ -1292,7 +1297,7 @@ void NvmCache<C>::put(Item& item, PutToken token) {
           recordEvent(AllocatorApiEvent::NVM_INSERT, key.key(), eventRes);
           putCleanup();
         },
-        item.getLastAccessTime());
+        poolId, expiryTime, item.getLastAccessTime());
 
     if (status == navy::Status::Ok) {
       guard.dismiss();

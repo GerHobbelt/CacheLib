@@ -51,8 +51,8 @@ class AbstractCache {
  public:
   virtual ~AbstractCache() = default;
 
-  // Set the EventTracker for all underlying engines
-  virtual void setEventTracker(std::shared_ptr<EventTracker> tracker) = 0;
+  // Set the EventTracker for all underlying engines (non-owning pointer)
+  virtual void setEventTracker(EventTracker* tracker) = 0;
 
   // Return true if item is considered a "large item". This is meant to be
   // a very fast check to verify a key & value pair will be considered as
@@ -72,6 +72,8 @@ class AbstractCache {
   // ItemMetadata as a param.
   virtual Status insert(HashedKey key,
                         BufferView value,
+                        uint8_t poolId = 0,
+                        uint32_t expiryTime = 0,
                         uint32_t lastAccessTimeSecs = 0) = 0;
 
   // Asynchronously inserts entry into the cache.
@@ -84,6 +86,8 @@ class AbstractCache {
   virtual Status insertAsync(HashedKey key,
                              BufferView value,
                              InsertCallback cb,
+                             uint8_t poolId = 0,
+                             uint32_t expiryTime = 0,
                              uint32_t lastAccessTimeSecs = 0) = 0;
 
   // Looks up value. Returns non-null buffer if found.

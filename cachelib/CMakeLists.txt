@@ -163,11 +163,10 @@ function (generic_add_source_test TEST_PREFIX SOURCE_FILE)
 
   # make tests visible to ctest
   gtest_add_tests(TARGET "${TEST_PREFIX}-${TEST_NAME}"
-                        WORKING_DIRECTORY "${TOP_DIR}"
                         TEST_PREFIX "${TEST_PREFIX}-${TEST_NAME}."
                         TEST_LIST "test_cases")
   # use same timeout as folly
-  set_tests_properties(${test_cases} PROPERTIES TIMEOUT 120)
+  set_tests_properties(${test_cases} PROPERTIES TIMEOUT 300)
 endfunction()
 
 
@@ -314,6 +313,7 @@ add_subdirectory (common)
 add_subdirectory (shm)
 add_subdirectory (navy)
 add_subdirectory (allocator)
+add_subdirectory (interface)
 add_subdirectory (datatype)
 add_subdirectory (compact_cache)
 add_subdirectory (benchmarks)
@@ -326,6 +326,7 @@ install(
     common
     compact_cache
     datatype
+    interface
     navy
     shm
   DESTINATION ${INCLUDE_INSTALL_DIR}
@@ -380,6 +381,7 @@ target_link_libraries(cachelib INTERFACE
      cachelib_shm
      cachelib_navy
      cachelib_allocator
+     cachelib_interface
      )
 target_include_directories(
   cachelib
@@ -405,6 +407,7 @@ if (BUILD_SHARED_LIBS)
     cachelib_cachebench
     cachelib_common
     cachelib_datatype
+    cachelib_interface
     cachelib_navy
     cachelib_shm
     PROPERTIES
