@@ -23,6 +23,7 @@
 #include "cachelib/allocator/memory/MemoryPoolManager.h"
 #include "cachelib/allocator/memory/Slab.h"
 #include "cachelib/allocator/memory/SlabAllocator.h"
+#include "cachelib/shm/ShmCommon.h"
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
@@ -89,12 +90,14 @@ class MemoryAllocator {
            bool zeroOnRelease,
            bool disableCoredump,
            bool _lockMemory,
-           bool _enableAsanPoisoning)
+           bool _enableAsanPoisoning,
+           PageSize _hugePageSize = PageSize())
         : allocSizes(std::move(sizes)),
           enableZeroedSlabAllocs(zeroOnRelease),
           disableFullCoredump(disableCoredump),
           lockMemory(_lockMemory),
-          enableAsanPoisoning(_enableAsanPoisoning) {}
+          enableAsanPoisoning(_enableAsanPoisoning),
+          hugePageSize(_hugePageSize) {}
 
     // Hint to determine the allocation class sizes
     std::set<uint32_t> allocSizes;
@@ -116,6 +119,11 @@ class MemoryAllocator {
     // When true, slab memory is ASAN-poisoned on free and unpoisoned on
     // allocation so ASAN can detect use-after-free bugs.
     bool enableAsanPoisoning{false};
+
+    // Page size backing slab memory; default => normal pages. Used when the
+    // allocator mmaps its memory and when excluding slab memory from core
+    // dumps.
+    PageSize hugePageSize{0};
   };
 
   // Creates a memory allocator out of the caller allocated memory region. The
@@ -154,11 +162,13 @@ class MemoryAllocator {
   //                        used to create this memory allocator
   // @param disableCoredump exclude mapped region from core dumps
   // @param enableAsanPoisoning When true, slab memory is ASAN-poisoned
+  // @param hugePageSize    Page size backing the restored memory region
   MemoryAllocator(const serialization::MemoryAllocatorObject& object,
                   void* memoryStart,
                   size_t memSize,
                   bool disableCoredump,
-                  bool enableAsanPoisoning);
+                  bool enableAsanPoisoning,
+                  PageSize hugePageSize = PageSize());
 
   MemoryAllocator(const MemoryAllocator&) = delete;
   MemoryAllocator& operator=(const MemoryAllocator&) = delete;

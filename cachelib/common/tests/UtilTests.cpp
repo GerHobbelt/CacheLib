@@ -23,6 +23,8 @@
 
 #include "cachelib/common/FastStats.h"
 #include "cachelib/common/Utils.h"
+#include "cachelib/shm/HugePageTestUtils.h"
+#include "cachelib/shm/ShmCommon.h"
 
 using facebook::cachelib::util::FastStats;
 using facebook::cachelib::util::SysctlSetting;
@@ -179,6 +181,10 @@ size_t mockCgroupMemProviderZero() { return 0; }
 size_t mockCgroupMemProviderFixed() {
   return 1024ULL * 1024 * 1024; // 1 GB
 }
+
+size_t mockRSSProviderFixed() {
+  return 2ULL * 1024 * 1024 * 1024; // 2 GB
+}
 } // namespace
 
 TEST(Util, CgroupMemoryAdvising) {
@@ -205,6 +211,14 @@ TEST(Util, CgroupMemoryAdvisingWithProvider) {
   EXPECT_GT(memHost, 0);
 }
 
+TEST(Util, RSSMemoryAdvisingWithProvider) {
+  util::setRSSMemoryAdvising(mockRSSProviderFixed);
+  EXPECT_EQ(util::getRSSBytes(), 2ULL * 1024 * 1024 * 1024);
+
+  util::setRSSMemoryAdvising(nullptr);
+  EXPECT_GT(util::getRSSBytes(), 0);
+}
+
 TEST(Util, CounterVisitor) {
   // Uninitialized can be called.
   util::CounterVisitor v;
@@ -214,6 +228,24 @@ TEST(Util, CounterVisitor) {
   util::CounterVisitor(
       [&ctrs](folly::StringPiece k, double v) { ctrs[k.str()] = v; });
 }
+
+TEST(Util, MmapAlignedZeroedMemoryHugeFlagThrowsWhenUnavailable) {
+  PageSize ps{PageSize::kHugePageSize2MB};
+  const size_t hugeAlign = ps.getPageSize();
+  const size_t hugeSize = ps.getPageSize();
+  int hugeFlag = ps.hugePageMmapFlags();
+
+  if (!canReserveHugePages(hugeSize, ps)) {
+    GTEST_SKIP() << "2MB huge pages not usable";
+  }
+
+  void* ptr =
+      util::mmapAlignedZeroedMemory(hugeAlign, hugeSize, false, hugeFlag);
+  ASSERT_NE(ptr, nullptr);
+  EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % hugeAlign, 0u);
+  munmap(ptr, hugeSize);
+}
+
 } // namespace tests
 } // namespace cachelib
 } // namespace facebook

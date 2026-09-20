@@ -52,19 +52,19 @@ CO_TYPED_TEST(FlashCacheComponentTest, ExpirationCallback) {
 
   auto valid = CO_ASSERT_OK(co_await this->cache_->allocate(
       "valid_0", kValueSize, currentTime, kTTL));
-  EXPECT_OK(co_await this->cache_->insert(std::move(valid)));
+  EXPECT_OK(co_await this->cache_->insert(std::move(valid).release()));
 
   auto valid2 = CO_ASSERT_OK(co_await this->cache_->allocate(
       "valid_1", kValueSize, currentTime - kTTL / 2, kTTL));
-  EXPECT_OK(co_await this->cache_->insert(std::move(valid2)));
+  EXPECT_OK(co_await this->cache_->insert(std::move(valid2).release()));
 
   auto expired = CO_ASSERT_OK(co_await this->cache_->allocate(
       "expired_0", kValueSize, currentTime - 2 * kTTL, kTTL));
-  EXPECT_OK(co_await this->cache_->insert(std::move(expired)));
+  EXPECT_OK(co_await this->cache_->insert(std::move(expired).release()));
 
   auto expired2 = CO_ASSERT_OK(co_await this->cache_->allocate(
       "expired_1", kValueSize, currentTime - 10 * kTTL, kTTL));
-  EXPECT_OK(co_await this->cache_->insert(std::move(expired2)));
+  EXPECT_OK(co_await this->cache_->insert(std::move(expired2).release()));
 
   // Fill the cache to force region reclamation, which exercises the
   // checkExpired callback configured in FlashCacheComponent::initConfig().
@@ -74,7 +74,8 @@ CO_TYPED_TEST(FlashCacheComponentTest, ExpirationCallback) {
     if (res.hasError()) {
       break;
     }
-    EXPECT_OK(co_await this->cache_->insertOrReplace(std::move(res.value())));
+    EXPECT_OK(co_await this->cache_->insertOrReplace(
+        std::move(res.value()).release()));
   }
 
   // Expired items should not have been reinserted during reclamation.
@@ -90,9 +91,10 @@ CO_TYPED_TEST(FlashCacheComponentTest, ExpirationCallback) {
     auto key = "valid_" + std::to_string(i);
     auto findResult = CO_ASSERT_OK(co_await this->cache_->find(key));
     CO_ASSERT_TRUE(findResult.has_value());
-    EXPECT_EQ(findResult.value()->getKey(), key);
-    EXPECT_EQ(findResult.value()->getExpiryTime(),
-              findResult.value()->getCreationTime() + kTTL);
+    auto foundHandle = std::move(findResult.value()).release();
+    EXPECT_EQ(foundHandle->getKey(), key);
+    EXPECT_EQ(foundHandle->getExpiryTime(),
+              foundHandle->getCreationTime() + kTTL);
   }
 }
 

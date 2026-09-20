@@ -22,6 +22,7 @@
 #include "cachelib/allocator/RebalanceStrategy.h"
 #include "cachelib/allocator/nvmcache/BlockCacheReinsertionPolicy.h"
 #include "cachelib/cachebench/util/JSONConfig.h"
+#include "cachelib/cachebench/util/MemoryMonitorScript.h"
 #include "cachelib/common/Ticker.h"
 #include "cachelib/navy/common/Device.h"
 
@@ -96,6 +97,7 @@ struct CacheConfig : public JSONConfig {
   uint64_t poolRebalanceIntervalSec{0};
   std::string rebalanceStrategy;
   uint64_t rebalanceMinSlabs{1};
+  uint64_t rebalanceMinDiff{100};
   double rebalanceDiffRatio{0.25};
   bool moveOnSlabRelease{false};
 
@@ -178,6 +180,9 @@ struct CacheConfig : public JSONConfig {
   // appropriate ratios.
   std::vector<unsigned int> navySegmentedFifoSegmentRatio{};
 
+  // Number of BlockCache allocators for each priority. 0 uses Navy's default.
+  uint32_t navyAllocatorsPerPriority{0};
+
   // Number of shards expressed as power of two for request ordering in
   // Navy. If 0, the default configuration of Navy(20) is used.
   uint64_t navyReqOrderShardsPower{21};
@@ -244,6 +249,9 @@ struct CacheConfig : public JSONConfig {
   // The number of RegionManager threads for reclaim and flush
   uint32_t navyCleanRegionThreads{1};
 
+  // Whether RegionManager workers flush regions asynchronously.
+  bool navyRegionManagerFlushAsync{false};
+
   // disabled when value is 0
   uint32_t navyAdmissionWriteRateMB{0};
 
@@ -279,8 +287,42 @@ struct CacheConfig : public JSONConfig {
   // Use Posix Shm instead of SysVShm
   bool usePosixShm{false};
 
+  // Selects the memory backing explicitly, overriding the legacy behavior of
+  // inferring it from cacheDir/usePosixShm. Valid values:
+  //   ""      preserve legacy behavior (shm iff cacheDir set; POSIX iff
+  //           usePosixShm, otherwise SysV)
+  //   "none"  heap memory, no shared memory
+  //   "tmp"   ephemeral temp shared memory (always SysV)
+  //   "sysv"  persistent SysV shared memory (requires cacheDir)
+  //   "posix" persistent POSIX shared memory (requires cacheDir)
+  std::string shmType;
+
+  // Requests HugeTLB-backed pages for the slab and hash-table memory. Value is
+  // a kernel-supported huge-page size in bytes (e.g. 2097152 for 2MB pages);
+  // 0 means normal pages. The HugeTLB pool must be reserved out-of-band.
+  size_t hugePageSize{0};
+
+  // Mounted hugetlbfs directory backing POSIX huge-page segments. Required when
+  // combining hugePageSize with POSIX shm; ignored for SysV and temp shm.
+  std::string hugePageMountDir;
+
   // Lock memory in the RAM
   bool lockMemory{false};
+
+  // Poison freed slab memory so ASAN can detect use-after-free bugs.
+  bool enableSlabAsanPoisoning{false};
+
+  // Memory monitor configuration. An empty script uses system memory values.
+  std::string memoryMonitorMode{"disabled"};
+  uint64_t memoryMonitorIntervalMs{0};
+  uint64_t memoryMonitorLowerLimitGB{10};
+  uint64_t memoryMonitorUpperLimitGB{15};
+  uint64_t memoryMonitorMaxAdvisePercentPerIter{5};
+  uint64_t memoryMonitorMaxReclaimPercentPerIter{5};
+  uint64_t memoryMonitorMaxAdvisePercent{20};
+  uint64_t memoryMonitorReclaimRateLimitWindowSecs{0};
+  bool memoryMonitorScriptRepeat{false};
+  std::vector<MemoryMonitorScriptPhase> memoryMonitorScript;
 
   // Memory tiers configs
   std::vector<MemoryTierCacheConfig> memoryTierConfigs{};
@@ -368,6 +410,10 @@ struct CacheConfig : public JSONConfig {
   CacheConfig() {}
 
   std::shared_ptr<RebalanceStrategy> getRebalanceStrategy() const;
+  std::vector<uint32_t> getNavyAllocatorCounts() const;
+
+  bool memoryMonitorEnabled() const;
+  MemoryMonitor::Config getMemoryMonitorConfig() const;
 };
 } // namespace cachebench
 } // namespace cachelib

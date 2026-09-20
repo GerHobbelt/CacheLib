@@ -20,6 +20,7 @@
 #include <folly/Optional.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <stdexcept>
 #include <type_traits>
@@ -69,9 +70,13 @@ class ChainedHashTable {
     // @param numBuckets    the number of buckets to be allocated, power of two
     // @param compressor    object used to compress/decompress node pointers
     // @param hasher        object used to hash the key for its bucket id
+    // @param pageSize      when a supported huge-page size (bytes), back the
+    //                      bucket array with anonymous HugeTLB pages; default
+    //                      => new[]
     Impl(size_t numBuckets,
          const PtrCompressor& compressor,
-         const Hasher& hasher);
+         const Hasher& hasher,
+         PageSize pageSize = PageSize());
 
     // allocate memory for hash table; the memory is managed by the user.
     //
@@ -186,6 +191,10 @@ class ChainedHashTable {
 
     // actual buckets.
     std::unique_ptr<CompressedPtrType[]> hashTable_;
+
+    // when non-zero, hashTable_ points at an Impl-owned HugeTLB mmap of this
+    // many bytes (freed via munmap); zero means new[] or user-managed memory.
+    size_t mmapBytes_{0};
 
     // indicate whether or not the hash table uses user-managed memory and
     // is thus restorable from serialized state
@@ -332,6 +341,7 @@ class ChainedHashTable {
     using Key = typename T::Key;
     using Handle = typename T::Handle;
     using HandleMaker = typename T::HandleMaker;
+    using PreRemoveCb = std::function<void(RemoveContext, const T&)>;
     using CompressedPtrType = typename T::CompressedPtrType;
     using PtrCompressor = typename T::PtrCompressor;
 
@@ -346,12 +356,16 @@ class ChainedHashTable {
     // @param config      the config for the hashtable
     // @param compressor  object used to compress/decompress node pointers
     // @param hm          the functor that creates a Handle from T*
+    // @param pageSize    back the bucket array with HugeTLB pages (bytes);
+    //                    default => normal pages
     Container(Config c,
               const PtrCompressor& compressor,
-              HandleMaker hm = kDefaultHandleMaker)
+              HandleMaker hm = kDefaultHandleMaker,
+              PageSize pageSize = PageSize())
         : config_(std::move(c)),
           handleMaker_(std::move(hm)),
-          ht_{config_.getNumBuckets(), compressor, config_.getHasher()},
+          ht_{config_.getNumBuckets(), compressor, config_.getHasher(),
+              pageSize},
           locks_{config_.getLocksPower(), config_.getHasher()} {}
 
     // create hash table container with user-managed memory
@@ -377,8 +391,8 @@ class ChainedHashTable {
     // @param memSegment  shared memory segment for the hash table
     // @param compressor  object used to compress/decompress node pointers
     // @param hm          the functor that creates a Handle from T*
-    // @param hugePageSize page size the segment was backed with (bytes), used
-    //        to validate the mapped segment size.
+    // @param pageSize    page size the segment was backed with (bytes), used
+    //                    to validate the mapped segment size.
     //
     // @throw std::invalid argument if the bucket power in new config does not
     //        match the previous state or the size of the memSegment does not
@@ -388,7 +402,7 @@ class ChainedHashTable {
               ShmAddr memSegment,
               const PtrCompressor& compressor,
               HandleMaker hm = kDefaultHandleMaker,
-              PageSize hugePageSize = PageSize());
+              PageSize pageSize = PageSize());
 
     // restore hash table from previous state. This only works when the
     // hash table memory is managed by the user.
@@ -399,8 +413,8 @@ class ChainedHashTable {
     // @param nBytes      size of memory allocation pointed to by memStart
     // @param compressor  object used to compress/decompress node pointers
     // @param hm          the functor that creates a Handle from T*
-    // @param hugePageSize page size the segment was backed with (bytes), used
-    //        to validate the mapped segment size.
+    // @param pageSize    page size the segment was backed with (bytes), used
+    //                    to validate the mapped segment size.
     //
     // @throw std::invalid argument if the bucket power in new config does not
     //        match the previous state or the size of the memSegment does not
@@ -411,7 +425,7 @@ class ChainedHashTable {
               size_t nBytes,
               const PtrCompressor& compressor,
               HandleMaker hm = kDefaultHandleMaker,
-              PageSize hugePageSize = PageSize());
+              PageSize pageSize = PageSize());
 
     Container(const Container&) = delete;
     Container& operator=(const Container&) = delete;
@@ -467,7 +481,9 @@ class ChainedHashTable {
     // @return  True if the node was in the hashtable and if it was
     //          successfully removed. False if the node was not in the
     //          hashtable.
-    bool remove(T& node) noexcept;
+    bool remove(T& node,
+                RemoveContext context = RemoveContext::kNormal,
+                const PreRemoveCb& preRemoveCb = {}) noexcept;
 
     // remove a node from the container if it exists for the key and the
     // predicate returns true for the node. This is intended to simplify the
@@ -480,7 +496,9 @@ class ChainedHashTable {
     // null handle if the node was either not in the container or the
     // predicate failed.
     Handle removeIf(T& node,
-                    const std::function<bool(const T& node)>& predicate);
+                    const std::function<bool(const T& node)>& predicate,
+                    RemoveContext context = RemoveContext::kNormal,
+                    const PreRemoveCb& preRemoveCb = {});
 
     // finds the node corresponding to the key in the hashtable and returns a
     // handle to that node.
@@ -771,6 +789,14 @@ class ChainedHashTable {
    private:
     using Hashtable = Impl<T, HookPtr>;
 
+    static void invokePreRemoveCb(const PreRemoveCb& preRemoveCb,
+                                  RemoveContext context,
+                                  const T& node) noexcept {
+      if (preRemoveCb) {
+        preRemoveCb(context, node);
+      }
+    }
+
     // Fetch a vector of handle to the items belonging to a given bucket. This
     // is for use by the iterator. 'handles' will be cleared and then populated
     // with handles for the items in the given bucket. Items will be skipped if
@@ -824,7 +850,8 @@ const typename T::HandleMaker
 template <typename T, typename ChainedHashTable::Hook<T> T::* HookPtr>
 ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
                                          const PtrCompressor& compressor,
-                                         const Hasher& hasher)
+                                         const Hasher& hasher,
+                                         PageSize pageSize)
     : numBuckets_(numBuckets),
       numBucketsMask_(numBuckets - 1),
       compressor_(compressor),
@@ -835,7 +862,15 @@ ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
   if (numBuckets & (numBuckets - 1)) {
     throw std::invalid_argument("Number of buckets must be a power of two");
   }
-  hashTable_ = std::make_unique<CompressedPtrType[]>(numBuckets_);
+  if (pageSize.isHugePage()) {
+    mmapBytes_ = pageSize.getPageAlignedSize(size());
+    hashTable_.reset(static_cast<CompressedPtrType*>(
+        util::mmapAlignedZeroedMemory(pageSize.getPageSize(), mmapBytes_,
+                                      /*noAccess=*/false,
+                                      pageSize.hugePageMmapFlags())));
+  } else {
+    hashTable_ = std::make_unique<CompressedPtrType[]>(numBuckets_);
+  }
   CompressedPtrType* memStart = hashTable_.get();
   std::fill(memStart, memStart + numBuckets_, CompressedPtrType{});
 }
@@ -868,7 +903,10 @@ ChainedHashTable::Impl<T, HookPtr>::Impl(size_t numBuckets,
 
 template <typename T, typename ChainedHashTable::Hook<T> T::* HookPtr>
 ChainedHashTable::Impl<T, HookPtr>::Impl::~Impl() {
-  if (restorable_) {
+  if (mmapBytes_ != 0) {
+    // Impl-owned HugeTLB mapping: detach from the new[] deleter, then munmap.
+    munmap(hashTable_.release(), mmapBytes_);
+  } else if (restorable_) {
     hashTable_.release();
   }
 }
@@ -1016,14 +1054,14 @@ ChainedHashTable::Container<T, HookPtr, LockT>::Container(
     ShmAddr memSegment,
     const PtrCompressor& compressor,
     HandleMaker hm,
-    PageSize hugePageSize)
+    PageSize pageSize)
     : Container(object,
                 config,
                 memSegment.addr,
                 memSegment.size,
                 compressor,
                 std::move(hm),
-                hugePageSize) {}
+                pageSize) {}
 
 template <typename T,
           typename ChainedHashTable::Hook<T> T::* HookPtr,
@@ -1035,7 +1073,7 @@ ChainedHashTable::Container<T, HookPtr, LockT>::Container(
     size_t nBytes,
     const PtrCompressor& compressor,
     HandleMaker hm,
-    PageSize hugePageSize)
+    PageSize pageSize)
     : config_{config},
       handleMaker_(std::move(hm)),
       ht_{config_.getNumBuckets(), memStart, compressor, config_.getHasher(),
@@ -1052,7 +1090,7 @@ ChainedHashTable::Container<T, HookPtr, LockT>::Container(
 
   // Take page alignment into consideration when comparing the size of the
   // shared memory and the size of the hashtable.
-  if (nBytes != util::getAlignedSize(ht_.size(), hugePageSize.getPageSize())) {
+  if (nBytes != util::getAlignedSize(ht_.size(), pageSize.getPageSize())) {
     throw std::invalid_argument(
         fmt::format("Hashtable size not compatible. old = {}, new = {}",
                     ht_.size(),
@@ -1213,7 +1251,8 @@ bool ChainedHashTable::Container<T, HookPtr, LockT>::replaceIf(T& oldNode,
 template <typename T,
           typename ChainedHashTable::Hook<T> T::* HookPtr,
           typename LockT>
-bool ChainedHashTable::Container<T, HookPtr, LockT>::remove(T& node) noexcept {
+bool ChainedHashTable::Container<T, HookPtr, LockT>::remove(
+    T& node, RemoveContext context, const PreRemoveCb& preRemoveCb) noexcept {
   const auto bucket = ht_.getBucket(node.getKey());
   auto l = locks_.lockExclusive(bucket);
 
@@ -1222,6 +1261,7 @@ bool ChainedHashTable::Container<T, HookPtr, LockT>::remove(T& node) noexcept {
     return false;
   }
 
+  invokePreRemoveCb(preRemoveCb, context, node);
   ht_.removeFromBucket(node, bucket);
   node.unmarkAccessible();
 
@@ -1233,7 +1273,10 @@ template <typename T,
           typename ChainedHashTable::Hook<T> T::* HookPtr,
           typename LockT>
 typename T::Handle ChainedHashTable::Container<T, HookPtr, LockT>::removeIf(
-    T& node, const std::function<bool(const T& node)>& predicate) {
+    T& node,
+    const std::function<bool(const T& node)>& predicate,
+    RemoveContext context,
+    const PreRemoveCb& preRemoveCb) {
   const auto bucket = ht_.getBucket(node.getKey());
   auto l = locks_.lockExclusive(bucket);
 
@@ -1243,6 +1286,7 @@ typename T::Handle ChainedHashTable::Container<T, HookPtr, LockT>::removeIf(
     // if handle maker throws an exception, we leave the item in a consistent
     // state.
     auto handle = handleMaker_(&node);
+    invokePreRemoveCb(preRemoveCb, context, node);
     ht_.removeFromBucket(node, bucket);
     node.unmarkAccessible();
     numKeys_.fetch_sub(1, std::memory_order_relaxed);

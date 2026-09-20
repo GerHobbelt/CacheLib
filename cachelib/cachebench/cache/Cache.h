@@ -48,6 +48,7 @@
 #include "cachelib/cachebench/consistency/LogEventStream.h"
 #include "cachelib/cachebench/consistency/ValueTracker.h"
 #include "cachelib/cachebench/util/CacheConfig.h"
+#include "cachelib/cachebench/util/MemoryMonitorScript.h"
 #include "cachelib/cachebench/util/NandWrites.h"
 #include "cachelib/common/EventTracker.h"
 #include "cachelib/common/Throttler.h"
@@ -445,6 +446,9 @@ class Cache {
   // instance of the cache.
   std::unique_ptr<Allocator> cache_;
 
+  // Process-wide memory-reading override used by scripted monitor runs.
+  std::unique_ptr<MemoryMonitorScript> memoryMonitorScript_;
+
   // the monitor for the cache. This is a facebook specific functionality to
   // pull stats from the cachebench directly into facebook monitoring systems.
   std::unique_ptr<CacheMonitor> monitor_;
@@ -582,6 +586,16 @@ Cache<Allocator>::Cache(const CacheConfig& config,
 
   allocatorConfig_.setCacheSize(config_.cacheSizeMB * (MB));
 
+  if (config_.memoryMonitorEnabled()) {
+    auto memoryMonitorConfig = config_.getMemoryMonitorConfig();
+    if (!config_.memoryMonitorScript.empty()) {
+      allocatorConfig_.setDelayCacheWorkersStart();
+    }
+    allocatorConfig_.enableMemoryMonitor(
+        std::chrono::milliseconds{config_.memoryMonitorIntervalMs},
+        std::move(memoryMonitorConfig));
+  }
+
   if (!cacheDir.empty()) {
     allocatorConfig_.cacheDir = cacheDir;
   }
@@ -608,11 +622,65 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     });
   }
 
-  if (config_.usePosixShm) {
-    allocatorConfig_.usePosixForShm();
+  // Select the memory backing. When shmType is empty we keep the legacy
+  // behavior (shared memory iff a cacheDir is set, POSIX iff usePosixShm);
+  // otherwise shmType is authoritative and overrides usePosixShm.
+  const bool useTempShm = config_.shmType == "tmp";
+  if (config_.shmType.empty()) {
+    if (config_.usePosixShm) {
+      allocatorConfig_.usePosixForShm();
+    }
+  } else if (config_.shmType == "none" || useTempShm) {
+    // Both heap and temp shm require an empty cacheDir; temp shm is then
+    // distinguished by enabling memory monitoring below.
+    allocatorConfig_.cacheDir.clear();
+  } else if (config_.shmType == "sysv" || config_.shmType == "posix") {
+    if (allocatorConfig_.cacheDir.empty()) {
+      throw std::invalid_argument(fmt::format(
+          "shmType '{}' requires a non-empty cacheDir", config_.shmType));
+    }
+    if (config_.shmType == "posix") {
+      allocatorConfig_.usePosixForShm();
+    }
+  } else {
+    throw std::invalid_argument(
+        fmt::format("Unknown shmType '{}'", config_.shmType));
+  }
+
+  if (config_.hugePageSize != 0) {
+    if (allocatorConfig_.isUsingPosixShm() &&
+        config_.hugePageMountDir.empty()) {
+      throw std::invalid_argument(
+          "Using POSIX for shared memory & huge pages, but didn't specify a "
+          "hugetlbfs mount");
+    }
+    allocatorConfig_.enableHugePages(PageSize(config_.hugePageSize),
+                                     config_.hugePageMountDir);
+  }
+
+  if (useTempShm && !config_.memoryMonitorEnabled()) {
+    // Temp shm is only allocated when memory monitoring is enabled (see
+    // CacheAllocator's isOnShm_). Configure a resident-memory monitor with an
+    // unreachable upper limit so it never advises away slabs -- its sole
+    // purpose is to route allocation through TempShmMapping.
+    MemoryMonitor::Config monitorConfig;
+    monitorConfig.mode = MemoryMonitor::ResidentMemory;
+    monitorConfig.maxAdvisePercent = 0;
+    monitorConfig.lowerLimitGB = 0;
+    monitorConfig.upperLimitGB = size_t{1} << 20;
+    allocatorConfig_.enableMemoryMonitor(std::chrono::seconds{1},
+                                         monitorConfig);
   }
 
   allocatorConfig_.setMemoryLocking(config_.lockMemory);
+
+#if !FOLLY_SANITIZE_ADDRESS
+  if (config_.enableSlabAsanPoisoning) {
+    throw std::invalid_argument(
+        "enableSlabAsanPoisoning requires an ASAN build");
+  }
+#endif
+  allocatorConfig_.setSlabAsanPoisoning(config_.enableSlabAsanPoisoning);
 
   if (!config_.memoryTierConfigs.empty()) {
     allocatorConfig_.configureMemoryTiers(config_.memoryTierConfigs);
@@ -700,20 +768,27 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     nvmConfig.navyConfig.setEnableFDP(config_.deviceEnableFDP);
 
     // configure BlockCache
-    auto& bcConfig = nvmConfig.navyConfig.blockCache()
-                         .setDataChecksum(config_.navyDataChecksum)
-                         .setCleanRegions(config_.navyCleanRegions,
-                                          config_.navyCleanRegionThreads)
-                         .setRegionSize(config_.navyRegionSizeMB * MB);
+    auto& bcConfig =
+        nvmConfig.navyConfig.blockCache()
+            .setDataChecksum(config_.navyDataChecksum)
+            .setCleanRegions(config_.navyCleanRegions,
+                             config_.navyCleanRegionThreads)
+            .setRegionSize(config_.navyRegionSizeMB * MB)
+            .setRegionManagerFlushAsync(config_.navyRegionManagerFlushAsync);
 
     // by default lru. if more than one fifo ratio is present, we use
     // segmented fifo. otherwise, simple fifo.
+    const auto navyAllocatorCounts = config_.getNavyAllocatorCounts();
     if (!config_.navySegmentedFifoSegmentRatio.empty()) {
       if (config.navySegmentedFifoSegmentRatio.size() == 1) {
         bcConfig.enableFifo();
       } else {
-        bcConfig.enableSegmentedFifo(config_.navySegmentedFifoSegmentRatio);
+        bcConfig.enableSegmentedFifo(config_.navySegmentedFifoSegmentRatio,
+                                     navyAllocatorCounts);
       }
+    }
+    if (navyAllocatorCounts.size() == 1) {
+      bcConfig.setAllocatorCount(navyAllocatorCounts.front());
     }
 
     if (config_.navyEnableItemHistoryTracking) {
@@ -960,6 +1035,18 @@ Cache<Allocator>::Cache(const CacheConfig& config,
     }
   }
 
+  if (!config_.memoryMonitorScript.empty()) {
+    memoryMonitorScript_ = std::make_unique<MemoryMonitorScript>(
+        config_.memoryMonitorScript,
+        std::chrono::milliseconds{config_.memoryMonitorIntervalMs},
+        config_.memoryMonitorScriptRepeat);
+    memoryMonitorScript_->install(
+        config_.memoryMonitorMode == "resident"
+            ? MemoryMonitorScript::Target::RSS
+            : MemoryMonitorScript::Target::MemAvailable);
+    cache_->startCacheWorkers();
+  }
+
   if (config_.cacheMonitorFactory) {
     monitor_ = config_.cacheMonitorFactory->create(*cache_);
   }
@@ -996,6 +1083,11 @@ template <typename Allocator>
 void Cache<Allocator>::reAttach() {
   cache_ =
       std::make_unique<Allocator>(Allocator::SharedMemAttach, allocatorConfig_);
+  if (!config_.memoryMonitorScript.empty()) {
+    // Preserve script progress across reattach because the script models
+    // external memory pressure, which continues across cache restarts.
+    cache_->startCacheWorkers();
+  }
 }
 
 template <typename Allocator>
@@ -1008,7 +1100,8 @@ template <typename Allocator>
 void Cache<Allocator>::cleanupSharedMem() {
   if (!allocatorConfig_.cacheDir.empty()) {
     cache_->cleanupStrayShmSegments(allocatorConfig_.cacheDir,
-                                    allocatorConfig_.usePosixShm);
+                                    allocatorConfig_.usePosixShm,
+                                    allocatorConfig_.hugePageMountDir);
     util::removePath(allocatorConfig_.cacheDir);
   }
 }
@@ -1358,6 +1451,7 @@ std::unique_ptr<StatsBase> Cache<Allocator>::getStats() const {
   }
 
   const auto cacheStats = cache_->getGlobalCacheStats();
+  const auto memoryStats = cache_->getCacheMemoryStats();
   const auto rebalanceStats = cache_->getSlabReleaseStats();
   const auto navyStats = cache_->getNvmCacheStatsMap().toMap();
   for (const auto& [name, value] : cache_->getEventTrackerStatsMap()) {
@@ -1405,6 +1499,8 @@ std::unique_ptr<StatsBase> Cache<Allocator>::getStats() const {
   ret.numNvmSkippedDeletes = cacheStats.numNvmSkippedDeletes;
 
   ret.slabsReleased = rebalanceStats.numSlabReleaseForRebalance;
+  ret.slabsReleasedForAdvise = rebalanceStats.numSlabReleaseForAdvise;
+  ret.advisedSlabs = memoryStats.numAdvisedSlabs();
   ret.numAbortedSlabReleases = cacheStats.numAbortedSlabReleases;
   ret.numReaperSkippedSlabs = cacheStats.numReaperSkippedSlabs;
   ret.moveAttemptsForSlabRelease = rebalanceStats.numMoveAttempts;

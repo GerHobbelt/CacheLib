@@ -16,9 +16,12 @@
 
 #include "cachelib/allocator/CacheAllocatorConfig.h"
 #include "cachelib/allocator/MemoryTierCacheConfig.h"
+#include "cachelib/allocator/memory/Slab.h"
 #include "cachelib/allocator/tests/TestBase.h"
 #include "cachelib/common/EventSink.h"
 #include "cachelib/common/EventTracker.h"
+#include "cachelib/shm/HugePageTestUtils.h"
+#include "cachelib/shm/ShmCommon.h"
 
 namespace facebook {
 namespace cachelib {
@@ -67,6 +70,40 @@ TEST_F(CacheAllocatorConfigTest, TotalCacheSizeLessThanRatios) {
       .configureMemoryTiers(
           {MemoryTierCacheConfig::fromShm().setRatio(defaultTotalSize + 1)});
   EXPECT_THROW(config.validate(), std::invalid_argument);
+}
+
+namespace {
+MemoryMonitor::Config advisingMonitorConfig() {
+  MemoryMonitor::Config memConfig;
+  memConfig.mode = MemoryMonitor::ResidentMemory;
+  memConfig.maxAdvisePercent = 10;
+  memConfig.lowerLimitGB = 1;
+  memConfig.upperLimitGB = 10;
+  return memConfig;
+}
+} // namespace
+
+TEST_F(CacheAllocatorConfigTest, HugePageLargerThanSlabWithMemoryMonitor) {
+  AllocatorT::Config config;
+  config.setCacheSize(defaultTotalSize)
+      .enableHugePages(PageSize(Slab::kSize * 256))
+      .enableMemoryMonitor(std::chrono::seconds{2}, advisingMonitorConfig());
+  EXPECT_THROW(config.validate(), std::invalid_argument);
+}
+
+TEST_F(CacheAllocatorConfigTest, HugePageDividingSlabWithMemoryMonitor) {
+  AllocatorT::Config config;
+  config.setCacheSize(defaultTotalSize)
+      .enableHugePages(PageSize(Slab::kSize / 2))
+      .enableMemoryMonitor(std::chrono::seconds{2}, advisingMonitorConfig());
+  EXPECT_NO_THROW(config.validate());
+}
+
+TEST_F(CacheAllocatorConfigTest, HugePageLargerThanSlabWithoutMonitor) {
+  AllocatorT::Config config;
+  config.setCacheSize(defaultTotalSize)
+      .enableHugePages(PageSize(Slab::kSize * 256));
+  EXPECT_NO_THROW(config.validate());
 }
 
 TEST_F(CacheAllocatorConfigTest, SerializeEvictionPolicyLru) {
@@ -147,6 +184,30 @@ TEST_F(CacheAllocatorConfigTest, SerializeEventTrackerConfigFactory) {
   });
   serialized = config.serialize();
   EXPECT_EQ(serialized["eventTrackerConfigFactory"], "set");
+}
+
+TEST_F(CacheAllocatorConfigTest, HeapHugePageCache) {
+  const size_t cacheSize = 20 * Slab::kSize;
+  PageSize huge{PageSize::kHugePageSize2MB};
+
+  if (!canReserveHugePages(cacheSize, huge)) {
+    GTEST_SKIP() << "Not enough free 2MB huge pages for " << cacheSize;
+  }
+
+  LruAllocator::Config configHuge;
+  configHuge.setCacheSize(cacheSize);
+  configHuge.enableHugePages(huge);
+  LruAllocator allocHuge(configHuge);
+  EXPECT_FALSE(allocHuge.isOnShm());
+
+  auto poolId = allocHuge.addPool("test_huge",
+                                  allocHuge.getCacheMemoryStats().ramCacheSize);
+  for (int i = 0; i < 100; ++i) {
+    auto h = allocHuge.allocate(poolId, folly::to<std::string>(i), 100);
+    if (h) {
+      allocHuge.insertOrReplace(h);
+    }
+  }
 }
 
 } // namespace tests

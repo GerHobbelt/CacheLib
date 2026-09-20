@@ -55,6 +55,7 @@ class CacheAllocatorConfig {
  public:
   using AccessConfig = typename CacheT::AccessConfig;
   using ChainedItemMovingSync = typename CacheT::ChainedItemMovingSync;
+  using PreRemoveCb = typename CacheT::PreRemoveCb;
   using RemoveCb = typename CacheT::RemoveCb;
   using ItemDestructor = typename CacheT::ItemDestructor;
   using NvmCacheEncodeCb = typename CacheT::NvmCacheT::EncodeCB;
@@ -101,8 +102,13 @@ class CacheAllocatorConfig {
   // number of estimated cache entries.
   CacheAllocatorConfig& setAccessConfig(size_t numEntries);
 
-  // RemoveCallback is invoked for each item that is evicted or removed
-  // explicitly from RAM
+  // PreRemoveCallback is invoked immediately before an explicit removal,
+  // expiry, or eviction makes an item unfindable in RAM. It runs under the
+  // access-container bucket lock and must obey the PreRemoveCb contract.
+  CacheAllocatorConfig& setPreRemoveCallback(PreRemoveCb cb);
+
+  // RemoveCallback is invoked when an item is actually freed from RAM.
+  // Outstanding references can delay it after PreRemoveCallback has run.
   CacheAllocatorConfig& setRemoveCallback(RemoveCb cb);
 
   // ItemDestructor is invoked for each item that is evicted or removed
@@ -239,6 +245,11 @@ class CacheAllocatorConfig {
   // required for POSIX shm (cache creation throws if empty) and ignored for
   // SysV. The HugeTLB pool must be provisioned out-of-band; CacheLib only draws
   // from the already-reserved pool.
+  //
+  // For persistent POSIX caches, the configured mount path must remain
+  // unchanged across restarts. Changing it, enabling huge pages after they
+  // were disabled, or disabling huge pages after they were enabled forces a
+  // cold roll that removes the old shared-memory segments.
   CacheAllocatorConfig& enableHugePages(PageSize pageSize,
                                         std::string mountDir = "");
 
@@ -506,6 +517,9 @@ class CacheAllocatorConfig {
   // check that memory tier ratios are set properly
   const CacheAllocatorConfig& validateMemoryTiers() const;
 
+  // check that configured huge pages (if any) work with memory monitor
+  void validateMemMonitorAndHugePages() const;
+
   // @return a map representation of the configs
   std::map<std::string, std::string> serialize() const;
 
@@ -699,6 +713,9 @@ class CacheAllocatorConfig {
   // for all normal items
   AccessConfig accessConfig{};
 
+  // user defined callback invoked before an item is unlinked from RAM
+  PreRemoveCb preRemoveCb{};
+
   // user defined callback invoked when an item is being evicted or freed from
   // RAM
   RemoveCb removeCb{};
@@ -856,6 +873,13 @@ CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setAccessConfig(
   AccessConfig config{};
   config.sizeBucketsPowerAndLocksPower(numEntries);
   accessConfig = std::move(config);
+  return *this;
+}
+
+template <typename T>
+CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::setPreRemoveCallback(
+    PreRemoveCb cb) {
+  preRemoveCb = std::move(cb);
   return *this;
 }
 
@@ -1339,6 +1363,10 @@ const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validate() const {
         "It's not allowed to enable both RemoveCB and ItemDestructor.");
   }
 
+  if (memMonitoringEnabled()) {
+    validateMemMonitorAndHugePages();
+  }
+
   return validateMemoryTiers();
 }
 
@@ -1382,6 +1410,20 @@ const CacheAllocatorConfig<T>& CacheAllocatorConfig<T>::validateMemoryTiers()
         "Sum of tier ratios must be less than total cache size.");
   }
   return *this;
+}
+
+template <typename T>
+void CacheAllocatorConfig<T>::validateMemMonitorAndHugePages() const {
+  // madvise() only frees physical memory when it covers whole pages, so huge
+  // pages that don't evenly divide slabs can't be released at slab granularity
+  if (hugePageSize.isHugePage() &&
+      Slab::kSize % hugePageSize.getPageSize() != 0) {
+    throw std::invalid_argument(
+        fmt::format("Memory monitor requires the huge page size ({}) to evenly "
+                    "divide the slab size ({})",
+                    hugePageSize.getPageSize(),
+                    Slab::kSize));
+  }
 }
 
 template <typename T>
@@ -1448,6 +1490,7 @@ std::map<std::string, std::string> CacheAllocatorConfig<T>::serialize() const {
   configMap["thresholdForConvertingToIOBuf"] =
       std::to_string(thresholdForConvertingToIOBuf);
   configMap["chainedItemsLockPower"] = std::to_string(chainedItemsLockPower);
+  configMap["preRemoveCb"] = preRemoveCb ? "set" : "empty";
   configMap["removeCb"] = removeCb ? "set" : "empty";
   configMap["nvmAP"] = nvmCacheAP ? "custom" : "empty";
   configMap["nvmAPRejectFirst"] = rejectFirstAPNumEntries ? "set" : "empty";

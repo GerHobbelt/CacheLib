@@ -35,6 +35,7 @@
 
 #include "cachelib/allocator/memory/CompressedPtr.h"
 #include "cachelib/allocator/memory/Slab.h"
+#include "cachelib/shm/ShmCommon.h"
 
 namespace facebook {
 namespace cachelib {
@@ -53,10 +54,12 @@ class SlabAllocator {
     Config() {}
     Config(bool _excludeFromCoreDump,
            bool _lockMemory,
-           bool _enableAsanPoisoning)
+           bool _enableAsanPoisoning,
+           PageSize _hugePageSize = PageSize())
         : excludeFromCoredump(_excludeFromCoreDump),
           lockMemory(_lockMemory),
-          enableAsanPoisoning(_enableAsanPoisoning) {}
+          enableAsanPoisoning(_enableAsanPoisoning),
+          hugePageSize(_hugePageSize) {}
 
     // exclude the memory region from core dumps
     bool excludeFromCoredump{false};
@@ -68,6 +71,10 @@ class SlabAllocator {
     // When true, slab memory is ASAN-poisoned on free and unpoisoned on
     // allocation so ASAN can detect use-after-free bugs.
     bool enableAsanPoisoning{false};
+
+    // Page size backing the slab memory; default => normal pages. Used to
+    // allocate mmap-owned memory.
+    PageSize hugePageSize{};
   };
 
   // initialize the slab allocator for the range of memory starting from
@@ -424,7 +431,7 @@ class SlabAllocator {
   // exclude associated slab memory from core dump
   //
   // @throw std::system_error on any failure to advise
-  void excludeMemoryFromCoredump() const;
+  void excludeMemoryFromCoredump(const PageSize& pageSize) const;
 
   // used by the memory locker to get pages allocated and locked into the
   // binary. With a cache size of 256GB, this will have about 60 million page
@@ -470,6 +477,11 @@ class SlabAllocator {
 
   // whether the memory this slab allocator manages is mmaped by the caller.
   const bool ownsMemory_{true};
+
+  // when ownsMemory_, the length of the mmap backing memoryStart_; used to
+  // munmap the full region. Exceeds memorySize_ for huge-page mappings, which
+  // round up to the huge-page size. Zero when the memory is caller-provided.
+  size_t mmapLength_{0};
 
 #if FOLLY_SANITIZE_ADDRESS
   // whether to poison free slab memory to detect use-after-free bugs

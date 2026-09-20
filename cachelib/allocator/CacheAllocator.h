@@ -278,6 +278,16 @@ class CacheAllocator : public CacheBase {
     folly::Optional<PoolId> poolId{folly::none};      // Memory pool identifier
   };
 
+  // Called immediately before an item is unlinked from RAM by an explicit
+  // removal, expiry, or eviction. The item is valid only for the duration of
+  // the call. The callback runs while the access-container bucket is
+  // exclusively locked, so it must not throw, call cache APIs, or acquire a
+  // lock that may be held while calling cache APIs. Throwing terminates the
+  // process. A successful insertOrReplace() does not invoke this callback for
+  // the replaced item.
+  using PreRemoveCb =
+      std::function<void(RemoveContext context, const Item& item)>;
+
   // holds information about removal, used in RemoveCb
   struct RemoveCbData {
     // remove or eviction
@@ -2237,8 +2247,11 @@ class CacheAllocator : public CacheBase {
                   config.minAllocationClassSize,
                   config.reduceFragmentationInAllocationClass)
             : config.defaultAllocSizes,
-        config.enableZeroedSlabAllocs, config.disableFullCoredump,
-        config.lockMemory, config.isSlabAsanPoisoningEnabled()};
+        config.enableZeroedSlabAllocs,
+        config.disableFullCoredump,
+        config.lockMemory,
+        config.isSlabAsanPoisoningEnabled(),
+        config.hugePageSize};
   }
 
   // starts one of the cache workers passing the current instance and the args
@@ -2586,6 +2599,14 @@ class CacheAllocator : public CacheBase {
   // nvmCache
   std::unique_ptr<NvmCacheT> nvmCache_;
 
+  // Wake the pool rebalancer after an allocation failure, unless forced
+  // wake-ups are disabled or no rebalancer is running.
+  void wakeUpPoolRebalancerOnAllocFailure() {
+    if (!config_.poolRebalancerDisableForcedWakeUp && poolRebalancer_) {
+      poolRebalancer_->wakeUpOnAllocationFailure();
+    }
+  }
+
   // rebalancer for the pools
   std::unique_ptr<PoolRebalancer> poolRebalancer_;
 
@@ -2750,7 +2771,8 @@ CacheAllocator<CacheTrait>::CacheAllocator(
                                           : config.memMonitoringEnabled()},
       config_(config.validate()),
       tempShm_(type == InitMemType::kNone && isOnShm_
-                   ? std::make_unique<TempShmMapping>(config_.getCacheSize())
+                   ? std::make_unique<TempShmMapping>(config_.getCacheSize(),
+                                                      config_.hugePageSize)
                    : nullptr),
       shmManager_(type != InitMemType::kNone
                       ? std::make_unique<ShmManager>(config_.cacheDir,
@@ -2867,7 +2889,7 @@ CacheAllocator<CacheTrait>::restoreMemoryAllocator() {
                       createShmCacheOpts())
           .addr,
       config_.getCacheSize(), config_.disableFullCoredump,
-      config_.isSlabAsanPoisoningEnabled());
+      config_.isSlabAsanPoisoningEnabled(), config_.hugePageSize);
 }
 
 template <typename CacheTrait>
@@ -2976,12 +2998,6 @@ void CacheAllocator<CacheTrait>::initWorkers() {
   }
 
   if (config_.memMonitoringEnabled() && !memMonitor_) {
-    if (!isOnShm_) {
-      throw std::invalid_argument(
-          "Memory monitoring is not supported for cache on heap. It is "
-          "supported "
-          "for cache on a shared memory segment only.");
-    }
     startNewMemMonitor(config_.memMonitorInterval,
                        config_.memMonitorConfig,
                        config_.poolAdviseStrategy);
@@ -3043,7 +3059,8 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
   if (type == InitMemType::kNone) {
     return std::make_unique<AccessContainer>(
         config, compressor_,
-        [this](Item* it) -> WriteHandle { return acquire(it); });
+        [this](Item* it) -> WriteHandle { return acquire(it); },
+        config_.hugePageSize);
   } else if (type == InitMemType::kMemNew) {
     return std::make_unique<AccessContainer>(
         config,
@@ -3157,9 +3174,7 @@ CacheAllocator<CacheTrait>::allocateInternal(PoolId pid,
   } else { // failed to allocate memory.
     (*stats_.allocFailures)[pid][cid].inc();
     // wake up rebalancer
-    if (!config_.poolRebalancerDisableForcedWakeUp && poolRebalancer_) {
-      poolRebalancer_->wakeUp();
-    }
+    wakeUpPoolRebalancerOnAllocFailure();
   }
 
   if (shouldRecordEvent(key)) {
@@ -3221,6 +3236,7 @@ CacheAllocator<CacheTrait>::allocateChainedItemInternal(const Item& parent,
   }
   if (memory == nullptr) {
     (*stats_.allocFailures)[pid][cid].inc();
+    wakeUpPoolRebalancerOnAllocFailure();
     return WriteHandle{};
   }
 
@@ -4092,7 +4108,7 @@ template <typename CacheTrait>
 void CacheAllocator<CacheTrait>::unlinkItemForEviction(Item& it) {
   XDCHECK(it.isMarkedForEviction());
   XDCHECK_EQ(0u, it.getRefCount());
-  accessContainer_->remove(it);
+  accessContainer_->remove(it, RemoveContext::kEviction, config_.preRemoveCb);
   removeFromMMContainer(it);
 
   // Since we managed to mark the item for eviction we must be the only
@@ -4485,7 +4501,8 @@ CacheAllocator<CacheTrait>::removeImpl(HashedKey hk,
         nvmCache_ ? nvmCache_->getItemDestructorLock(hk)
                   : std::unique_lock<typename NvmCacheT::ItemDestructorMutex>();
 
-    success = accessContainer_->remove(item);
+    success = accessContainer_->remove(item, RemoveContext::kNormal,
+                                       config_.preRemoveCb);
 
     if (removeFromNvm && success && item.isNvmClean() && !item.isNvmEvicted()) {
       // item is to be removed and the destructor will be executed
@@ -5637,7 +5654,8 @@ bool CacheAllocator<CacheTrait>::removeIfExpired(const ReadHandle& handle) {
   // We remove the item from both access and mm containers.
   // We want to make sure the caller is the only one holding the handle.
   auto removedHandle =
-      accessContainer_->removeIf(*(handle.getInternal()), itemExpiryPredicate);
+      accessContainer_->removeIf(*(handle.getInternal()), itemExpiryPredicate,
+                                 RemoveContext::kExpired, config_.preRemoveCb);
   if (removedHandle) {
     removeFromMMContainer(*(handle.getInternal()));
     return true;
@@ -6335,6 +6353,13 @@ bool CacheAllocator<CacheTrait>::startNewMemMonitor(
     std::chrono::milliseconds interval,
     MemoryMonitor::Config config,
     std::shared_ptr<RebalanceStrategy> strategy) {
+  if (!isOnShm_) {
+    throw std::invalid_argument(
+        "Memory monitoring is not supported for cache on heap. It is "
+        "supported for cache on a shared memory segment only.");
+  }
+  config_.validateMemMonitorAndHugePages();
+
   if (!startNewWorker("MemoryMonitor", memMonitor_, interval, *this, config,
                       strategy, allocator_->getNumSlabsAdvised())) {
     return false;
