@@ -560,6 +560,11 @@ class BlockCacheConfig {
     return *this;
   }
 
+  BlockCacheConfig& useCombinedEntryBlock(bool enable) noexcept {
+    useCombinedEntryBlock_ = enable;
+    return *this;
+  }
+
   // TO enable Sparse Map Index with the configurable parameters. Without
   // calling this explicitly, default index will be still SparseMapIndex
   // with the default parameters.
@@ -612,6 +617,8 @@ class BlockCacheConfig {
 
   bool isCleanRegionFastPath() const { return cleanRegionFastPath_; }
 
+  bool isCombinedEntryBlockEnabled() const { return useCombinedEntryBlock_; }
+
   const BlockCacheReinsertionConfig& getReinsertionConfig() const {
     return reinsertionConfig_;
   }
@@ -660,6 +667,14 @@ class BlockCacheConfig {
   // When enabled, getCleanRegion() can skip acquiring the mutex and return
   // Retry immediately if clean regions are empty and reclaims are in-flight.
   bool cleanRegionFastPath_{false};
+
+  // Whether to use Combined entry block (For index entries and small sized
+  // items).
+  // Only FixedSizeIndex will support this and it doesn't work with
+  // SparseMapIndex
+  //
+  // TODO: For now, only index entries will be handled with Combined entry block
+  bool useCombinedEntryBlock_{false};
 
   // Number of allocators per priority.
   // Do not set this directly. This should be configured by setAllocatorCount
@@ -884,6 +899,8 @@ class NavyConfig {
   uint64_t getMaxParcelMemoryMB() const { return maxParcelMemoryMB_; }
   bool getUseEstimatedWriteSize() const { return useEstimatedWriteSize_; }
   size_t getNumShards() const { return numShards_; }
+  bool getEnableAccessTimeMap() const { return enableAccessTimeMap_; }
+  size_t getAccessTimeMapMaxSize() const { return accessTimeMapMaxSize_; }
 
   // Setters:
   // Enable "dynamic_random" admission policy.
@@ -1027,6 +1044,12 @@ class NavyConfig {
     useEstimatedWriteSize_ = useEstimatedWriteSize;
   }
   void setNumShards(size_t numShards) noexcept { numShards_ = numShards; }
+  void setEnableAccessTimeMap(bool enable) noexcept {
+    enableAccessTimeMap_ = enable;
+  }
+  void setAccessTimeMapMaxSize(size_t maxSize) noexcept {
+    accessTimeMapMaxSize_ = maxSize;
+  }
 
   const std::vector<EnginesConfig>& enginesConfigs() const {
     return enginesConfigs_;
@@ -1124,6 +1147,10 @@ class NavyConfig {
   bool enableFDP_{false};
   // Number of nvm lock shards
   size_t numShards_{8192};
+  // Whether to enable the AccessTimeMap for tracking NVM item access times.
+  bool enableAccessTimeMap_{false};
+  // Maximum number of entries in the AccessTimeMap. 0 means unbounded.
+  size_t accessTimeMapMaxSize_{0};
 };
 } // namespace navy
 } // namespace cachelib

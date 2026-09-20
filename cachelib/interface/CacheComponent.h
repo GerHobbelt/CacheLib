@@ -143,6 +143,12 @@ class CacheComponent {
    */
   FOLLY_ALWAYS_INLINE void releaseHandle(Handle&& handle) { handle.release(); }
 
+  /**
+   * Get a pointer to the inline buffer in the handle, suitable for placement
+   * new of a CacheItem subclass.
+   */
+  static void* getInlineBuf(Handle& handle) noexcept { return handle.buf_; }
+
  private:
   // ------------------------------ Interface ------------------------------ //
 
@@ -166,7 +172,7 @@ class CacheComponent {
    * @param inserted whether the item was previously inserted into the cache
    * (callbacks are typically only called when it was inserted)
    */
-  virtual folly::coro::Task<void> release(CacheItem& item, bool inserted) = 0;
+  virtual void release(CacheItem& item, bool inserted) = 0;
 
   friend class Handle;
   friend class WriteHandle;

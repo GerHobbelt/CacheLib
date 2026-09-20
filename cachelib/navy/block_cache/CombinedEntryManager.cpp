@@ -79,6 +79,114 @@ void CombinedEntryManager::recover() {
 
   XLOG(INFO) << "Finished recovering BlockCache Combined entry block buffers";
 }
+
+CombinedEntryBlock* CombinedEntryManager::getCombinedEntryBlock(
+    uint64_t stream) {
+  XDCHECK(stream < numCebStreams_);
+
+  // If we don't have the combined entry block for the stream, create one
+  if (cebStreams_[stream] == nullptr) {
+    // TODO: Let's just use CombinedEntryBlock as it is for now though it won't
+    // use shm for the buffer.
+    cebStreams_[stream] = std::make_unique<CombinedEntryBlock>(cebSize_);
+    totalCebs_++;
+  }
+
+  return cebStreams_[stream].get();
+}
+
+CombinedEntryStatus CombinedEntryManager::addIndexEntryToStream(
+    uint64_t stream, uint64_t bid, uint64_t key, const EntryRecord& record) {
+  auto ceb = getCombinedEntryBlock(stream);
+  if (!ceb) {
+    XLOGF(ERR,
+          "Can't add an index entry (bid {}, key {}) to the stream: CEB is not "
+          "available for the given stream {}",
+          bid, key, stream);
+    return CombinedEntryStatus::kError;
+  }
+
+  auto res = ceb->addIndexEntry(bid, key, record);
+  if (res == CombinedEntryStatus::kFull) {
+    auto writeStatus = writeCebCb_(stream, *ceb);
+    if (writeStatus == Status::Ok) {
+      // Write to flash was successful and all the index entries for the CEB
+      // were updated at this point.
+      ceb->clear();
+      // Now we can add the given index entry and it has to succeed.
+      res = ceb->addIndexEntry(bid, key, record);
+    } else {
+      // TODO: writing CEB can return Status::Retry when it can't find the clean
+      // region and can't allocate. We will handle this case gracefully by
+      // maintaining to-be-written CEBs, but for now, it will just give up on
+      // adding the given entry and return.
+      XDCHECK(writeStatus == Status::Retry);
+      XLOGF(WARN,
+            "Can't add an index entry (bid {}, key {}) to the stream: CEB is "
+            "full "
+            "for the given stream {}",
+            bid, key, stream);
+      return CombinedEntryStatus::kFull;
+    }
+  }
+
+  XDCHECK(res == CombinedEntryStatus::kUpdated ||
+          res == CombinedEntryStatus::kOk);
+  return res;
+}
+
+// Check all the active combined entry block(s) for the stream to see if we have
+// a valid entry for the key.
+// (If it's already flushed to flash, index will be updated to point to the
+// flash location, so it will be handled differently and this won't be called
+// for that case)
+bool CombinedEntryManager::peekIndexEntryFromStream(uint64_t stream,
+                                                    uint64_t key) {
+  XDCHECK(stream < numCebStreams_);
+
+  if (cebStreams_[stream] == nullptr) {
+    return false;
+  }
+
+  // TODO: for now, only one active CEB for each stream. It'll be expanded
+  // to handle multiple in case there are pending flushes.
+  return cebStreams_[stream]->peekIndexEntry(key);
+}
+
+// Get the index entry for the given key from the active combined entry block(s)
+// for the stream. When there are multiple CEBs open for the stream, it will
+// look up starting from the latest one to get the latest entry in case the same
+// key entry was updated. (If it's already flushed to flash, index will be
+// updated to point to the flash location, so it will be handled differently and
+// this won't be called for that case)
+folly::Expected<EntryRecord, CombinedEntryStatus>
+CombinedEntryManager::getIndexEntryFromStream(uint64_t stream, uint64_t key) {
+  XDCHECK(stream < numCebStreams_);
+
+  if (cebStreams_[stream] == nullptr) {
+    return folly::makeUnexpected(CombinedEntryStatus::kNotFound);
+  }
+
+  // TODO: for now, only one active CEB for each stream. It'll be expanded
+  // to handle multiple in case there are pending flushes.
+  return cebStreams_[stream]->getIndexEntry(key);
+}
+
+// Remove a index entry for the given key from the active combined entry
+// block(s) for the stream. When there are multiple CEBs open for the stream, it
+// will check and remove starting from the latest one first.
+CombinedEntryStatus CombinedEntryManager::removeIndexEntryFromStream(
+    uint64_t stream, uint64_t key) {
+  XDCHECK(stream < numCebStreams_);
+
+  if (cebStreams_[stream] == nullptr) {
+    return CombinedEntryStatus::kNotFound;
+  }
+
+  // TODO: for now, only one active CEB for each stream.
+  return cebStreams_[stream]->removeIndexEntry(key);
+}
+
 } // namespace navy
 } // namespace cachelib
 } // namespace facebook

@@ -324,7 +324,8 @@ RAMCacheComponent::RAMCacheComponent(
     LruAllocatorConfig&& config,
     const LatencySamplingConfig& latencySamplingConfig)
     : CacheComponentWithStats(latencySamplingConfig),
-      cache_(std::make_unique<LruAllocator>(std::move(config))) {}
+      cache_(std::make_unique<LruAllocator>(std::move(config))),
+      lastStatsCollectionTime_(std::chrono::steady_clock::now()) {}
 
 UnitResult RAMCacheComponent::writeBack(CacheItem& /* item */) {
   stats_->writeBack_.throughput_.calls_.inc();
@@ -333,15 +334,13 @@ UnitResult RAMCacheComponent::writeBack(CacheItem& /* item */) {
   return folly::unit;
 }
 
-folly::coro::Task<void> RAMCacheComponent::release(interface::CacheItem& item,
-                                                   bool inserted) {
+void RAMCacheComponent::release(interface::CacheItem& item, bool inserted) {
   stats_->release_.throughput_.calls_.inc();
   auto latencyGuard = stats_->release_.latency_.start();
   auto* implItem = reinterpret_cast<RAMCacheItem&>(item).item();
   cache_->releaseBackToAllocator(
       *implItem, RemoveContext::kNormal, /* nascent */ !inserted);
   stats_->release_.throughput_.successes_.inc();
-  co_return;
 }
 
 CacheComponentStats RAMCacheComponent::getStats() const noexcept {
@@ -358,6 +357,15 @@ CacheComponentStats RAMCacheComponent::getStats() const noexcept {
 
   // Populate allocate latency from CacheAllocator's counter
   stats.allocate_.latency_ = allocatorStats.allocateLatency_.estimate();
+
+  auto now = std::chrono::steady_clock::now();
+  auto prev = std::exchange(lastStatsCollectionTime_, now);
+  cache_->exportStats(
+      /* statPrefix */ "",
+      std::chrono::duration_cast<std::chrono::seconds>(now - prev),
+      [&stats](folly::StringPiece name, uint64_t value) {
+        stats.extraStats_.insertCount(name.toString(), value);
+      });
 
   return stats;
 }
