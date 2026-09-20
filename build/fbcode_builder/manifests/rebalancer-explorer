@@ -1,6 +1,6 @@
 [manifest]
-name = rebalancer
-fbsource_path = fbcode/algopt/rebalancer/
+name = rebalancer-explorer
+fbsource_path = fbcode/rebalancer/explorer/
 shipit_project = facebookincubator/rebalancer
 shipit_fbcode_builder = true
 use_shipit = true
@@ -16,30 +16,30 @@ builder = cmake
 
 [cmake.defines]
 CMAKE_POSITION_INDEPENDENT_CODE=ON
+REBALANCER_BUILD_EXPLORER=ON
 
-# Build the example/demo executables only when getdeps is invoked with
-# tests enabled (test=on -- the default for `getdeps build` without
-# --no-tests). Wheel builds pass --no-tests so the wheel stays
-# data-only. CI test jobs get the examples built and link-checked
-# automatically without needing to thread EXAMPLES=ON through every
-# workflow's --extra-cmake-defines.
+# Build examples when tests are enabled (default unless --no-tests). Mirrors the
+# `rebalancer` manifest; lets the bundles image get examples without EXAMPLES=ON
+# in --extra-cmake-defines, which would change every dep's hash and break sharing
+# the prebuilt deps.
 [cmake.defines.test=on]
 EXAMPLES=ON
-TESTS=ON
 
 [dependencies]
 boost
-# Rebalancer only uses fbthrift's codegen + (de)serialization. Skip the RPC
-# transport stack (fizz/wangle/mvfst, none of which it links) and the
-# benchmark executables. shared_libs builds folly/fbthrift/fmt/gflags/glog as
-# shared libraries, which avoids duplicate static-initializer crashes and lets
-# the wheel bundler (auditwheel/delocate) reason about each dep as a single
-# shared object.
-fbthrift = !rpc, !benchmark, shared_libs
+# fbthrift kept for RPC, benchmarks off. shared_libs makes folly/fbthrift/fmt
+# (and gflags/glog) single shared libs; as static archives they'd be linked into
+# several of the explorer's .so/exe and double-register gflags, aborting startup.
+fbthrift = !benchmark, shared_libs
 fmt = shared_libs
 folly = shared_libs
+gflags
+glog
 googletest
 highs-optimizer
+# Required by the HTTP/JSON proxy (rebalancer_explorer_proxy) for its HTTP server.
+proxygen
+re2
 xxhash
 
 [dependencies.os=linux]
@@ -51,11 +51,14 @@ CMAKE_CXX_COMPILER=clang++-19
 
 [shipit.strip]
 ^.*/fb/.*$
+^fbcode/rebalancer/explorer/CLAUDE\.md$
+^fbcode/rebalancer/explorer/PACKAGE$
 
 [shipit.pathmap]
 fbcode/algopt/rebalancer/oss_root = .
 fbcode/algopt/rebalancer = algopt/rebalancer
 fbcode/algopt/lp = algopt/lp
+fbcode/rebalancer/explorer = rebalancer/explorer
 
 [dependencies.all(distro=centos_stream,distro_vers=9)]
 clang19
