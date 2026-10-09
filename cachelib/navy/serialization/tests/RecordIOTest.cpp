@@ -20,6 +20,10 @@
 #include <gtest/gtest.h>
 
 #include "cachelib/navy/serialization/RecordIO.h"
+#include "cachelib/navy/testing/MockDevice.h"
+
+using testing::_;
+using testing::NiceMock;
 
 namespace facebook::cachelib::navy::tests {
 namespace {
@@ -226,6 +230,91 @@ TEST(RecordIO, MemoryDeviceVariousPayloads) {
         }
       }
     }
+  }
+}
+
+// The writer keeps whole blocks that already fit and drops only the final
+// block when the stream reaches the end of the metadata region.
+TEST(RecordIO, PartialTailIsDroppedOneBlock) {
+  constexpr uint32_t ioAlignSize = 4096;
+  constexpr uint64_t metadataSize = 8 * ioAlignSize;
+  const uint32_t fullBlock =
+      ioAlignSize - folly::recordio_helpers::headerSize();
+
+  auto dev = createMemoryDevice(10 * metadataSize, nullptr, ioAlignSize);
+  {
+    auto rw = createMetadataRecordWriter(*dev, metadataSize);
+    for (int i = 0; i < 7; i++) {
+      auto wbuf = folly::IOBuf::create(fullBlock);
+      wbuf->append(fullBlock);
+      memset(wbuf->writableData(), 'A' + i, fullBlock);
+      rw->writeRecord(std::move(wbuf));
+    }
+    auto tail = folly::IOBuf::create(100);
+    tail->append(100);
+    memset(tail->writableData(), 'Z', 100);
+    rw->writeRecord(std::move(tail));
+  }
+
+  auto rr = createMetadataRecordReader(*dev, metadataSize);
+  for (int i = 0; i < 7; i++) {
+    ASSERT_FALSE(rr->isEnd());
+    auto rbuf = rr->readRecord();
+    ASSERT_NE(nullptr, rbuf);
+    EXPECT_EQ(fullBlock, rbuf->length());
+    EXPECT_EQ('A' + i, rbuf->data()[0]);
+  }
+  EXPECT_TRUE(rr->isEnd());
+}
+
+// A larger staging size means fewer, bigger device writes; the bytes written
+// are the same either way.
+TEST(RecordIO, StagingSizeBatchesWritesWithoutChangingImage) {
+  constexpr uint64_t metadataSize = 4 * 1024 * 1024;
+  constexpr uint32_t recSize = 3000;
+  constexpr int nRecs = 500;
+
+  auto run = [&](uint32_t ioAlignSize, size_t stagingSize) {
+    auto dev =
+        std::make_unique<NiceMock<MockDevice>>(2 * metadataSize, ioAlignSize);
+    uint32_t writes = 0;
+    ON_CALL(*dev, writeImpl(_, _, _, _))
+        .WillByDefault(
+            [&](uint64_t offset, uint32_t size, const void* data, int) {
+              writes++;
+              auto& real = dev->getRealDeviceRef();
+              Buffer buffer = real.makeIOBuffer(size);
+              memcpy(buffer.data(), data, size);
+              return real.write(offset, std::move(buffer));
+            });
+    {
+      auto rw = createMetadataRecordWriter(*dev, metadataSize, stagingSize);
+      for (int i = 0; i < nRecs; i++) {
+        auto wbuf = folly::IOBuf::create(recSize);
+        wbuf->append(recSize);
+        memset(wbuf->writableData(), 'A' + (i % 26), recSize);
+        rw->writeRecord(std::move(wbuf));
+      }
+    }
+    Buffer img{metadataSize, ioAlignSize};
+    EXPECT_TRUE(dev->getRealDeviceRef().read(0, metadataSize, img.data()));
+    auto s = std::string(reinterpret_cast<char*>(img.data()), metadataSize);
+    // Guards against the mock swallowing the writes and leaving every run
+    // comparing the same empty image.
+    EXPECT_NE(std::string(metadataSize, '\0'), s);
+    return std::make_pair(s, writes);
+  };
+
+  for (uint32_t ioAlignSize : {4096u, 16384u}) {
+    const auto oneBlock = run(ioAlignSize, ioAlignSize);
+    // Values below a block and values that are not a block multiple are
+    // clamped, so they must land on the same image.
+    for (size_t stagingSize : {size_t{0}, size_t{1}, size_t{4095},
+                               size_t{100000}, size_t{4 * 1024 * 1024}}) {
+      EXPECT_EQ(oneBlock.first, run(ioAlignSize, stagingSize).first)
+          << "align=" << ioAlignSize << " staging=" << stagingSize;
+    }
+    EXPECT_LT(run(ioAlignSize, 4 * 1024 * 1024).second, oneBlock.second);
   }
 }
 
