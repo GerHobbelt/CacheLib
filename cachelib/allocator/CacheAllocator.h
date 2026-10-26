@@ -2253,7 +2253,7 @@ class CacheAllocator : public CacheBase {
         config.disableFullCoredump,
         config.lockMemory,
         config.isSlabAsanPoisoningEnabled(),
-        config.hugePageSize};
+        config.slabHugePageSize};
   }
 
   // starts one of the cache workers passing the current instance and the args
@@ -2785,7 +2785,7 @@ CacheAllocator<CacheTrait>::CacheAllocator(
       config_(config.validate()),
       tempShm_(type == InitMemType::kNone && isOnShm_
                    ? std::make_unique<TempShmMapping>(config_.getCacheSize(),
-                                                      config_.hugePageSize)
+                                                      config_.slabHugePageSize)
                    : nullptr),
       shmManager_(type != InitMemType::kNone
                       ? std::make_unique<ShmManager>(config_.cacheDir,
@@ -2848,14 +2848,14 @@ ShmSegmentOpts CacheAllocator<CacheTrait>::createShmCacheOpts() {
     throw std::invalid_argument("CacheLib only supports a single memory tier");
   }
   opts.memBindNumaNodes = config_.memoryTierConfigs[0].getMemBind();
-  applyHugePageOpts(opts, config_.hugePageSize);
+  applyHugePageOpts(opts, config_.slabHugePageSize);
   return opts;
 }
 
 template <typename CacheTrait>
 ShmSegmentOpts CacheAllocator<CacheTrait>::createShmAccessOpts() {
   ShmSegmentOpts opts;
-  applyHugePageOpts(opts, config_.hugePageSize);
+  applyHugePageOpts(opts, config_.accessHugePageSize);
   return opts;
 }
 
@@ -2902,7 +2902,7 @@ CacheAllocator<CacheTrait>::restoreMemoryAllocator() {
                       createShmCacheOpts())
           .addr,
       config_.getCacheSize(), config_.disableFullCoredump,
-      config_.isSlabAsanPoisoningEnabled(), config_.hugePageSize);
+      config_.isSlabAsanPoisoningEnabled(), config_.slabHugePageSize);
 }
 
 template <typename CacheTrait>
@@ -3083,7 +3083,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
     return std::make_unique<AccessContainer>(
         config, compressor_,
         [this](Item* it) -> WriteHandle { return acquire(it); },
-        config_.hugePageSize);
+        config_.accessHugePageSize);
   } else if (type == InitMemType::kMemNew) {
     return std::make_unique<AccessContainer>(
         config,
@@ -3103,7 +3103,7 @@ CacheAllocator<CacheTrait>::initAccessContainer(InitMemType type,
         shmManager_->attachShm(name, nullptr, createShmAccessOpts()),
         compressor_,
         [this](Item* it) -> WriteHandle { return acquire(it); },
-        config_.hugePageSize);
+        config_.accessHugePageSize);
   }
 
   // Invalid type
@@ -5905,6 +5905,14 @@ folly::IOBufQueue CacheAllocator<CacheTrait>::saveStateToIOBuf() {
   *metadata_.cacheCreationTime() = static_cast<int64_t>(cacheCreationTime_);
   *metadata_.mmType() = MMType::kId;
   *metadata_.accessType() = AccessType::kId;
+  if (config_.slabHugePageSize.isHugePage()) {
+    *metadata_.slabPageSize() =
+        static_cast<int64_t>(config_.slabHugePageSize.getPageSize());
+  }
+  if (config_.accessHugePageSize.isHugePage()) {
+    *metadata_.accessPageSize() =
+        static_cast<int64_t>(config_.accessHugePageSize.getPageSize());
+  }
 
   metadata_.compactCachePools()->clear();
   const auto pools = getPoolIds();
@@ -6121,6 +6129,20 @@ CacheAllocator<CacheTrait>::deserializeCacheAllocatorMetadata(
     throw std::invalid_argument(fmt::format("Expected {}, got {} for MMType",
                                             *meta.mmType(), MMType::kId));
   }
+
+  const size_t persistedSlabPageSize =
+      PageSize(static_cast<size_t>(*meta.slabPageSize())).getPageSize();
+  const size_t persistedAccessPageSize =
+      PageSize(static_cast<size_t>(*meta.accessPageSize())).getPageSize();
+  if (persistedSlabPageSize != config_.slabHugePageSize.getPageSize() ||
+      persistedAccessPageSize != config_.accessHugePageSize.getPageSize()) {
+    throw std::invalid_argument(fmt::format(
+        "Huge page config changed across restarts: persisted slab/access page "
+        "sizes {}/{}, configured {}/{}",
+        persistedSlabPageSize, persistedAccessPageSize,
+        config_.slabHugePageSize.getPageSize(),
+        config_.accessHugePageSize.getPageSize()));
+  }
   return meta;
 }
 
@@ -6267,7 +6289,9 @@ CacheMemoryStats CacheAllocator<CacheTrait>::getCacheMemoryStats() const {
                           allocator_->getUnreservedMemorySize(),
                           nvmCache_ ? nvmCache_->getSize() : 0,
                           util::getMemAvailable(),
-                          util::getRSSBytes()};
+                          util::getRSSBytes(),
+                          accessContainer_->getMemorySize(),
+                          chainedItemAccessContainer_->getMemorySize()};
 }
 
 template <typename CacheTrait>
