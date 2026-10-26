@@ -36,13 +36,6 @@ rust-shed
 [dependencies.fbsource=on]
 rust
 
-# macOS ships with sqlite3, and some of the core system
-# frameworks require that that version be linked rather
-# than the one we might build for ourselves here, so we
-# skip building it on macos.
-[dependencies.not(os=darwin)]
-sqlite3
-
 [dependencies.os=darwin]
 osxfuse
 
@@ -53,8 +46,6 @@ osxfuse
 libcurl
 # Added so that OSS doesn't see system "python" which is python 2 on darwin and some linux
 python
-# TODO: teach getdeps to compile lmdb on Windows.
-lmdb
 
 [dependencies.test=on]
 # sapling CLI is needed to run the tests
@@ -121,6 +112,9 @@ USE_CARGO_VENDOR=ON
 
 [cmake.defines.fb=on]
 IS_FB_BUILD=ON
+
+[cmake.defines.test=on]
+BUILD_TESTS=ON
 
 [depends.environment]
 EDEN_VERSION_OVERRIDE
