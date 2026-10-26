@@ -1524,6 +1524,8 @@ std::unique_ptr<StatsBase> Cache<Allocator>::getStats() const {
 
   ret.cacheAllocateLatencyNs = cacheStats.allocateLatencyNs;
   ret.cacheFindLatencyNs = cacheFindLatency_.estimate();
+  ret.nvmLookupLatencyNs = cacheStats.nvmLookupLatencyNs;
+  ret.nvmInsertLatencyNs = cacheStats.nvmInsertLatencyNs;
 
   // Populate counters.
   // TODO: Populate more counters that are interesting to cachebench.
@@ -1632,7 +1634,15 @@ void Cache<Allocator>::clearCache(uint64_t errorLimit) {
     for (const auto& key : keys) {
       cache_->remove(key);
     }
+  }
+
+  // Drain asynchronous NVM removals before final stats validate that the
+  // item-destructor ownership bookkeeping is empty.
+  if (config_.enableItemDestructorCheck || config_.enableItemDestructor) {
     cache_->flushNvmCache();
+  }
+
+  if (config_.enableItemDestructorCheck) {
     itemRecords_.findUndestructedItem(std::cout, errorLimit);
   }
 }
